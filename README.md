@@ -2,7 +2,8 @@
 
 **Apple's open-source XNU (xnu-8796, the iOS 16 generation) on the Xiaomi Pad 6 Pro (`liuqin`, Qualcomm SM8475 / Snapdragon 8+ Gen 1), with the unmodified iPadOS 16 userland on top.**
 
-Derived from [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet) (Redmi Note 10 Pro, SM7150), with hardware data from
+Fork of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet) (Redmi Note 10 Pro, SM7150),
+retargeted to SM8475, with hardware data from
 [yzddmr6/xiaomipad-6pro-mainline](https://github.com/yzddmr6/xiaomipad-6pro-mainline) and
 [mytiantian001/iPadOS-nabu](https://github.com/mytiantian001/iPadOS-nabu).
 

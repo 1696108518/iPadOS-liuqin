@@ -2,7 +2,7 @@
 
 **把 Apple 开源 XNU（xnu-8796，iOS 16 世代）移植到 Xiaomi Pad 6 Pro（`liuqin`，高通 SM8475 / Snapdragon 8+ Gen 1），上面跑未修改的 iPadOS 16 用户态。**
 
-本项目从 [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet)（Redmi Note 10 Pro，SM7150）派生，硬件适配参考了：
+本项目是 [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet)（Redmi Note 10 Pro，SM7150）的 fork，重新适配到 SM8475；硬件资料参考了：
 
 - [yzddmr6/xiaomipad-6pro-mainline](https://github.com/yzddmr6/xiaomipad-6pro-mainline) —— liuqin 的主线 Linux 设备树、分区与器件资料；
 - [mytiantian001/iPadOS-nabu](https://github.com/mytiantian001/iPadOS-nabu) —— Xiaomi Pad 5 上的 iPadOS 用户态、iPad 身份与 Novatek 触摸协议。
