@@ -1,0 +1,28 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -849,6 +849,25 @@
+                                                  * client) needs this to be true; it was
+                                                  * never set, so the CP path never ran. */
+                                                 gpu_context_ready_=true;
++                                                /* The kit writes SMR as VALID|sid and the
++                                                 * qsmmu drops it (the GMU route needed the
++                                                 * same fix): the ladder writes
++                                                 * VALID|0x400<<16|sid.  Without the mask the
++                                                 * GPU's streams never match, so the CP's own
++                                                 * instruction fetch faults and the CP stops
++                                                 * acknowledging register writes - which is
++                                                 * exactly what stalls CP_SQE_CNTL. */
++                                                {
++                                                    volatile uint32_t *sm=reinterpret_cast<volatile uint32_t *>(smmu_base);
++                                                    sm[0xc00/4+gslot0]=gpubank;
++                                                    sm[0xc00/4+gslot1]=gpubank;
++                                                    sm[0x800/4+gslot0]=0x84000000u;
++                                                    sm[0x800/4+gslot1]=0x84000001u;
++                                                    __asm__ volatile("dsb sy" ::: "memory");
++                                                    IOLog("NativeAdreno: GPU route smr%u=0x%x s2cr%u=0x%x smr%u=0x%x s2cr%u=0x%x\n",
++                                                        gslot0,sm[0x800/4+gslot0],gslot0,sm[0xc00/4+gslot0],
++                                                        gslot1,sm[0x800/4+gslot1],gslot1,sm[0xc00/4+gslot1]);
++                                                }
+                                                 NativeAdrenoGpuBuffer b[5]{};
+                                                 if(!NativeAdrenoGpuContextBuffers(b))
+                                                     IOLog("NativeAdreno: GPU buffers sqe 0x%llx ring 0x%llx memptrs 0x%llx pwrup 0x%llx scratch 0x%llx\n",

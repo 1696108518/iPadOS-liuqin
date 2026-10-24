@@ -1,0 +1,16 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp	2026-10-24 09:41:06
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp	2026-10-24 09:41:06
+@@ -530,6 +530,13 @@
+                                             gmu_startup_.protocol.stage,gmu_startup_.protocol.poll_reads,
+                                             gmu_startup_.protocol.transport_status,gmu_startup_.protocol.firmware_error,
+                                             (unsigned long long)gmu_startup_.protocol.elapsed_us);
++                                            if(started!=ShengGmuSuccess) {
++                                                IOLog("NativeAdreno: HFI hdr %08x %08x %08x %08x %08x %08x q0 %08x %08x %08x idx %08x %08x %08x\n",
++                                                    config.hfi.cpu[0],config.hfi.cpu[1],config.hfi.cpu[2],config.hfi.cpu[3],
++                                                    config.hfi.cpu[4],config.hfi.cpu[5],
++                                                    config.hfi.cpu[6],config.hfi.cpu[7],config.hfi.cpu[8],
++                                                    config.hfi.cpu[15],config.hfi.cpu[16],config.hfi.cpu[17]);
++                                            }
+                                         }
+                                     if(started==ShengGmuSuccess) {
+                                         /* GPU bank/asid 2, streams 0 and 1 (the ladder's

@@ -1,0 +1,27 @@
+diff --git a/iokit/NativeAdreno/NativeAdrenoService.cpp b/iokit/NativeAdreno/NativeAdrenoService.cpp
+index aa8fd25..d5f909b 100644
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -384,6 +384,22 @@ bool NativeAdrenoGpuService::start(IOService *provider)
+                 } else {
+                     IOLog("NativeAdreno: GMU payloads mapped, bank=%u asid=%u sid=%u slot=%u ttbr0=0x%llx\n",
+                         bank,asid,sid,slot,static_cast<unsigned long long>(report.ttbr0));
++                    {
++                        /* The ladder's exact match for stream 5: S2CR first,
++                         * then SMR with VALID|mask|sid.  The kit writes
++                         * VALID|sid without the mask and the qsmmu leaves the
++                         * SMR without its valid bit. */
++                        uint32_t route=0;
++                        PE_parse_boot_argn("sheng-gpu-route",&route,sizeof(route));
++                        if(route) {
++                            volatile uint32_t *m=reinterpret_cast<volatile uint32_t *>(smmu_base);
++                            m[0xc00/4]=bank;
++                            m[0x800/4]=0x84000005u;
++                            __asm__ volatile("dsb sy" ::: "memory");
++                            IOLog("NativeAdreno: route smr0 0x%x s2cr0 0x%x\n",
++                                m[0x800/4],m[0xc00/4]);
++                        }
++                    }
+ #ifdef NATIVE_ADRENO_HAVE_GMU_RULES
+                     uint32_t loaded_bytes=0;
+                     const void *loaded=liuqin_fw_get("gmu_gen70000.bin",&loaded_bytes);

@@ -1,0 +1,20 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp	2026-10-24 09:56:06
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp	2026-10-24 09:56:06
+@@ -531,6 +531,8 @@
+                                             gmu_startup_.protocol.transport_status,gmu_startup_.protocol.firmware_error,
+                                             (unsigned long long)gmu_startup_.protocol.elapsed_us);
+                                             if(started!=ShengGmuSuccess) {
++                                                /* Drop any stale CPU lines before reading DRAM. */
++                                                NativeAdrenoMaintainOwnedPages((void *)(uintptr_t)config.hfi.cpu,0x4000,NativeAdrenoCleanInvalidate);
+                                                 IOLog("NativeAdreno: HFI hdr %08x %08x %08x %08x %08x %08x q0 %08x %08x %08x idx %08x %08x %08x q1 %08x %08x %08x\n",
+                                                     config.hfi.cpu[0],config.hfi.cpu[1],config.hfi.cpu[2],config.hfi.cpu[3],
+                                                     config.hfi.cpu[4],config.hfi.cpu[5],
+@@ -541,6 +543,8 @@
+                                                     uint32_t v=0xdeadbeef;
+                                                     return gmu_io_.read32(gmu_io_.cookie,0,size_t(reg)*4u,&v)?0xdeadbeefu:v;
+                                                 };
++                                                IOLog("NativeAdreno: HFI q1data %08x %08x %08x %08x\n",
++                                                    config.hfi.cpu[2048],config.hfi.cpu[2049],config.hfi.cpu[2050],config.hfi.cpu[2051]);
+                                                 IOLog("NativeAdreno: GMU core sysreset=0x%x fw_init=0x%x hfi_status=0x%x qtbl_info=0x%x qtbl_addr=0x%x ctrl_init=0x%x gmu2host=0x%x ao=0x%x\n",
+                                                     core(REG_GMU_CM3_SYSRESET),core(REG_GMU_CM3_FW_INIT_RESULT),
+                                                     core(REG_GMU_HFI_CTRL_STATUS),core(REG_GMU_HFI_QTBL_INFO),

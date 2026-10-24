@@ -1,0 +1,32 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -443,6 +443,29 @@
+         return status;
+     }
+     IOLog("NativeAdreno: CP started fence=%u\n",start_fence);
++    /* The CP is executing; now publish the submission path.  The VM must be the
++     * GPU context's (the GMU VM's iovas are not reachable by the GPU's
++     * streams), and the interrupts/queue/user client are built on this ring. */
++    IOReturn tail=irq_.attach(&io);
++    if(!tail) tail=irq_.programMask(nullptr);
++    if(tail) {
++        IOLog("NativeAdreno: CP interrupt setup stopped at 0x%x\n",tail);
++        return tail;
++    }
++    NativeAdrenoVm *vm=NativeAdrenoGpuContextVm();
++    if(!vm) {
++        IOLog("NativeAdreno: CP started but the GPU VM is missing\n");
++        return kIOReturnNotReady;
++    }
++    execbuf_=new NativeAdrenoSubmit;
++    core_=new NativeAdrenoUserClient;
++    if(execbuf_ && core_ &&
++        execbuf_->attach(vm,&ring_)==kIOReturnSuccess &&
++        core_->open(NativeAdrenoAbiVersion,vm,execbuf_,&ring_,32,40)==kIOReturnSuccess)
++        core_ready_=true;
++    ready_=true;
++    IOLog("NativeAdreno: CP started, fence=%u, interrupts masked=%08x, client=%s\n",
++        start_fence,NativeAdrenoIrq::mask(),core_ready_?"ready":"FAILED");
+     return kIOReturnSuccess;
+ }
+ uint64_t NativeAdrenoGpuService::ring_now(void *)

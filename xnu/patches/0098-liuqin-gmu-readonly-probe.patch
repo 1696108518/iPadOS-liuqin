@@ -1,0 +1,38 @@
+diff --git a/iokit/NativeAdreno/NativeAdrenoService.cpp b/iokit/NativeAdreno/NativeAdrenoService.cpp
+index 905c48e..106614f 100644
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -27,6 +27,7 @@
+ #include "NativeAdrenoPwrup.h"
+ #include "NativeAdrenoRing.h"
+ #include "ShengGmuCommandDb.h"
++#include "ShengGmuSource.h"
+ #include "NativeAdrenoSmmuService.h"
+ #include <pexpert/pexpert.h>
+ #if __has_include("ShengGmuSource.h")
+@@ -448,7 +449,24 @@ bool NativeAdrenoGpuService::start(IOService *provider)
+                                         NativeAdrenoKernelTime::now_us,
+                                         NativeAdrenoKernelTime::wait_us};
+                                     ShengGmuServices services{};
+-                                    if(ShengGmuBuildStartup(&inputs,&startup)!=AdrenoHfiStartupSuccess) {
++                                    /* sheng-gpu-readonly=1: read the GMU state
++                                     * and stop before any write, to tell a
++                                     * register-access hang from a firmware one. */
++                                    uint32_t readonly=0;
++                                    PE_parse_boot_argn("sheng-gpu-readonly",&readonly,sizeof(readonly));
++                                    if(readonly) {
++                                        auto rd=[&](unsigned window,unsigned reg)->uint32_t {
++                                            uint32_t v=0;
++                                            return gmu_io_.read32(gmu_io_.cookie,window,reg*4u,&v)?
++                                                0xdeadbeefu:v;
++                                        };
++                                        IOLog("NativeAdreno: readonly sysreset 0x%x hfi 0x%x cx 0x%x rscc 0x%x ao 0x%x cm3 0x%x\n",
++                                            rd(0,REG_GMU_CM3_SYSRESET),rd(0,REG_GMU_HFI_CTRL_STATUS),
++                                            rd(4,REG_CX_MISC_TCM_RET_CNTL),rd(1,REG_RSCC_SEQ_BUSY_DRV0),
++                                            rd(0,REG_GMU_AO_HOST_INTERRUPT_STATUS),
++                                            rd(0,REG_GMU_GMU2HOST_INTR_INFO));
++                                    }
++                                    else if(ShengGmuBuildStartup(&inputs,&startup)!=AdrenoHfiStartupSuccess) {
+                                         extern volatile uint32_t sheng_gmu_vote_stage,sheng_gmu_vote_info[8];
+                                         IOLog("NativeAdreno: startup config refused stage %u (gfx %u mx %u cx %u sh0 %u mc0 %u acv %u cn0 0x%x chip 0x%x)\n",
+                                             sheng_gmu_vote_stage,sheng_gmu_vote_info[0],sheng_gmu_vote_info[1],

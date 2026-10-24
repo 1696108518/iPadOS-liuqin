@@ -1,0 +1,27 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -297,6 +297,13 @@
+         {0x0e09,0xfffff000},{0x0e0a,0x0001ffff},     /* UCHE_TRAP_BASE */
+         {0x0e07,0xfffff000},{0x0e08,0x0001ffff},     /* UCHE_WRITE_THRU_BASE */
+         {0x0830,(uint32_t)GpuSqeIova},{0x0831,0},    /* CP_SQE_INSTR_BASE */
++        /* The two writes the ladder makes that our ring attach does not: the
++         * BV ring's read-pointer address (reset 0 would send the CP's rptr
++         * write to address 0, whose translation fault stalls the CP and then
++         * the bus on the SQE start) and bit 27 of CP_RB_CNTL ("no rptr copy",
++         * the ladder's 0x800020c). */
++        {0x0a98,(uint32_t)(GpuMemptrsIova+0x100)},{0x0a99,0}, /* CP_BV_RB_RPTR_ADDR */
++        {0x0802,0x0800020c},                         /* CP_RB_CNTL */
+     };
+     for(unsigned i=0;i<sizeof(regs)/sizeof(regs[0]);++i)
+         if(gpu_write32(&window,regs[i].reg,regs[i].value)) {
+@@ -313,7 +320,9 @@
+      * the rest of the CP path can be observed. */
+     uint32_t sqe_cntl=~0u;
+     (void)gpu_read32(&window,0x0808,&sqe_cntl);
+-    uint32_t sqe_start=0;
++    /* Enabled by default now that the two missing writes are in; pass 0 to
++     * keep the SQE stopped and still get the readbacks. */
++    uint32_t sqe_start=1;
+     PE_parse_boot_argn("sheng-gpu-sqe-start",&sqe_start,sizeof(sqe_start));
+     IOLog("NativeAdreno: CP_SQE_CNTL reads 0x%x, start=%s\n",sqe_cntl,
+         sqe_start?"yes":"skipped (sheng-gpu-sqe-start=0)");

@@ -1,0 +1,28 @@
+--- a/iokit/NativeAdreno/ShengGmu.c	2026-10-24 10:35:53
++++ b/iokit/NativeAdreno/ShengGmu.c	2026-10-24 10:35:53
+@@ -136,9 +136,6 @@
+     const ShengGmuMemory *memory[]={&c->icache,&c->dummy,&c->debug,&c->log};
+     r->memory_changed=1;
+     for(unsigned m=0;m<4;++m)for(size_t i=0;i<memory[m]->bytes/4;++i)memory[m]->cpu[i]=0;
+-    if(AdrenoHfiInitializeStopped(&d->hfi,c->hfi.cpu,c->hfi.bytes,c->hfi.iova,d,notify)!=AdrenoHfiSuccess) {
+-        status=ShengGmuArgument;goto failed;
+-    }
+     r->phase=3;
+     for(size_t i=0;i<count;++i) {
+         const AdrenoFirmwareBlock *b=blocks+i;
+@@ -215,6 +212,15 @@
+     status=poll(d,REG_GMU_CM3_FW_INIT_RESULT,mask,ready,c->poll_budget,&r->firmware_init_result,r);
+     if(status!=ShengGmuSuccess)goto failed;
+     r->firmware_ready_observed=1;
++    /* The GMU firmware initializes its own HFI table while booting (it rewrites
++     * the queue-header size fields), so the host's table must be written after
++     * FW_INIT_RESULT - the ladder does hfi_table_init() here too. */
++    if(AdrenoHfiInitializeStopped(&d->hfi,c->hfi.cpu,c->hfi.bytes,c->hfi.iova,d,notify)!=AdrenoHfiSuccess) {
++        status=ShengGmuArgument;goto failed;
++    }
++    if(d->services.clean && d->services.clean(d->services.cookie,c->hfi.cpu,c->hfi.bytes)) {
++        status=ShengGmuIoError;goto failed;
++    }
+     if(core_write(d,REG_GMU_HFI_CTRL_INIT,1,r) || d->io.barrier(d->io.cookie)) {status=ShengGmuIoError;goto failed;}
+     r->phase=6;
+     status=poll(d,REG_GMU_HFI_CTRL_STATUS,1,1,c->poll_budget,&r->hfi_status,r);

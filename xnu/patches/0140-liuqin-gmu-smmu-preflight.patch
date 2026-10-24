@@ -1,0 +1,40 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -64,6 +64,8 @@
+     /* The GPU register block as the vendor DT and the ladder address it
+      * (0x3d00000) when the ADT's own window does not answer. */
+     OSSharedPtr<IOMemoryMap> alt_gpu_map_;
++    /* The GPU SMMU window, for the read-only CP-fetch preflight. */
++    volatile uint8_t *smmu_base_=nullptr;
+     NativeAdrenoGmuContext gmu_ctx_;
+     NativeAdrenoGmuPlatform gmu_platform_;
+     ShengGmuIo gmu_io_{};
+@@ -331,6 +333,20 @@
+             (unsigned long long)b[3].physical);
+         return published;
+     }
++    /* Read-only SMMU preflight: the CP fetches its microcode through the GPU's
++     * stream, so a stale global fault or a bank that did not take the tables
++     * explains a stalled fetch without needing the register write to survive.
++     * Geometry from IDR1 as the ladder derives it: page size bit 31, context
++     * banks start at (2 << ((IDR1 >> 28) & 7)) pages. */
++    if(smmu_base_) {
++        volatile uint32_t *sm=reinterpret_cast<volatile uint32_t *>(smmu_base_);
++        const uint32_t idr1=sm[0x24/4];
++        const unsigned page=(idr1>>31)?0x10000u:0x1000u;
++        const unsigned pages=2u<<((idr1>>28)&7);
++        volatile uint32_t *cb=sm+(size_t)(pages+2)*page/4;
++        IOLog("NativeAdreno: SMMU preflight idr1=0x%x cb2base=0x%x sgfsr=0x%x sctlr=0x%x tcr=0x%x ttbr0=0x%x%08x fsr=0x%x\n",
++            idr1,(unsigned)((pages+2)*page),sm[0x48/4],cb[0x00/4],cb[0x30/4],cb[0x24/4],cb[0x20/4],cb[0x50/4]);
++    } else IOLog("NativeAdreno: SMMU preflight skipped (no window)\n");
+     uint32_t sqe_cntl=~0u;
+     (void)gpu_read32(&window,0x0808,&sqe_cntl);
+     uint32_t sqe_start=1;
+@@ -530,6 +546,7 @@
+         NativeAdrenoSmmuService *node=OSDynamicCast(NativeAdrenoSmmuService,smmu);
+         if(node && node->windowCount() && node->windowAddress(0)) {
+             volatile uint8_t *smmu_base=node->windowAddress(0);
++            smmu_base_=smmu_base;
+             const size_t smmu_bytes=static_cast<size_t>(node->windowBytes(0));
+             const uint32_t id0=*reinterpret_cast<volatile uint32_t *>(smmu_base+0x20);
+             const uint32_t id1=*reinterpret_cast<volatile uint32_t *>(smmu_base+0x24);

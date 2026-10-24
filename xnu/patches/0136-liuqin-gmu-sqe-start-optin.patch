@@ -1,0 +1,28 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -306,9 +306,22 @@
+     uint32_t eco=0;
+     if(!gpu_read32(&window,0x8e28,&eco))
+         (void)gpu_write32(&window,0x8e28,eco|(1u<<11)); /* RB_CMP_DBG_ECO_CNTL */
+-    IOLog("NativeAdreno: CP registers written, starting the SQE\n");
+-    if(gpu_write32(&window,0x0808,1))return kIOReturnIOError; /* CP_SQE_CNTL */
+-    IOLog("NativeAdreno: CP_SQE_CNTL=1 written\n");
++    IOLog("NativeAdreno: CP registers written\n");
++    /* Starting the SQE by writing CP_SQE_CNTL has hung the bus twice: the store
++     * never completes, so the SQE's fetch path is not usable at that moment.
++     * Read it first (safe), then start only on request so a boot survives and
++     * the rest of the CP path can be observed. */
++    uint32_t sqe_cntl=~0u;
++    (void)gpu_read32(&window,0x0808,&sqe_cntl);
++    uint32_t sqe_start=0;
++    PE_parse_boot_argn("sheng-gpu-sqe-start",&sqe_start,sizeof(sqe_start));
++    IOLog("NativeAdreno: CP_SQE_CNTL reads 0x%x, start=%s\n",sqe_cntl,
++        sqe_start?"yes":"skipped (sheng-gpu-sqe-start=0)");
++    if(sqe_start) {
++        IOLog("NativeAdreno: writing CP_SQE_CNTL=1\n");
++        if(gpu_write32(&window,0x0808,1))return kIOReturnIOError;
++        IOLog("NativeAdreno: CP_SQE_CNTL=1 written\n");
++    }
+     IOSleep(20);
+     IOLog("NativeAdreno: CP settle done\n");
+     uint32_t rbbm=~0u,fault=~0u,rptr=~0u,sqe_lo=~0u,sqe_hi=~0u,rb_lo=~0u,rb_hi=~0u;

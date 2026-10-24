@@ -1,0 +1,275 @@
+--- a/iokit/NativeAdreno/ShengGmu.c
++++ b/iokit/NativeAdreno/ShengGmu.c
+@@ -278,10 +278,198 @@
+     case AdrenoHfiStartupTimeout:status=ShengGmuTimeout;break;
+     case AdrenoHfiStartupPlatformFault:status=r->health_status;break;
+     default:status=ShengGmuProtocolError;break;
++    }
++    reset_after_failure(d,&r->load);d->startup.poisoned=1;
++    return status;
++}
++
++/* ---- liuqin: the ladder's interrupt-driven HFI transport ----
++ * The a6xx kit drives both queues by their read/write indices.  This Gen7 GMU
++ * publishes every response packet in the response queue memory and raises
++ * GMU2HOST_INTR, but it never advances either index: the ladder in
++ * bsd/dev/liuqin_adreno.c saw the same and never used them either.  An
++ * index-driven poll therefore reports Empty while a real ACK sits in the
++ * window, and a scan that moves the indices behind the firmware's back
++ * desynchronises the ring (that path ended in a kernel panic).
++ *
++ * Every exchange here keeps the queues in a state both models agree on:
++ *   1. zero both payload windows, so no stale packet can pass for an answer;
++ *   2. publish the command at the base of the command window with the
++ *      command indices consistent (read 0, write padded);
++ *   3. clean the queue memory, drop a stale interrupt, pulse HOST2GMU_INTR;
++ *   4. bound-wait for GMU2HOST_INTR bit 0 and acknowledge it;
++ *   5. invalidate the queue memory and accept only a packet whose length,
++ *      message id and sequence number match this command, from one of the
++ *      four word-aligned base slots.
++ * Step 2 resets the ring to its base state for every command, so whatever the
++ * firmware does with the indices cannot accumulate across messages. */
++#define SHENG_HFI_QUEUE_WORDS 1024u
++#define SHENG_HFI_QUEUE_BYTES 4096u
++#define SHENG_HFI_TABLE_WORDS 6u
++#define SHENG_HFI_QHDR_WORDS 12u
++#define SHENG_HFI_PACKET_WORDS 19u
++#define SHENG_HFI_RSP_SLOTS 4u
++enum {ShengHfiCommandQueue=0,ShengHfiResponseQueue=1};
++/* The wire sequence is one message per value, as the ladder numbers them. */
++static uint32_t sheng_hfi_sequence;
++static volatile uint32_t *hfi_queue_header(const ShengGmuConfig *c,unsigned q)
++{return c->hfi.cpu+SHENG_HFI_TABLE_WORDS+SHENG_HFI_QHDR_WORDS*q;}
++static volatile uint32_t *hfi_queue_data(const ShengGmuConfig *c,unsigned q)
++{return c->hfi.cpu+SHENG_HFI_QUEUE_WORDS*(q+1);}
++static int hfi_clean(ShengGmuDevice *d,const volatile void *at,size_t bytes)
++{
++    if(!d->services.clean)return 0;
++    return d->services.clean(d->services.cookie,(void *)(uintptr_t)at,bytes)?1:0;
++}
++static int hfi_invalidate(ShengGmuDevice *d,const volatile void *at,size_t bytes)
++{
++    if(!d->services.invalidate)return 0;
++    return d->services.invalidate(d->services.cookie,(void *)(uintptr_t)at,bytes)?1:0;
++}
++static ShengGmuStatus hfi_health(ShengGmuDevice *d,ShengGmuResult *r)
++{
++    uint32_t reset,status;
++    if(core_read(d,REG_GMU_CM3_SYSRESET,&reset,r) ||
++        core_read(d,REG_GMU_HFI_CTRL_STATUS,&status,r))return ShengGmuIoError;
++    if(reset!=0 || !(status&1))return ShengGmuStateMismatch;
++    return check_faults(d,r);
++}
++static ShengGmuStatus hfi_wait_interrupt(ShengGmuDevice *d,const ShengGmuStartupLimits *limits,
++    AdrenoHfiStartupResult *p,ShengGmuResult *r)
++{
++    uint64_t start,now;uint32_t info=0;
++    if(d->services.now_us(d->services.cookie,&start))return ShengGmuClockError;
++    for(unsigned i=0;i<limits->polls_per_command;++i) {
++        if(d->services.now_us(d->services.cookie,&now) || now<start)return ShengGmuClockError;
++        if(now-start>=limits->command_timeout_us)return ShengGmuTimeout;
++        ++p->poll_reads;
++        if(core_read(d,REG_GMU_GMU2HOST_INTR_INFO,&info,r))return ShengGmuIoError;
++        if(info&1)return ShengGmuSuccess;
++        if(i+1<limits->polls_per_command &&
++            d->services.wait_us(d->services.cookie,limits->wait_interval_us))return ShengGmuClockError;
++    }
++    return ShengGmuTimeout;
++}
++/* One command and its answer.  `id`/`payload` are the encoded startup message;
++ * `output` receives the message body of the ACK (header, return and error code
++ * excluded), exactly as the kit's transport delivers it. */
++static ShengGmuStatus hfi_exchange(ShengGmuDevice *d,const ShengGmuConfig *c,
++    const ShengGmuStartupLimits *limits,unsigned id,const uint32_t *payload,size_t words,
++    uint32_t *output,size_t capacity,size_t *returned,uint32_t *wire,
++    AdrenoHfiStartupResult *p,ShengGmuResult *r)
++{
++    *returned=0;p->firmware_error=0;
++    if(!payload || !words || words+1>SHENG_HFI_PACKET_WORDS || !id || id>255 ||
++        !output || capacity<16)return ShengGmuArgument;
++    volatile uint32_t *cmd=hfi_queue_data(c,ShengHfiCommandQueue);
++    volatile uint32_t *rsp=hfi_queue_data(c,ShengHfiResponseQueue);
++    volatile uint32_t *cq=hfi_queue_header(c,ShengHfiCommandQueue);
++    volatile uint32_t *rq=hfi_queue_header(c,ShengHfiResponseQueue);
++    uint32_t seq=++sheng_hfi_sequence%4095u;
++    if(!seq)seq=sheng_hfi_sequence=1;
++    const uint32_t count=(uint32_t)words+1,padded=(count+3)&~UINT32_C(3);
++    const uint32_t header=(seq<<20)|(count<<8)|(uint32_t)id;
++    for(unsigned i=0;i<SHENG_HFI_PACKET_WORDS*4;++i) {cmd[i]=0;rsp[i]=0;}
++    cmd[0]=header;
++    for(unsigned i=0;i<words;++i)cmd[1+i]=payload[i];
++    for(unsigned i=count;i<padded;++i)cmd[i]=UINT32_C(0xfafafafa);
++    /* An empty ring whose first packet is this command: read 0, write padded. */
++    cq[10]=0;cq[11]=padded;
++    rq[10]=0;
++    if(hfi_clean(d,cmd,SHENG_HFI_QUEUE_BYTES) || hfi_clean(d,rsp,SHENG_HFI_QUEUE_BYTES) ||
++        hfi_clean(d,c->hfi.cpu,SHENG_HFI_QUEUE_BYTES))return ShengGmuIoError;
++    if(core_write(d,REG_GMU_GMU2HOST_INTR_CLR,1,r) || d->io.barrier(d->io.cookie) ||
++        core_write(d,REG_GMU_HOST2GMU_INTR_SET,1,r) || d->io.barrier(d->io.cookie))
++        return ShengGmuIoError;
++    p->wire_header=header;*wire=header;
++    ShengGmuStatus status=hfi_wait_interrupt(d,limits,p,r);
++    if(status!=ShengGmuSuccess) {
++        p->transport_status=status==ShengGmuTimeout?AdrenoHfiEmpty:AdrenoHfiWaitError;
++        return status;
+     }
++    if(core_write(d,REG_GMU_GMU2HOST_INTR_CLR,1,r) || d->io.barrier(d->io.cookie) ||
++        hfi_invalidate(d,c->hfi.cpu,SHENG_HFI_QUEUE_BYTES) ||
++        hfi_invalidate(d,rsp,SHENG_HFI_QUEUE_BYTES))return ShengGmuIoError;
++    /* Only a complete packet naming this command's id and sequence is an
++     * answer.  Both windows were zeroed before the doorbell, so a match can
++     * only come from this exchange, never from an earlier one. */
++    for(unsigned slot=0;slot<SHENG_HFI_RSP_SLOTS;++slot) {
++        const unsigned at=slot*4;
++        const uint32_t packet_header=rsp[at];
++        const uint32_t packet_count=(packet_header>>8)&0xffu;
++        if(packet_count<3 || packet_count>SHENG_HFI_PACKET_WORDS)continue;
++        if((packet_header&0xffu)!=(uint32_t)id)continue;
++        if((rsp[at+1]>>20)!=seq)continue;
++        if(rsp[at+2]) {
++            p->firmware_error=rsp[at+2];p->transport_status=AdrenoHfiFirmwareError;
++            return ShengGmuProtocolError;
++        }
++        const size_t back=(size_t)packet_count-3;
++        if(back>capacity) {p->transport_status=AdrenoHfiInvalid;return ShengGmuProtocolError;}
++        for(unsigned i=0;i<back;++i)output[i]=rsp[at+3+i];
++        *returned=back;p->transport_status=AdrenoHfiSuccess;
++        return ShengGmuSuccess;
++    }
++    p->transport_status=AdrenoHfiUnexpected;return ShengGmuProtocolError;
++}
++ShengGmuStatus ShengGmuColdStartInterrupt(ShengGmuDevice *d,const ShengGmuConfig *c,
++    const AdrenoHfiStartupConfig *config,const ShengGmuStartupLimits *limits,ShengGmuStartupResult *r)
++{
++    if(!r)return ShengGmuArgument;
++    *r=(ShengGmuStartupResult){0};
++    r->load.resources_must_retain=r->protocol.resources_must_retain=1;
++    r->protocol_status=AdrenoHfiStartupInvalid;r->protocol.transport_status=AdrenoHfiEmpty;
++    if(!d || !c || !limits || AdrenoHfiStartupValidate(config)!=AdrenoHfiStartupSuccess)
++        return ShengGmuArgument;
++    if(!limits->polls_per_command || !limits->wait_interval_us ||
++        !limits->command_timeout_us || !limits->total_timeout_us)return ShengGmuArgument;
++    if(d->poisoned || d->startup.poisoned)return ShengGmuPoisoned;
++    if(d->startup.attempted || d->startup.completed)return ShengGmuBusy;
++    ShengGmuStatus status=ShengGmuLoadAndStartHfi(d,c,&r->load);
++    if(status!=ShengGmuSuccess)return status;
++    uint64_t begin=0,now=0;
++    if(d->services.now_us(d->services.cookie,&begin))return ShengGmuClockError;
++    uint32_t payload[159],output[16],wire=0,total=0;
++    size_t words=0,returned=0;
++    d->startup.attempted=1;
++    for(unsigned step=AdrenoHfiStagePerformance;step<=AdrenoHfiStageStart;++step) {
++        if((step==AdrenoHfiStageAcdEnable || step==AdrenoHfiStageAcdTable) && !config->acd_enable_mask)continue;
++        if(step==AdrenoHfiStageIfpc && !config->enable_ifpc)continue;
++        r->protocol.stage=(AdrenoHfiStartupStage)step;
++        if(d->services.now_us(d->services.cookie,&now) || now<begin) {status=ShengGmuClockError;goto failed;}
++        r->protocol.elapsed_us=now-begin;
++        if(now-begin>=limits->total_timeout_us) {status=ShengGmuTimeout;goto failed;}
++        if(AdrenoHfiStartupEncode(config,r->protocol.stage,&total,payload,159,&words)!=AdrenoHfiStartupSuccess) {
++            status=ShengGmuArgument;goto failed;
++        }
++        wire=0;
++        status=hfi_exchange(d,c,limits,total,payload,words,output,16,&returned,&wire,&r->protocol,&r->load);
++        if(wire)++r->protocol.published_commands;
++        if(status!=ShengGmuSuccess)goto failed;
++        status=hfi_health(d,&r->load);
++        if(status!=ShengGmuSuccess)goto failed;
++        r->protocol.acknowledged_stages|=1u<<step;
++    }
++    d->startup.completed=1;r->protocol_status=AdrenoHfiStartupSuccess;
++    r->protocol.stage=AdrenoHfiStageComplete;
++    if(d->services.now_us(d->services.cookie,&now) || now<begin)return ShengGmuClockError;
++    r->protocol.elapsed_us=now-begin;
++    return ShengGmuSuccess;
++ failed:
++    switch(status) {
++    case ShengGmuIoError:r->protocol_status=AdrenoHfiStartupTransportError;break;
++    case ShengGmuClockError:r->protocol_status=AdrenoHfiStartupClockError;break;
++    case ShengGmuTimeout:r->protocol_status=AdrenoHfiStartupTimeout;break;
++    case ShengGmuProtocolError:r->protocol_status=AdrenoHfiStartupTransportError;break;
++    case ShengGmuFault:case ShengGmuStateMismatch:
++        r->protocol_status=AdrenoHfiStartupPlatformFault;break;
++    default:r->protocol_status=AdrenoHfiStartupInvalid;break;
++    }
++    if(!d->services.now_us(d->services.cookie,&now) && now>=begin)r->protocol.elapsed_us=now-begin;
+     reset_after_failure(d,&r->load);d->startup.poisoned=1;
+     return status;
+ }
++
+ static int fits(ShengGmuMmio *m,unsigned window,size_t at)
+ {
+     if(!m || window>=ShengGmuWindows)return 0;
+--- a/iokit/NativeAdreno/ShengGmu.h
++++ b/iokit/NativeAdreno/ShengGmu.h
+@@ -98,6 +98,14 @@
+  * shader execution, submission, presentation or a complete hardware driver. */
+ ShengGmuStatus ShengGmuColdStart(ShengGmuDevice *,const ShengGmuConfig *,
+     const AdrenoHfiStartupConfig *,const ShengGmuStartupLimits *,ShengGmuStartupResult *);
++/* liuqin: the same cold start, but exchanging the startup messages through the
++ * ladder's interrupt-driven HFI transport instead of the a6xx kit's index
++ * poll.  This Gen7 GMU publishes ACK packets without advancing the queue
++ * indices, so the index-driven transport reports Empty for a real answer.
++ * Preconditions, validation and the failure/reset/poison policy are those of
++ * ShengGmuColdStart. */
++ShengGmuStatus ShengGmuColdStartInterrupt(ShengGmuDevice *,const ShengGmuConfig *,
++    const AdrenoHfiStartupConfig *,const ShengGmuStartupLimits *,ShengGmuStartupResult *);
+ 
+ typedef struct {volatile unsigned char *cpu;uint64_t physical;size_t bytes;} ShengGmuMmioWindow;
+ typedef struct {ShengGmuMmioWindow windows[ShengGmuWindows];} ShengGmuMmio;
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -517,12 +517,21 @@
+                                             sheng_gmu_stopped_at=0;
+                                         }
+                                         ShengGmuStartupLimits limits{512,200,100000,200000};
+-                                        const ShengGmuStatus started=ShengGmuColdStart(
++                                        /* sheng-gpu-hfi=1: exchange the startup
++                                         * messages through the ladder's
++                                         * interrupt-driven transport (this GMU
++                                         * answers without advancing the HFI
++                                         * queue indices); 0 keeps the kit. */
++                                        uint32_t hfi_mode=0;
++                                        PE_parse_boot_argn("sheng-gpu-hfi",&hfi_mode,sizeof(hfi_mode));
++                                        const ShengGmuStatus started=(hfi_mode?
++                                            ShengGmuColdStartInterrupt:ShengGmuColdStart)(
+                                             &gmu_device_,&config,&startup,&limits,&gmu_startup_);
+                                         {
+                                             extern volatile uint32_t sheng_gmu_stopped_at;
+-                                            IOLog("NativeAdreno: ColdStart status=%d fw_ready=%u hfi_ready=%u stage=%u stopped_at=%u fw_init=0x%x hfi=0x%x polls=%u proto stage=%u polls=%u transport=%u fwerr=0x%x elapsed=%llu us\n",
+-                                            started,gmu_startup_.load.firmware_ready_observed,
++                                            IOLog("NativeAdreno: ColdStart status=%d mode=%s fw_ready=%u hfi_ready=%u stage=%u stopped_at=%u fw_init=0x%x hfi=0x%x polls=%u proto stage=%u polls=%u transport=%u fwerr=0x%x elapsed=%llu us\n",
++                                            started,hfi_mode?"intr":"poll",
++                                            gmu_startup_.load.firmware_ready_observed,
+                                             gmu_startup_.load.hfi_ready_observed,
+                                             gmu_startup_.protocol.stage,sheng_gmu_stopped_at,
+                                             gmu_startup_.load.firmware_init_result,gmu_startup_.load.hfi_status,
+@@ -557,6 +566,29 @@
+                                                     core(REG_GMU_GMU2HOST_INTR_INFO),core(REG_GMU_AO_HOST_INTERRUPT_STATUS));
+                                             }
+                                         }
++                                    if(hfi_mode) {
++                                        /* One-shot check that the interrupt transport saw
++                                         * the queue as modelled: table header, both index
++                                         * pairs, the response and command windows and the
++                                         * GMU2HOST status. */
++                                        const IOReturn inverr=NativeAdrenoMaintainOwnedPages(
++                                            (void *)(uintptr_t)config.hfi.cpu,0x4000,
++                                            NativeAdrenoCleanInvalidate);
++                                        uint32_t intr=0xdeadbeef;
++                                        (void)gmu_io_.read32(gmu_io_.cookie,0,
++                                            size_t(REG_GMU_GMU2HOST_INTR_INFO)*4u,&intr);
++                                        IOLog("NativeAdreno: HFI intr inv=0x%x tbl %08x %08x %08x %08x %08x %08x intr=0x%x\n",
++                                            inverr,config.hfi.cpu[0],config.hfi.cpu[1],
++                                            config.hfi.cpu[2],config.hfi.cpu[3],
++                                            config.hfi.cpu[4],config.hfi.cpu[5],intr);
++                                        IOLog("NativeAdreno: HFI intr q0 rd/wr %08x %08x q1 rd/wr %08x %08x rsp %08x %08x %08x %08x cmd %08x %08x %08x %08x\n",
++                                            config.hfi.cpu[16],config.hfi.cpu[17],
++                                            config.hfi.cpu[28],config.hfi.cpu[29],
++                                            config.hfi.cpu[2048],config.hfi.cpu[2049],
++                                            config.hfi.cpu[2050],config.hfi.cpu[2051],
++                                            config.hfi.cpu[1024],config.hfi.cpu[1025],
++                                            config.hfi.cpu[1026],config.hfi.cpu[1027]);
++                                    }
+                                     if(started==ShengGmuSuccess) {
+                                         /* GPU bank/asid 2, streams 0 and 1 (the ladder's
+                                          * choice); the two SMR slots default to the first

@@ -1,0 +1,31 @@
+--- a/iokit/NativeAdreno/kits/AdrenoFirmware/AdrenoHfi.c
++++ b/iokit/NativeAdreno/kits/AdrenoFirmware/AdrenoHfi.c
+@@ -77,27 +77,7 @@
+     if(!h->pending_header)return AdrenoHfiInvalid;
+     /* A ring holds at most WORDS/4 packets; each pass consumes one. */
+     for(unsigned pass=0;pass<WORDS/4;++pass) {
+-        if(read==write) {
+-            /* The liuqin GMU (Gen7) publishes a response packet in the queue
+-             * memory without advancing write_index. Accept a packet whose
+-             * sequence matches the pending command; the sequence check keeps
+-             * stale packets from being taken for a new ACK. */
+-            for(unsigned at=0;at<WORDS;at+=4) {
+-                uint32_t header=data[at];unsigned count=(header>>8)&255;
+-                if(count<3 || count>19)continue;
+-                if((data[(at+1)&(WORDS-1)]>>20)!=(h->pending_header>>20))continue;
+-                uint32_t packet[19];
+-                for(unsigned i=0;i<count;++i)packet[i]=data[(at+i)&(WORDS-1)];
+-                complete();
+-                if(packet[2]) {*error=packet[2];return poison(h,AdrenoHfiFirmwareError);}
+-                for(unsigned i=3;i<count;++i)payload[i-3]=packet[i];
+-                /* Do not advance read_index: this GMU never advances write_index,
+-                 * so the next poll must keep read==write and scan again. */
+-                publish();
+-                h->pending_header=0;*payload_words=count-3;return AdrenoHfiSuccess;
+-            }
+-            v[8]=1;publish();return AdrenoHfiEmpty;
+-        }
++        if(read==write) {v[8]=1;publish();return AdrenoHfiEmpty;}
+         uint32_t packet[19];uint32_t header=data[read];unsigned count=(header>>8)&255;
+         unsigned available=(write-read)&(WORDS-1),padded=(count+3)&~3u;
+         if(!count || count>19 || padded>available)return poison(h,AdrenoHfiCorrupt);

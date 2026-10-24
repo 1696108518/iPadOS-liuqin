@@ -1,0 +1,60 @@
+diff --git a/iokit/NativeAdreno/NativeAdrenoGmuPlatform.cpp b/iokit/NativeAdreno/NativeAdrenoGmuPlatform.cpp
+index ae2f4c0..a6a2de1 100644
+--- a/iokit/NativeAdreno/NativeAdrenoGmuPlatform.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoGmuPlatform.cpp
+@@ -54,6 +54,10 @@ static int clean(void *,void *mapping,size_t bytes)
+ {
+     return NativeAdrenoMaintainOwnedPages(mapping,bytes,NativeAdrenoClean)?1:0;
+ }
++static int invalidate(void *,void *mapping,size_t bytes)
++{
++    return NativeAdrenoMaintainOwnedPages(mapping,bytes,NativeAdrenoInvalidate)?1:0;
++}
+ IOReturn NativeAdrenoGmuPlatform::services(const NativeAdrenoGmuTime *time,
+     ShengGmuServices *services)
+ {
+@@ -65,5 +69,6 @@ IOReturn NativeAdrenoGmuPlatform::services(const NativeAdrenoGmuTime *time,
+     services->now_us=time->now_us;
+     services->wait_us=time->wait_us;
+     services->clean=clean;
++    services->invalidate=invalidate;
+     return kIOReturnSuccess;
+ }
+diff --git a/iokit/NativeAdreno/ShengGmu.c b/iokit/NativeAdreno/ShengGmu.c
+index dc120ee..e4df29c 100644
+--- a/iokit/NativeAdreno/ShengGmu.c
++++ b/iokit/NativeAdreno/ShengGmu.c
+@@ -35,6 +35,9 @@ static ShengGmuStatus check_faults(ShengGmuDevice *d,ShengGmuResult *r)
+ static int notify(void *cookie)
+ {
+     ShengGmuDevice *d=cookie;
++    /* The HFI queue is written with cacheable CPU stores; clean it so the
++     * GMU reads the new command, then interrupt it. */
++    if(d->services.clean && d->services.clean(d->services.cookie,d->hfi.shared,0x4000))return 1;
+     return d->io.barrier(d->io.cookie) ||
+         d->io.write32(d->io.cookie,ShengGmuCore,core_offset(REG_GMU_HOST2GMU_INTR_SET),1) ||
+         d->io.barrier(d->io.cookie);
+@@ -238,6 +241,8 @@ static int startup_health(void *cookie)
+ {
+     StartupContext *c=cookie;ShengGmuDevice *d=c->device;
+     ShengGmuStartupResult *r=c->result;uint32_t reset,status;
++    /* Drop the CPU's stale lines over the response queue before polling. */
++    if(d->services.invalidate && d->services.invalidate(d->services.cookie,d->hfi.shared,0x4000))return 1;
+     r->health_status=check_faults(d,&r->load);
+     if(r->health_status!=ShengGmuSuccess)return 1;
+     if(core_read(d,REG_GMU_CM3_SYSRESET,&reset,&r->load) ||
+diff --git a/iokit/NativeAdreno/ShengGmu.h b/iokit/NativeAdreno/ShengGmu.h
+index 8f531e9..018c587 100644
+--- a/iokit/NativeAdreno/ShengGmu.h
++++ b/iokit/NativeAdreno/ShengGmu.h
+@@ -23,8 +23,9 @@ typedef struct {
+     int (*sha256)(void *,const void *,size_t,uint8_t digest[32]);
+     int (*now_us)(void *,uint64_t *);
+     int (*wait_us)(void *,unsigned);
+-    /* Clean the CPU caches over memory the GMU will read (ICACHE/HFI). */
++    /* Clean/invalidate the CPU caches over memory shared with the GMU. */
+     int (*clean)(void *,void *,size_t);
++    int (*invalidate)(void *,void *,size_t);
+ } ShengGmuServices;
+ typedef struct {volatile uint32_t *cpu;size_t bytes;uint64_t iova;} ShengGmuMemory;
+ typedef struct {

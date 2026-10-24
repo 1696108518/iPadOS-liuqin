@@ -1,0 +1,42 @@
+--- a/iokit/NativeAdreno/ShengGmu.c
++++ b/iokit/NativeAdreno/ShengGmu.c
+@@ -474,6 +474,19 @@
+         if(status!=ShengGmuSuccess)goto failed;
+         r->protocol.acknowledged_stages|=1u<<step;
+     }
++    /* The ladder's a6xx_gmu_resume tail: the initial GX perf/bandwidth vote
++     * (HFI 30) that makes the GMU raise the GPU's own (GX) domain.  Without it
++     * the core stays off and every GPU register reads zero even though the
++     * startup sequence was acknowledged.  Payload order is the ladder's:
++     * 0, blocking ack, perf level 1 (220 MHz), bandwidth level 3. */
++    {
++        const uint32_t vote[4]={0,1,1,3};
++        status=hfi_exchange(d,c,limits,30,vote,4,output,16,&returned,&wire,&r->protocol,&r->load);
++        if(wire)++r->protocol.published_commands;
++        if(status!=ShengGmuSuccess)goto failed;
++        status=hfi_health(d,&r->load);
++        if(status!=ShengGmuSuccess)goto failed;
++    }
+     d->startup.completed=1;r->protocol_status=AdrenoHfiStartupSuccess;
+     r->protocol.stage=AdrenoHfiStageComplete;
+     if(d->services.now_us(d->services.cookie,&now) || now<begin)return ShengGmuClockError;
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -860,6 +860,8 @@
+                                                 reinterpret_cast<volatile uint8_t *>(maps_[0]->getVirtualAddress()),
+                                                 static_cast<size_t>(windows[0].bytes)};
+                                             {
++                                                /* The GX domain needs a moment after the HFI vote. */
++                                                IOSleep(20);
+                                                 uint32_t adt_id=0,adt_status=0,dt_id=0,dt_status=0;
+                                                 (void)gpu_read32(&gpu_window,0x0000,&adt_id);
+                                                 (void)gpu_read32(&gpu_window,0x0210,&adt_status);
+@@ -870,6 +872,8 @@
+                                                         stock->map(kIOMapAnywhere|kIOMapInhibitCache),OSNoRetain);
+                                                     stock->release();
+                                                 }
++                                                IOLog("NativeAdreno: GPU window DT map %p\n",alt_gpu_map_?
++                                                    reinterpret_cast<void *>(alt_gpu_map_->getVirtualAddress()):nullptr);
+                                                 if(alt_gpu_map_) {
+                                                     dt_window.base=reinterpret_cast<volatile uint8_t *>(
+                                                         alt_gpu_map_->getVirtualAddress());

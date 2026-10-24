@@ -1,0 +1,174 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -78,6 +78,15 @@
+     bool core_ready_=false;
+     struct RingCache {NativeAdrenoMemory *ring;NativeAdrenoMemory *fence;};
+     RingCache ring_cache_{};
++    /* The CP ring and fence are the GPU context's own buffers; their cache
++     * maintenance goes through the physical pages those buffers own. */
++    struct GpuCtxCache {
++        uint64_t ring_phys,fence_phys;uintptr_t ring_va,fence_va;
++        size_t ring_bytes,fence_bytes;
++    };
++    GpuCtxCache gpu_ctx_cache_{};
++    static int gpu_ring_publish(void *,const volatile uint32_t *,size_t);
++    static int gpu_fence_acquire(void *,volatile uint32_t *,size_t);
+     static int gpu_read32(void *,uint32_t,uint32_t *);
+     static int gpu_write32(void *,uint32_t,uint32_t);
+     static int gpu_barrier(void *);
+@@ -194,6 +203,33 @@
+     NativeAdrenoGpuService::RingCache *cache=static_cast<RingCache *>(cookie);
+     return cache && cache->fence && cache->fence->acquireDeviceWrites(0,bytes)==kIOReturnSuccess?0:1;
+ }
++/* Whole 4 KiB pages around the touched range: the maintenance helper refuses
++ * unaligned extents, and these buffers are page mapped either way. */
++static int maintainPhysical(uint64_t physical,size_t bytes,NativeAdrenoCacheOperation op)
++{
++    if(!physical || !bytes)return 1;
++    const uint64_t first=physical&~UINT64_C(0xfff);
++    const uint64_t end=(physical+bytes+0xfff)&~UINT64_C(0xfff);
++    return NativeAdrenoMaintainPhysicalPages(first,size_t(end-first),op)?1:0;
++}
++int NativeAdrenoGpuService::gpu_ring_publish(void *cookie,const volatile uint32_t *words,size_t bytes)
++{
++    GpuCtxCache *cache=static_cast<GpuCtxCache *>(cookie);
++    if(!cache || !words || !bytes)return 1;
++    const uintptr_t at=reinterpret_cast<uintptr_t>(words);
++    if(at<cache->ring_va || at-cache->ring_va>cache->ring_bytes ||
++        bytes>cache->ring_bytes-(at-cache->ring_va))return 1;
++    return maintainPhysical(cache->ring_phys+(at-cache->ring_va),bytes,NativeAdrenoClean);
++}
++int NativeAdrenoGpuService::gpu_fence_acquire(void *cookie,volatile uint32_t *words,size_t bytes)
++{
++    GpuCtxCache *cache=static_cast<GpuCtxCache *>(cookie);
++    if(!cache || !words || !bytes)return 1;
++    const uintptr_t at=reinterpret_cast<uintptr_t>(words);
++    if(at<cache->fence_va || at-cache->fence_va>cache->fence_bytes ||
++        bytes>cache->fence_bytes-(at-cache->fence_va))return 1;
++    return maintainPhysical(cache->fence_phys+(at-cache->fence_va),bytes,NativeAdrenoInvalidate);
++}
+ uint64_t NativeAdrenoGpuService::ring_now(void *)
+ {
+     uint64_t microseconds=0;
+@@ -654,6 +690,10 @@
+                                             IOLog("NativeAdreno: GPU context status 0x%x step %u (bank %u asid %u slots %u/%u sids 0/1)\n",
+                                                 gpu_status,gpu_report.step,gpubank,gpuasid,gslot0,gslot1);
+                                             if(!gpu_status) {
++                                                /* Everything downstream (ring, CP, user
++                                                 * client) needs this to be true; it was
++                                                 * never set, so the CP path never ran. */
++                                                gpu_context_ready_=true;
+                                                 NativeAdrenoGpuBuffer b[5]{};
+                                                 if(!NativeAdrenoGpuContextBuffers(b))
+                                                     IOLog("NativeAdreno: GPU buffers sqe 0x%llx ring 0x%llx memptrs 0x%llx pwrup 0x%llx scratch 0x%llx\n",
+@@ -698,84 +738,40 @@
+                                     if(started==ShengGmuSuccess && !gpu_context_ready_) {
+                                         IOLog("NativeAdreno: ring/SQE refused: the GPU context (iommus 0/1) is not built\n");
+                                     } else if(started==ShengGmuSuccess) {
+-                                        IOReturn ring_status=ring_mem_.allocate(ring_bytes,40,true,ring_bytes);
+-                                        if(!ring_status)ring_status=fence_mem_.allocate(fence_bytes,40,true,fence_bytes);
+-                                        if(!ring_status && sqe_bytes)
+-                                            ring_status=sqe_mem_.allocate(size_t(sqe_bytes),40,true,size_t(sqe_bytes));
+-                                        if(!ring_status)ring_status=vm_.map(&ring_mem_,1,ring_iova,3,0,2,&ring_map_);
+-                                        if(!ring_status)ring_status=vm_.map(&fence_mem_,1,fence_iova,3,0,2,&fence_map_);
+-                                        if(!ring_status && fence_mem_.spanCount())native_adreno_fence_phys=fence_mem_.spans()[0].physical;
+-                                        if(!ring_status)ring_status=vm_.map(&sqe_mem_,1,sqe_iova,3,0,2,&sqe_map_);
++                                        /* The CP's ring and fence are the GPU context's own
++                                         * buffers (ring at GpuRingIova, the fence in the
++                                         * memptrs page at GpuMemptrsIova).  The old path
++                                         * allocated separate buffers in the GMU VM at iova 0,
++                                         * which the GPU's streams cannot reach. */
++                                        NativeAdrenoGpuBuffer b[5]{};
++                                        void *ring_cpu=NativeAdrenoGpuContextBufferCpu(1);
++                                        void *fence_cpu=NativeAdrenoGpuContextBufferCpu(2);
++                                        IOReturn ring_status=NativeAdrenoGpuContextBuffers(b);
++                                        if(!ring_status && (!ring_cpu || !fence_cpu))ring_status=kIOReturnNotReady;
+                                         if(ring_status) {
+-                                            IOLog("NativeAdreno: ring/SQE setup stopped at 0x%x\n",ring_status);
++                                            IOLog("NativeAdreno: CP ring: buffers unavailable 0x%x\n",ring_status);
+                                         } else {
+                                             NativeAdrenoGpuWindow gpu_window={
+                                                 reinterpret_cast<volatile uint8_t *>(maps_[0]->getVirtualAddress()),
+                                                 static_cast<size_t>(windows[0].bytes)};
+                                             NativeAdrenoRingIo ring_io{&gpu_window,gpu_write32,gpu_read32,gpu_barrier};
+-                                            ring_cache_={&ring_mem_,&fence_mem_};
+-                                            NativeAdrenoRingCache cache{&ring_cache_,ring_publish,fence_acquire};
+-                                            ring_status=ring_.attach(&ring_io,&cache,ring_mem_.mapping(),
+-                                                ring_bytes,ring_iova,fence_mem_.mapping(),fence_bytes,fence_iova);
+-                                            if(!ring_status && sqe_bytes) {
+-                                                memcpy(sqe_mem_.mapping(),native_adreno_sqe_firmware_image,
+-                                                    size_t(native_adreno_sqe_firmware_image_size));
+-                                                ring_status=sqe_mem_.publishForDevice(0,size_t(sqe_bytes),false);
+-                                            }
++                                            gpu_ctx_cache_={b[1].physical,b[2].physical,
++                                                reinterpret_cast<uintptr_t>(ring_cpu),
++                                                reinterpret_cast<uintptr_t>(fence_cpu),
++                                                static_cast<size_t>(b[1].bytes),
++                                                static_cast<size_t>(b[2].bytes)};
++                                            NativeAdrenoRingCache cache{&gpu_ctx_cache_,gpu_ring_publish,gpu_fence_acquire};
++                                            native_adreno_fence_phys=b[2].physical;
++                                            ring_status=ring_.attach(&ring_io,&cache,ring_cpu,
++                                                static_cast<size_t>(b[1].bytes),GpuRingIova,
++                                                fence_cpu,static_cast<size_t>(b[2].bytes),GpuMemptrsIova);
+                                             if(ring_status)
+-                                                IOLog("NativeAdreno: ring attach stopped at 0x%x\n",ring_status);
++                                                IOLog("NativeAdreno: CP ring attach stopped at 0x%x\n",ring_status);
+                                             else
+-                                                IOLog("NativeAdreno: ring attached ring_iova=0x%llx fence_iova=0x%llx sqe_iova=0x%llx\n",
+-                                                    static_cast<unsigned long long>(ring_iova),
+-                                                    static_cast<unsigned long long>(fence_iova),
+-                                                    static_cast<unsigned long long>(sqe_iova));
+-                                            }
+-                                            if(!ring_status) {
+-                                                NativeAdrenoGpuWindow cp_window={
+-                                                    reinterpret_cast<volatile uint8_t *>(maps_[0]->getVirtualAddress()),
+-                                                    static_cast<size_t>(windows[0].bytes)};
+-                                                NativeAdrenoRingIo cp_io{&cp_window,gpu_write32,gpu_read32,gpu_barrier};
+-                                                ring_status=pwrup_mem_.allocate(0x1000,40,true,0x1000);
+-                                                if(!ring_status)ring_status=vm_.map(&pwrup_mem_,1,
+-                                                    pwrup_iova,3,0,2,&pwrup_map_);
+-                                                size_t list_bytes=0;
+-                                                if(!ring_status)ring_status=NativeAdrenoPwrupList::buildA740(
+-                                                    gpu_read32,&cp_window,
+-                                                    static_cast<uint8_t *>(pwrup_mem_.mapping()),
+-                                                    0x1000,&list_bytes);
+-                                                if(!ring_status)ring_status=pwrup_mem_.publishForDevice(0,0x1000,false);
+-                                                if(!ring_status) {
+-                                                    NativeAdrenoCpInit cp;
+-                                                    NativeAdrenoCpInitConfig cfg{sqe_iova,pwrup_iova,0};
+-                                                    uint32_t start_fence=0;
+-                                                    ring_status=cp.run(&cp_io,&ring_,&cfg,&start_fence);
+-                                                    if(!ring_status) {
+-                                                        NativeAdrenoRingClock clock{nullptr,ring_now,nullptr};
+-                                                        ring_status=ring_.wait(start_fence,&clock,2000,nullptr)
+-                                                            ==NativeAdrenoRingFenceComplete?
+-                                                            kIOReturnSuccess:kIOReturnTimeout;
+-                                                    }
+-                                                    if(!ring_status) {
+-                                                        ring_status=irq_.attach(&cp_io);
+-                                                        if(!ring_status)ring_status=irq_.programMask(nullptr);
+-                                                    }
+-                                                    if(ring_status)
+-                                                        IOLog("NativeAdreno: CP start stopped at 0x%x\n",ring_status);
+-                                                    else
+-                                                    {
+-                                                        execbuf_=new NativeAdrenoSubmit;
+-                                                        core_=new NativeAdrenoUserClient;
+-                                                        if(execbuf_ && core_ &&
+-                                                            execbuf_->attach(&vm_,&ring_)==kIOReturnSuccess &&
+-                                                            core_->open(NativeAdrenoAbiVersion,&vm_,execbuf_,
+-                                                                &ring_,32,40)==kIOReturnSuccess)
+-                                                            core_ready_=true;
+-                                                        ready_=true;
+-                                                        IOLog("NativeAdreno: CP started, fence=%u, interrupts masked=%08x\n",
+-                                                            start_fence,NativeAdrenoIrq::mask());
+-                                                    }
+-                                                }
+-                                            }
++                                                IOLog("NativeAdreno: CP ring attached ring 0x%llx/0x%x fence 0x%llx/0x%x\n",
++                                                    (unsigned long long)GpuRingIova,static_cast<unsigned>(b[1].bytes),
++                                                    (unsigned long long)GpuMemptrsIova,static_cast<unsigned>(b[2].bytes));
++                                        }
+                                     }
+                                     }
+ #else

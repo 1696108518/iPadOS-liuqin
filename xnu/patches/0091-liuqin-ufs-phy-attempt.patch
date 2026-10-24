@@ -1,0 +1,168 @@
+diff --git a/bsd/dev/liuqin_ufs.c b/bsd/dev/liuqin_ufs.c
+index 518e13b..9facf85 100644
+--- a/bsd/dev/liuqin_ufs.c
++++ b/bsd/dev/liuqin_ufs.c
+@@ -431,26 +431,123 @@ ufs_gcc_clocks_on(void)
+ 	delay(1000);
+ }
+ 
+-/* Minimal QMP UFS PHY bring-up: the bootloader powers the PHY down, and
+- * without clearing that the UIC/UniPro commands all fail.  sm8450 uses the
+- * v5 PCS layout (pcs at +0xc00, start 0x000, power-down 0x004, ready 0x180). */
++/* QMP UFS PHY, HS-capable (SM8475).  Ported from the Linux driver's
++ * sm8475_ufsphy_cfg: QMP v6 offsets, sm8475 serdes, sm8550 tx/rx/pcs, plus the
++ * HS-G4 overlay.  The v5 layout tried first wrote into the wrong block and
++ * killed the link outright, which is how these offsets were settled. */
++struct ufs_phy_reg {
++	uint16_t off;
++	uint16_t val;
++};
++
++/* Generated from Linux sm8475_ufsphy_cfg: QMP v6 offsets (pcs 0x400,
++ * tx 0x1000, rx 0x1200, tx2 0x1800, rx2 0x1a00), sm8475 serdes +
++ * sm8550 tx/rx/pcs, plus the HS-G4 overlay.  The v5 layout this replaced
++ * wrote into the wrong block and killed the link. */
++static const struct ufs_phy_reg liuqin_phy_serdes[] = {
++	{0x110,0xd9}, {0x174,0x16}, {0x03c,0x11}, {0x09c,0x00}, {0x120,0x01}, {0x148,0x00}, 
++	{0x088,0x82}, {0x074,0x18}, {0x078,0x18}, {0x080,0xff}, {0x084,0x0c},
++};
++static const struct ufs_phy_reg liuqin_phy_tx[] = {
++	{0x07c,0x05}, {0x030,0x07},
++};
++static const struct ufs_phy_reg liuqin_phy_rx[] = {
++	{0x0d4,0x0c}, {0x208,0xc2}, {0x20c,0xc2}, {0x214,0x1a}, {0x220,0x60}, {0x238,0x9e}, 
++	{0x244,0x60}, {0x25c,0x9e}, {0x260,0x0e}, {0x264,0x36}, {0x270,0x02},
++};
++static const struct ufs_phy_reg liuqin_phy_pcs[] = {
++	{0x18c,0x69}, {0x030,0x0f}, {0x1f4,0x43}, {0x1fc,0x02},
++};
++static const struct ufs_phy_reg liuqin_phy_g4_serdes[] = {
++	{0x140,0x04}, {0x0f4,0x0f}, {0x070,0x14}, {0x028,0x98}, {0x010,0x14}, {0x014,0x18}, 
++	{0x018,0x18}, {0x020,0x32}, {0x024,0x0f},
++};
++static const struct ufs_phy_reg liuqin_phy_g4_tx[] = {
++	{0x108,0x4c},
++};
++static const struct ufs_phy_reg liuqin_phy_g4_rx[] = {
++	{0x178,0x0e},
++};
++static const struct ufs_phy_reg liuqin_phy_g4_pcs[] = {
++	{0x02c,0x0b}, {0x074,0x04}, {0x0bc,0x04},
++};
++
++static void
++ufs_phy_apply(volatile uint8_t *base, uint32_t off,
++    const struct ufs_phy_reg *t, size_t n)
++{
++	for (size_t i = 0; i < n; i++) {
++		*(volatile uint32_t *)(base + off + t[i].off) = t[i].val;
++	}
++}
++
++#define PHY_TBL(t) (t), sizeof(t) / sizeof((t)[0])
++
++/* v6 layout: serdes 0x0, PCS 0x400 (start 0x000, power-down 0x004,
++ * SW reset 0x008, ready 0x1a8), tx/rx 0x1000/0x1200, second lane
++ * 0x1800/0x1a00. */
++enum { PHY_SERDES = 0x000, PHY_PCS = 0x400, PHY_TX = 0x1000, PHY_RX = 0x1200,
++       PHY_TX2 = 0x1800, PHY_RX2 = 0x1a00 };
++
+ static int
+ ufs_phy_wake(void)
+ {
+ 	if (!su.phy) {
+ 		return EIO;
+ 	}
+-	volatile uint32_t *pcs = (volatile uint32_t *)(su.phy + 0xc00);
+-	uint32_t pre_st = pcs[0x00 / 4], pre_pw = pcs[0x04 / 4], pre_rd = pcs[0x180 / 4];
++	volatile uint8_t *phy = (volatile uint8_t *)su.phy;
++	volatile uint32_t *pcs = (volatile uint32_t *)(phy + PHY_PCS);
++	uint32_t pre_rd = pcs[0x1a8 / 4];
++
++	extern int liuqin_console_force;
++	liuqin_console_force = 1;
+ 	printf("LIUQIN UFS: phy pre start 0x%x pwrdn 0x%x ready 0x%x\n",
+-	    pre_st, pre_pw, pre_rd);
+-	pcs[0x04 / 4] = 0;              /* clear SW_PWRDN (power up) */
+-	pcs[0x00 / 4] = 0x3;            /* SERDES_START | PCS_START */
+-	for (int i = 0; i < 1000 && !(pcs[0x180 / 4] & 1); i++) {
++	    pcs[0x000 / 4], pcs[0x004 / 4], pre_rd);
++	liuqin_console_force = 0;
++
++	/*
++	 * The HS tables are opt-in: with them applied the PCS reaches its ready
++	 * state but the UIC commands are refused, so the GCC-side ufsphy reset and
++	 * reference-clock rate that Linux sets up are still missing.  Default boot
++	 * keeps the minimal power-on, which brings the link up in PWM.
++	 */
++	uint32_t hs = 0;
++	PE_parse_boot_argn("ufsphyhs", &hs, sizeof(hs));
++	if (hs) {
++	ufs_phy_apply(phy, PHY_SERDES, PHY_TBL(liuqin_phy_serdes));
++	ufs_phy_apply(phy, PHY_TX, PHY_TBL(liuqin_phy_tx));
++	ufs_phy_apply(phy, PHY_RX, PHY_TBL(liuqin_phy_rx));
++	ufs_phy_apply(phy, PHY_TX2, PHY_TBL(liuqin_phy_tx));
++	ufs_phy_apply(phy, PHY_RX2, PHY_TBL(liuqin_phy_rx));
++	ufs_phy_apply(phy, PHY_PCS, PHY_TBL(liuqin_phy_pcs));
++	ufs_phy_apply(phy, PHY_SERDES, PHY_TBL(liuqin_phy_g4_serdes));
++	ufs_phy_apply(phy, PHY_TX, PHY_TBL(liuqin_phy_g4_tx));
++	ufs_phy_apply(phy, PHY_RX, PHY_TBL(liuqin_phy_g4_rx));
++	ufs_phy_apply(phy, PHY_TX2, PHY_TBL(liuqin_phy_g4_tx));
++	ufs_phy_apply(phy, PHY_RX2, PHY_TBL(liuqin_phy_g4_rx));
++	ufs_phy_apply(phy, PHY_PCS, PHY_TBL(liuqin_phy_g4_pcs));
++	}
++
++	/*
++	 * Order from qmp_ufs_com_init()/qmp_ufs_power_on(): hold the PCS powered
++	 * down while the tables are written, release SW reset, start only the
++	 * SerDes (PCS_START is not set by Linux), then release the power-down.
++	 */
++	if (hs) {
++		pcs[0x004 / 4] = 0x1;          /* SW_PWRDN */
++		pcs[0x008 / 4] = 0x1;          /* SW_RESET asserted */
++		__builtin_arm_dsb(0xf);
++	}
++	pcs[0x008 / 4] = 0;
++	pcs[0x004 / 4] = 0;
++	pcs[0x000 / 4] = pcs[0x000 / 4] | 0x3;
++	for (int i = 0; i < 1000 && !(pcs[0x1a8 / 4] & 1); i++) {
+ 		delay(100);
+ 	}
+-	uint32_t rd = pcs[0x180 / 4];
+-	printf("LIUQIN UFS: phy post pwrdn 0x%x ready 0x%x\n", pcs[0x04 / 4], rd);
++	uint32_t rd = pcs[0x1a8 / 4];
++	liuqin_console_force = 1;
++	printf("LIUQIN UFS: phy post pwrdn 0x%x ready 0x%x\n", pcs[0x004 / 4], rd);
++	liuqin_console_force = 0;
+ 	return (rd & 1) ? 0 : EIO;
+ }
+ 
+@@ -1056,8 +1153,13 @@ liuqin_ufs_init(void)
+ 		int re = softwake ? 0 : ufs_uic(0x12, 0, 0, 0, NULL);  /* DME_ENABLE */
+ 		int rp = ufs_uic(0x10, 0, 0, 0, NULL);  /* DME_POWERON */
+ 		int rl = ufs_uic(0x16, 0, 0, 0, NULL);  /* DME_LINKSTARTUP */
+-		printf("LIUQIN UFS: uic reset %d enable %d poweron %d link %d (softwake %u)\n",
+-		    rr, re, rp, rl, softwake);
++		{
++			extern int liuqin_console_force;
++			liuqin_console_force = 1;
++			printf("LIUQIN UFS: uic reset %d enable %d poweron %d link %d (softwake %u)\n",
++			    rr, re, rp, rl, softwake);
++			liuqin_console_force = 0;
++		}
+ 		if (softwake) {
+ 			extern int liuqin_console_force;
+ 			uint32_t stx = 0, srx = 0, spm = 0;
+@@ -1071,8 +1173,10 @@ liuqin_ufs_init(void)
+ 		}
+ 		uint32_t pm = 0;
+ 		int pq = ufs_query(0x03, 0x02, 0, 0, 0, &pm);
+-		if (pq || pm != 0x11) {
+-			panic("LIUQIN UFS diag: phy=%d reset=%d en=%d pon=%d link=%d pmode=0x%x query=%d",
++		if (pq || (pm != 0x11 && pm != 0x10)) {
++			/* 0x10 = FAST (HS), 0x11 = SLOW (PWM), both are fine now that
++			 * the PHY can do either; anything else is worth a look. */
++			printf("LIUQIN UFS: unexpected power mode (phy=%d reset=%d en=%d pon=%d link=%d pmode=0x%x query=%d)\n",
+ 			    pw, rr, re, rp, rl, pm, pq);
+ 		}
+ 	}

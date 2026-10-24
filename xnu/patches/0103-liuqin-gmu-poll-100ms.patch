@@ -1,0 +1,34 @@
+diff --git a/iokit/NativeAdreno/NativeAdrenoService.cpp b/iokit/NativeAdreno/NativeAdrenoService.cpp
+index d5f909b..7cd0553 100644
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -520,10 +520,12 @@ bool NativeAdrenoGpuService::start(IOService *provider)
+                                             &gmu_device_,&config,&startup,&limits,&gmu_startup_);
+                                         {
+                                             extern volatile uint32_t sheng_gmu_stopped_at;
+-                                            IOLog("NativeAdreno: ColdStart status=%d fw_ready=%u hfi_ready=%u stage=%u stopped_at=%u\n",
++                                            IOLog("NativeAdreno: ColdStart status=%d fw_ready=%u hfi_ready=%u stage=%u stopped_at=%u fw_init=0x%x hfi=0x%x polls=%u\n",
+                                             started,gmu_startup_.load.firmware_ready_observed,
+                                             gmu_startup_.load.hfi_ready_observed,
+-                                            gmu_startup_.protocol.stage,sheng_gmu_stopped_at);
++                                            gmu_startup_.protocol.stage,sheng_gmu_stopped_at,
++                                            gmu_startup_.load.firmware_init_result,gmu_startup_.load.hfi_status,
++                                            gmu_startup_.load.poll_reads);
+                                         }
+                                     if(started==ShengGmuSuccess && !gpu_context_ready_) {
+                                         IOLog("NativeAdreno: ring/SQE refused: the GPU context (iommus 0/1) is not built\n");
+diff --git a/iokit/NativeAdreno/ShengGmu.c b/iokit/NativeAdreno/ShengGmu.c
+index c66e812..1c6e63d 100644
+--- a/iokit/NativeAdreno/ShengGmu.c
++++ b/iokit/NativeAdreno/ShengGmu.c
+@@ -48,7 +48,9 @@ static ShengGmuStatus poll(ShengGmuDevice *d,uint32_t reg,uint32_t mask,
+     last=start;
+     for(unsigned i=0;i<budget;++i) {
+         if(d->services.now_us(d->services.cookie,&now) || now<last)return ShengGmuClockError;
+-        if(now-start>=10000)return ShengGmuTimeout;
++        /* The pinned tree allows 10 ms; the A730's CM3 boot (ICACHE fetch
++         * through the SMMU) regularly takes longer, so give it 100 ms. */
++        if(now-start>=100000)return ShengGmuTimeout;
+         last=now;++r->poll_reads;
+         ShengGmuStatus fault=check_faults(d,r);if(fault!=ShengGmuSuccess)return fault;
+         if(core_read(d,reg,observed,r))return ShengGmuIoError;

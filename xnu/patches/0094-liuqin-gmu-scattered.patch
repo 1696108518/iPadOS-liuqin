@@ -1,0 +1,23 @@
+diff --git a/iokit/NativeAdreno/NativeAdrenoGmuMemory.cpp b/iokit/NativeAdreno/NativeAdrenoGmuMemory.cpp
+index b7fc903..e973ce3 100644
+--- a/iokit/NativeAdreno/NativeAdrenoGmuMemory.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoGmuMemory.cpp
+@@ -29,9 +29,16 @@ IOReturn NativeAdrenoGmuAllocator::allocate(const NativeAdrenoGmuSizes &sizes,un
+         {&hfi_,sizes.hfi,&layout_.hfi_iova,GmuUncachedBase+sizes.dummy+sizes.log},
+         {&tables_,sizes.tables,&layout_.tables_iova,0}};
+     for(const Selection &selection:selections) {
+-        const IOReturn status=selection.memory->allocate(static_cast<size_t>(selection.bytes),
+-            address_bits,true,static_cast<size_t>(selection.bytes));
++        const size_t bytes=static_cast<size_t>(selection.bytes);
++        IOReturn status=selection.memory->allocate(bytes,address_bits,true,bytes);
++        if(status==kIOReturnUnsupported) {
++            /* A physically contiguous run of 16 MiB is not always available;
++             * the SMMU maps the pages individually, so scattered is fine. */
++            IOLog("NativeAdrenoGmu: %zu bytes not contiguous, retrying scattered\n",bytes);
++            status=selection.memory->allocate(bytes,address_bits,false,bytes);
++        }
+         if(status) {
++            IOLog("NativeAdrenoGmu: %zu bytes allocation failed 0x%x\n",bytes,status);
+             (void)releaseAll();
+             return status;
+         }

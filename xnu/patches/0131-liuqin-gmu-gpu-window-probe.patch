@@ -1,0 +1,53 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -61,6 +61,9 @@
+ class NativeAdrenoGpuService : public IOService {
+     OSDeclareDefaultStructors(NativeAdrenoGpuService)
+     OSSharedPtr<IOMemoryMap> maps_[2];
++    /* The GPU register block as the vendor DT and the ladder address it
++     * (0x3d00000) when the ADT's own window does not answer. */
++    OSSharedPtr<IOMemoryMap> alt_gpu_map_;
+     NativeAdrenoGmuContext gmu_ctx_;
+     NativeAdrenoGmuPlatform gmu_platform_;
+     ShengGmuIo gmu_io_{};
+@@ -846,9 +849,40 @@
+                                         if(ring_status) {
+                                             IOLog("NativeAdreno: CP ring: buffers unavailable 0x%x\n",ring_status);
+                                         } else {
++                                            /* The ADT puts the GPU block at windows[0].base
++                                             * (0x2d00000), but the vendor DT names it
++                                             * qcom,kgsl-3d0@3d00000 and the ladder read its
++                                             * registers there; writes through the ADT window
++                                             * are dropped (CP_SQE_INSTR_BASE read back 0).
++                                             * Read a version register through both and keep
++                                             * the window that answers. */
+                                             NativeAdrenoGpuWindow gpu_window={
+                                                 reinterpret_cast<volatile uint8_t *>(maps_[0]->getVirtualAddress()),
+                                                 static_cast<size_t>(windows[0].bytes)};
++                                            {
++                                                uint32_t adt_id=0,adt_status=0,dt_id=0,dt_status=0;
++                                                (void)gpu_read32(&gpu_window,0x0000,&adt_id);
++                                                (void)gpu_read32(&gpu_window,0x0210,&adt_status);
++                                                NativeAdrenoGpuWindow dt_window{nullptr,0x40000};
++                                                IODeviceMemory *stock=IODeviceMemory::withRange(0x3d00000,0x40000);
++                                                if(stock) {
++                                                    alt_gpu_map_=OSSharedPtr<IOMemoryMap>(
++                                                        stock->map(kIOMapAnywhere|kIOMapInhibitCache),OSNoRetain);
++                                                    stock->release();
++                                                }
++                                                if(alt_gpu_map_) {
++                                                    dt_window.base=reinterpret_cast<volatile uint8_t *>(
++                                                        alt_gpu_map_->getVirtualAddress());
++                                                    (void)gpu_read32(&dt_window,0x0000,&dt_id);
++                                                    (void)gpu_read32(&dt_window,0x0210,&dt_status);
++                                                }
++                                                IOLog("NativeAdreno: GPU window ADT 0x%llx id=0x%x status=0x%x | DT 0x3d00000 id=0x%x status=0x%x\n",
++                                                    (unsigned long long)windows[0].base,adt_id,adt_status,dt_id,dt_status);
++                                                if(dt_id && !adt_id) {
++                                                    gpu_window=dt_window;
++                                                    IOLog("NativeAdreno: GPU window switched to the DT address 0x3d00000\n");
++                                                }
++                                            }
+                                             NativeAdrenoRingIo ring_io{&gpu_window,gpu_write32,gpu_read32,gpu_barrier};
+                                             gpu_ctx_cache_={b[1].physical,b[2].physical,
+                                                 reinterpret_cast<uintptr_t>(ring_cpu),

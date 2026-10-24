@@ -1,0 +1,11 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp	2026-10-24 09:19:14
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp	2026-10-24 09:19:14
+@@ -516,7 +516,7 @@
+                                             sheng_gmu_stop_stage=stop;
+                                             sheng_gmu_stopped_at=0;
+                                         }
+-                                        ShengGmuStartupLimits limits{4,100,1000,10000};
++                                        ShengGmuStartupLimits limits{8,200,5000,200000};
+                                         const ShengGmuStatus started=ShengGmuColdStart(
+                                             &gmu_device_,&config,&startup,&limits,&gmu_startup_);
+                                         {

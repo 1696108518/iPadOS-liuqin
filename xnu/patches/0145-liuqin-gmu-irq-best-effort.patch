@@ -1,0 +1,26 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -446,12 +446,19 @@
+     /* The CP is executing; now publish the submission path.  The VM must be the
+      * GPU context's (the GMU VM's iovas are not reachable by the GPU's
+      * streams), and the interrupts/queue/user client are built on this ring. */
++    /* Interrupts are an optimisation here: the ring retires fences by polling
++     * the memptrs page, so a mask register that does not keep every requested
++     * bit must not block the submission path.  Report it and carry on. */
+     IOReturn tail=irq_.attach(&io);
+-    if(!tail) tail=irq_.programMask(nullptr);
++    uint32_t masked=0;
++    if(!tail) tail=irq_.programMask(&masked);
+     if(tail) {
+-        IOLog("NativeAdreno: CP interrupt setup stopped at 0x%x\n",tail);
+-        return tail;
+-    }
++        uint32_t mask_read=~0u,int0=~0u;
++        (void)gpu_read32(&window,0x0038,&mask_read);
++        (void)gpu_read32(&window,0x0201,&int0);
++        IOLog("NativeAdreno: CP interrupt mask 0x%x (want 0x%x, status 0x%x) refused 0x%x; polling fences\n",
++            mask_read,NativeAdrenoIrq::mask(),int0,tail);
++    } else IOLog("NativeAdreno: CP interrupt mask programmed 0x%x\n",masked);
+     NativeAdrenoVm *vm=NativeAdrenoGpuContextVm();
+     if(!vm) {
+         IOLog("NativeAdreno: CP started but the GPU VM is missing\n");

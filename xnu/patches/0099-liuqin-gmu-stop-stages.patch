@@ -1,0 +1,76 @@
+diff --git a/iokit/NativeAdreno/NativeAdrenoService.cpp b/iokit/NativeAdreno/NativeAdrenoService.cpp
+index 106614f..ddfb5b7 100644
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -484,13 +484,23 @@ bool NativeAdrenoGpuService::start(IOService *provider)
+                                          * are built here, not by the framework. */
+                                         gmu_device_.io=gmu_io_;
+                                         gmu_device_.services=services;
++                                        {
++                                            extern volatile uint32_t sheng_gmu_stop_stage,sheng_gmu_stopped_at;
++                                            uint32_t stop=0;
++                                            PE_parse_boot_argn("sheng-gpu-stop",&stop,sizeof(stop));
++                                            sheng_gmu_stop_stage=stop;
++                                            sheng_gmu_stopped_at=0;
++                                        }
+                                         ShengGmuStartupLimits limits{4,100,1000,10000};
+                                         const ShengGmuStatus started=ShengGmuColdStart(
+                                             &gmu_device_,&config,&startup,&limits,&gmu_startup_);
+-                                        IOLog("NativeAdreno: ColdStart status=%d fw_ready=%u hfi_ready=%u stage=%u\n",
+-                                        started,gmu_startup_.load.firmware_ready_observed,
+-                                        gmu_startup_.load.hfi_ready_observed,
+-                                        gmu_startup_.protocol.stage);
++                                        {
++                                            extern volatile uint32_t sheng_gmu_stopped_at;
++                                            IOLog("NativeAdreno: ColdStart status=%d fw_ready=%u hfi_ready=%u stage=%u stopped_at=%u\n",
++                                            started,gmu_startup_.load.firmware_ready_observed,
++                                            gmu_startup_.load.hfi_ready_observed,
++                                            gmu_startup_.protocol.stage,sheng_gmu_stopped_at);
++                                        }
+                                     if(started==ShengGmuSuccess && !gpu_context_ready_) {
+                                         IOLog("NativeAdreno: ring/SQE refused: the GPU context (iommus 0/1) is not built\n");
+                                     } else if(started==ShengGmuSuccess) {
+diff --git a/iokit/NativeAdreno/ShengGmu.c b/iokit/NativeAdreno/ShengGmu.c
+index af60d3a..c66e812 100644
+--- a/iokit/NativeAdreno/ShengGmu.c
++++ b/iokit/NativeAdreno/ShengGmu.c
+@@ -4,5 +4,9 @@
+ /* Generated only from exact pinned XML/catalog/DT/firmware policy; ignored.
+  * In particular, no vendor firmware or sequencer payload is stored in Git. */
+ #include "ShengGmuSource.h"
++/* liuqin port: sheng-gpu-stop=N returns after stage N without any cleanup
++ * write, to bisect a board reset in the write path. */
++volatile uint32_t sheng_gmu_stop_stage;
++volatile uint32_t sheng_gmu_stopped_at;
+ #if !defined(__aarch64__) || __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
+ #error sheng GMU requires little-endian AArch64
+@@ -116,11 +120,13 @@ ShengGmuStatus ShengGmuLoadAndStartHfi(ShengGmuDevice *d,const ShengGmuConfig *c
+         if(write32(d,w->window,w->byte_offset,w->value,r)) {status=ShengGmuIoError;goto failed;}
+     }
+     if(d->io.barrier(d->io.cookie)) {status=ShengGmuIoError;goto failed;}
++    if(sheng_gmu_stop_stage==1) {sheng_gmu_stopped_at=1;return ShengGmuStateMismatch;}
+     if(core_write(d,REG_GPU_GMU_CX_GMU_CX_FALNEXT_INTF,1,r) ||
+         core_write(d,REG_GPU_GMU_CX_GMU_CX_FAL_INTF,1,r) ||
+         write32(d,ShengGmuCxMisc,REG_CX_MISC_TCM_RET_CNTL*4,1,r)) {status=ShengGmuIoError;goto failed;}
+     if(d->io.barrier(d->io.cookie) || read32(d,ShengGmuCxMisc,REG_CX_MISC_TCM_RET_CNTL*4,&value,r)) {status=ShengGmuIoError;goto failed;}
+     if(value!=1) {status=ShengGmuStateMismatch;goto failed;}
++    if(sheng_gmu_stop_stage==2) {sheng_gmu_stopped_at=2;return ShengGmuStateMismatch;}
+     /* All shared allocations are real owned coherent memory, not simulated
+      * GMU addresses. Zero only after actual stopped/idle checks above. */
+     const ShengGmuMemory *memory[]={&c->icache,&c->dummy,&c->debug,&c->log};
+@@ -160,6 +166,7 @@ ShengGmuStatus ShengGmuLoadAndStartHfi(ShengGmuDevice *d,const ShengGmuConfig *c
+             if(value!=le32(c->firmware+b->payload_offset+at)) {status=ShengGmuStateMismatch;goto failed;}
+         }
+     }
++    if(sheng_gmu_stop_stage==3) {sheng_gmu_stopped_at=3;return ShengGmuStateMismatch;}
+     r->phase=4;
+     if(core_write(d,REG_GMU_CM3_FW_INIT_RESULT,0,r) ||
+         core_write(d,REG_GMU_CM3_BOOT_CONFIG,2,r) ||
+@@ -187,6 +194,7 @@ ShengGmuStatus ShengGmuLoadAndStartHfi(ShengGmuDevice *d,const ShengGmuConfig *c
+         if(value!=config_values[i]) {status=ShengGmuStateMismatch;goto failed;}
+     }
+     r->reset_verified=0;
++    if(sheng_gmu_stop_stage==4) {sheng_gmu_stopped_at=4;return ShengGmuStateMismatch;}
+     if(core_write(d,REG_GMU_CM3_SYSRESET,0,r) || d->io.barrier(d->io.cookie)) {status=ShengGmuIoError;goto failed;}
+     r->phase=5;
+     status=poll(d,REG_GMU_CM3_FW_INIT_RESULT,mask,ready,c->poll_budget,&r->firmware_init_result,r);

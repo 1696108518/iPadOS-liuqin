@@ -1,0 +1,54 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -597,24 +597,41 @@
+                                             config.hfi.cpu[2056],config.hfi.cpu[2057],
+                                             config.hfi.cpu[2058],config.hfi.cpu[2059]);
+                                     }
+-                                    if(started==ShengGmuSuccess) {
++                                    /* sheng-gpu-ctx=0 keeps the GPU context out of the
++                                     * boot, so a fault in it can be bisected without
++                                     * losing the rest of the bring-up. */
++                                    uint32_t gpu_ctx_enable=1;
++                                    PE_parse_boot_argn("sheng-gpu-ctx",&gpu_ctx_enable,sizeof(gpu_ctx_enable));
++                                    if(started==ShengGmuSuccess && gpu_ctx_enable) {
+                                         /* GPU bank/asid 2, streams 0 and 1 (the ladder's
+                                          * choice); the two SMR slots default to the first
+                                          * free ones after the GMU's. */
++                                        /* Breadcrumbs: the previous boot died after the HFI
++                                         * dump and before the first GPU-context line, i.e. in
++                                         * one of these statements. Each is logged before it
++                                         * runs so the screen names the one that faults. */
++                                        IOLog("NativeAdreno: A1 started=%d hfi_mode=%u slot=%u\n",
++                                            started,hfi_mode,slot);
+                                         unsigned gpubank=2,gpuasid=2,gslot0=0xffffffffu,gslot1=0xffffffffu;
+                                         PE_parse_boot_argn("sheng-gpu-gpubank",&gpubank,sizeof(gpubank));
+                                         PE_parse_boot_argn("sheng-gpu-gpuasid",&gpuasid,sizeof(gpuasid));
+                                         PE_parse_boot_argn("sheng-gpu-gpuslot0",&gslot0,sizeof(gslot0));
+                                         PE_parse_boot_argn("sheng-gpu-gpuslot1",&gslot1,sizeof(gslot1));
++                                        IOLog("NativeAdreno: A2 bank=%u asid=%u smmu=%p bytes=%u\n",
++                                            gpubank,gpuasid,(void *)smmu_base,(unsigned)smmu_bytes);
+                                         volatile uint32_t *smmu=reinterpret_cast<volatile uint32_t *>(smmu_base);
+                                         for(unsigned i=0;i<32;++i) {
+                                             if(i==slot)continue;
++                                            if((i&7)==0) IOLog("NativeAdreno: A3 i=%u smr=%08x s2cr=%08x\n",
++                                                i,static_cast<unsigned>(smmu[0x800/4+i]),
++                                                static_cast<unsigned>(smmu[0xc00/4+i]));
+                                             const bool free=!(smmu[0x800/4+i]&0x80000000u) &&
+                                                 ((smmu[0xc00/4+i]>>16)&3)==2;
+                                             if(!free || i==gslot0 || i==gslot1)continue;
+                                             if(gslot0==0xffffffffu)gslot0=i;
+                                             else if(gslot1==0xffffffffu)gslot1=i;
+                                         }
++                                        IOLog("NativeAdreno: A4 slots %u/%u\n",gslot0,gslot1);
+                                         if(gslot0==0xffffffffu || gslot1==0xffffffffu) {
+                                             IOLog("NativeAdreno: GPU context: no free stream slots\n");
+                                         } else {
+@@ -637,6 +654,8 @@
+                                                         (unsigned long long)b[4].iova);
+                                             }
+                                         }
++                                    } else if(started==ShengGmuSuccess) {
++                                        IOLog("NativeAdreno: GPU ctx skipped by sheng-gpu-ctx=0\n");
+                                     }
+                                     {
+                                         /* Put the A730 SQE microcode into the GPU context's

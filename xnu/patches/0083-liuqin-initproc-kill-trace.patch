@@ -1,0 +1,29 @@
+diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
+index ca53f9b..16051ad 100644
+--- a/bsd/kern/kern_sig.c
++++ b/bsd/kern/kern_sig.c
+@@ -2571,12 +2571,24 @@ psignal(proc_t p, int signum)
+ void
+ psignal_with_reason(proc_t p, int signum, struct os_reason *signal_reason)
+ {
++	if (p == initproc && signum == SIGKILL) {
++		printf("LIUQIN: initproc SIGKILL ns %d code 0x%llx caller %p\n",
++		    signal_reason ? (int)signal_reason->osr_namespace : -1,
++		    signal_reason ? (unsigned long long)signal_reason->osr_code : 0ULL,
++		    __builtin_return_address(0));
++	}
+ 	psignal_internal(p, NULL, NULL, 0, signum, signal_reason);
+ }
+ 
+ void
+ psignal_sigkill_with_reason(struct proc *p, struct os_reason *signal_reason)
+ {
++	if (p == initproc) {
++		printf("LIUQIN: initproc sigkill2 ns %d code 0x%llx caller %p\n",
++		    signal_reason ? (int)signal_reason->osr_namespace : -1,
++		    signal_reason ? (unsigned long long)signal_reason->osr_code : 0ULL,
++		    __builtin_return_address(0));
++	}
+ 	psignal_internal(p, NULL, NULL, 0, SIGKILL, signal_reason);
+ }
+ 

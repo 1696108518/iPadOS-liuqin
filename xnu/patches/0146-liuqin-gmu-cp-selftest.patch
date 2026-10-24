@@ -1,0 +1,38 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -446,6 +446,35 @@
+     /* The CP is executing; now publish the submission path.  The VM must be the
+      * GPU context's (the GMU VM's iovas are not reachable by the GPU's
+      * streams), and the interrupts/queue/user client are built on this ring. */
++    /* Kernel-side self test: one general-purpose PM4 packet the CP must execute
++     * (CP_MEM_WRITE of a magic word into the scratch page), retired by the same
++     * timestamp fence.  This is the first proof that arbitrary command streams
++     * run, not just the init sequence. */
++    {
++        uint32_t self_test=1;
++        PE_parse_boot_argn("sheng-gpu-selftest",&self_test,sizeof(self_test));
++        void *scratch=NativeAdrenoGpuContextBufferCpu(4);
++        if(self_test && scratch && b[4].physical) {
++            volatile uint32_t *cell=static_cast<volatile uint32_t *>(scratch)+(0x40/4);
++            *cell=0;
++            (void)maintainPhysical(b[4].physical,0x1000,NativeAdrenoCleanInvalidate);
++            uint32_t pm4[8]={0},fence=0;
++            IOReturn st=kIOReturnError;
++            if(AdrenoPM4Type7(0x3d,3,&pm4[0])==AdrenoPM4Success) {  /* CP_MEM_WRITE */
++                pm4[1]=(uint32_t)(GpuScratchIova+0x40);
++                pm4[2]=0;
++                pm4[3]=0x600dc0deu;
++                st=ring_.submit(pm4,4,&fence);
++            }
++            uint32_t seen=0;
++            NativeAdrenoRingClock clock{nullptr,ring_now,nullptr};
++            const NativeAdrenoRingFence f=!st?ring_.wait(fence,&clock,1000,&seen):
++                NativeAdrenoRingFencePoisoned;
++            (void)maintainPhysical(b[4].physical,0x1000,NativeAdrenoInvalidate);
++            IOLog("NativeAdreno: CP self-test submit 0x%x fence=%u result=%u observed=%u wrote=0x%08x (want 0x600dc0de)\n",
++                st,fence,unsigned(f),seen,*cell);
++        }
++    }
+     /* Interrupts are an optimisation here: the ring retires fences by polling
+      * the memptrs page, so a mask register that does not keep every requested
+      * bit must not block the submission path.  Report it and carry on. */

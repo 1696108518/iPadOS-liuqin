@@ -1,0 +1,29 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -373,6 +373,26 @@
+     (void)gpu_read32(&window,0x0831,&sqe_hi);
+     IOLog("NativeAdreno: CP SQE alive rbbm=0x%x hw_fault=0x%x rptr=%u sqe=0x%x%08x (want 0x%llx) rb=0x%x%08x\n",
+         rbbm,fault,rptr,sqe_hi,sqe_lo,(unsigned long long)GpuSqeIova,rb_hi,rb_lo);
++    /* Probe first: a submission made only of NOPs whose sole effect is the
++     * ring's own timestamp event write.  If this fence arrives the CP executes
++     * the ring and the event packet is right, and anything that fails after it
++     * is the ME_INIT payload; if it does not arrive, the event/timestamp path
++     * is what is wrong, independently of ME_INIT. */
++    {
++        uint32_t nop[2]={0};
++        uint32_t probe_fence=0;
++        if(AdrenoPM4Type7(0x10,1,&nop[0])==AdrenoPM4Success) {
++            nop[1]=0;                        /* CP_NOP, one payload word */
++            IOReturn probe=ring_.submit(nop,2,&probe_fence);
++            uint32_t seen=0;
++            NativeAdrenoRingClock clock{nullptr,ring_now,nullptr};
++            if(!probe) {
++                const NativeAdrenoRingFence f=ring_.wait(probe_fence,&clock,500,&seen);
++                IOLog("NativeAdreno: CP probe fence=%u result=%u observed=%u\n",
++                    probe_fence,unsigned(f),seen);
++            } else IOLog("NativeAdreno: CP probe submit 0x%x\n",probe);
++        }
++    }
+     /* The ladder's a7xx_cp_init payload exactly: CP_THREAD_CONTROL with
+      * concurrent binning disabled, then CP_ME_INIT with **no** power-up
+      * register list (the kit's form points the CP at the list, and the CP stops

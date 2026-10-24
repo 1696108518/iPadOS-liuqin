@@ -1,0 +1,538 @@
+--- a/bsd/dev/liuqin_ufs.c
++++ b/bsd/dev/liuqin_ufs.c
+@@ -62,6 +62,10 @@
+ #define REG_UTRLDBR     0x58
+ #define REG_UTRLCLR     0x5c
+ #define REG_UTRLRSR     0x60
++#define REG_UICCMD      0x90
++#define REG_UICARG1     0x94
++#define REG_UICARG2     0x98
++#define REG_UICARG3     0x9c
+ 
+ #define HCS_DP          (1u << 0)
+ #define HCS_UTRLRDY     (1u << 1)
+@@ -98,6 +102,8 @@
+ 
+ static struct {
+ 	vm_offset_t regs;
++	vm_offset_t phy;                        /* QMP UFS PHY registers */
++	vm_offset_t gcc;                        /* GCC clock controller */
+ 	vm_offset_t dma;                        /* kernel VA of the DMA allocation */
+ 	uint64_t dma_pa;
+ 	uint8_t lun;
+@@ -164,8 +170,10 @@
+ 	ucd->cmd[15] = (uint8_t)len;
+ 	memcpy(&ucd->cmd[16], cdb, cdb_len);
+ 
+-	/* DD: 1 = memory to device, 2 = device to memory. */
+-	utrd->dw0 = (1u << 28) | ((len ? (write ? 1u : 2u) : 0u) << 25) | (1u << 24);
++	/* UTRD dword 0: bit 28 = command type 1 (as u-boot/Linux program it),
++	 * bits 25..26 = data direction, bit 24 = interrupt. */
++	uint32_t dir = len ? (write ? 1u : 2u) : 0u;
++	utrd->dw0 = (1u << 28) | (dir << 25) | (1u << 24);
+ 	utrd->dw2 = 0x0f;                       /* OCS invalid until updated */
+ 	utrd->ucdba = (uint32_t)ucd_pa;
+ 	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
+@@ -247,13 +255,233 @@
+ 
+ 	uint32_t ocs = utrd->dw2 & 0xff;
+ 	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
+-		printf("LIUQIN UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
+-		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
++		printf("LIUQIN UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x key 0x%x asc 0x%x ascq 0x%x\n",
++		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7],
++		    ucd->resp[36] & 0xf, ucd->resp[46], ucd->resp[47]);
++		static int dbg_once;
++		if (!dbg_once) {
++			const uint32_t *w = (const uint32_t *)ucd->resp;
++			dbg_once = 1;
++			printf("LIUQIN UFS: utrd %08x %08x %08x %08x\n",
++			    utrd->dw0, utrd->dw1, utrd->dw2, utrd->dw3);
++			printf("LIUQIN UFS: rsp0 %08x %08x %08x %08x %08x %08x %08x %08x\n",
++			    w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++			printf("LIUQIN UFS: rsp8 %08x %08x %08x %08x %08x %08x %08x %08x\n",
++			    w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]);
++		}
++		return EIO;
++	}
++	return 0;
++}
++
++/*
++ * One UFS Query Request UPIU (no data segment). Used for the device
++ * initialisation flag sequence, which the bootloader may not have run.
++ * Returns 0 on success and stores the query value in *out.
++ */
++/* Deassert the GCC UFS PHY block reset; the bootloader may leave it asserted
++ * after powering the block down, which makes every PHY register read zero. */
++static void
++ufs_gcc_phy_reset(void)
++{
++	if (!su.gcc) {
++		return;
++	}
++	volatile uint32_t *bcr = (volatile uint32_t *)(su.gcc + 0x87000);
++	printf("LIUQIN UFS: gcc bcr before %08x\n", *bcr);
++	*bcr = 0;
++	delay(2000);
++	printf("LIUQIN UFS: gcc bcr after %08x\n", *bcr);
++}
++
++/* Turn on the GCC clocks that gate the UFS PHY register interface.  The
++ * bootloader leaves the PHY core running (the link works) but gates the
++ * aux/apb clock, so the PCS registers read back as zero. */
++static void
++ufs_gcc_clocks_on(void)
++{
++	static const uint32_t cbcr[] = {
++		0x87018,        /* gcc_ufs_phy_axi_clk */
++		0x87020,        /* gcc_ufs_phy_ahb_clk */
++		0x87064,        /* gcc_ufs_phy_unipro_core_clk */
++		0x8706c,        /* gcc_ufs_phy_ice_core_clk */
++		0x870a4,        /* gcc_ufs_phy_phy_aux_clk */
++	};
++	if (!su.gcc) {
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(cbcr) / sizeof(cbcr[0]); i++) {
++		volatile uint32_t *r = (volatile uint32_t *)(su.gcc + cbcr[i]);
++		*r = *r | 1u;
++	}
++	/* root generator enable for the aux clock */
++	{
++		volatile uint32_t *r = (volatile uint32_t *)(su.gcc + 0x870a8);
++		*r = *r | 1u;
++	}
++	delay(1000);
++}
++
++/* Minimal QMP UFS PHY bring-up: the bootloader powers the PHY down, and
++ * without clearing that the UIC/UniPro commands all fail.  sm8450 uses the
++ * v5 PCS layout (pcs at +0xc00, start 0x000, power-down 0x004, ready 0x180). */
++static int
++ufs_phy_wake(void)
++{
++	if (!su.phy) {
++		return EIO;
++	}
++	volatile uint32_t *pcs = (volatile uint32_t *)(su.phy + 0xc00);
++	uint32_t pre_st = pcs[0x00 / 4], pre_pw = pcs[0x04 / 4], pre_rd = pcs[0x180 / 4];
++	printf("LIUQIN UFS: phy pre start 0x%x pwrdn 0x%x ready 0x%x\n",
++	    pre_st, pre_pw, pre_rd);
++	pcs[0x04 / 4] = 0;              /* clear SW_PWRDN (power up) */
++	pcs[0x00 / 4] = 0x3;            /* SERDES_START | PCS_START */
++	for (int i = 0; i < 1000 && !(pcs[0x180 / 4] & 1); i++) {
++		delay(100);
++	}
++	uint32_t rd = pcs[0x180 / 4];
++	printf("LIUQIN UFS: phy post pwrdn 0x%x ready 0x%x\n", pcs[0x04 / 4], rd);
++	return (rd & 1) ? 0 : EIO;
++}
++
++/* Stop and re-enable the host controller (u-boot/Linux do this when link
++ * startup fails), then the caller must re-program the request list. */
++static int
++ufs_hba_restart(void)
++{
++	ufs_wr(REG_HCE, 0);
++	for (int i = 0; i < 1000 && (ufs_rd(REG_HCE) & 1); i++) {
++		delay(1);
++	}
++	ufs_wr(REG_HCE, 1);
++	for (int i = 0; i < 1000 && !(ufs_rd(REG_HCE) & 1); i++) {
++		delay(1);
++	}
++	for (int i = 0; i < 1000 && ((ufs_rd(REG_HCS) & 0xf) != 0xf); i++) {
++		delay(1);
++	}
++	return (ufs_rd(REG_HCE) & 1) ? 0 : EIO;
++}
++
++/* One UIC command (link startup, DME get/set). Returns the result code. */
++static int
++ufs_uic(uint8_t opcode, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t *out)
++{
++	uint64_t deadline;
++
++	if (!(ufs_rd(REG_HCS) & 0x8)) {          /* UIC_COMMAND_READY */
++		printf("LIUQIN UFS: UIC not ready (hcs 0x%x)\n", ufs_rd(REG_HCS));
++		return EBUSY;
++	}
++	ufs_wr(REG_UICARG1, a1);
++	ufs_wr(REG_UICARG2, a2);
++	ufs_wr(REG_UICARG3, a3);
++	ufs_wr(REG_UICCMD, opcode & 0xff);
++
++	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	while (!(ufs_rd(REG_IS) & 0x400)) {     /* UIC_COMMAND_COMPL */
++		if (mach_absolute_time() > deadline) {
++			printf("LIUQIN UFS: UIC 0x%02x timed out (is 0x%x)\n",
++			    opcode, ufs_rd(REG_IS));
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++	ufs_wr(REG_IS, ufs_rd(REG_IS));
++	if (out) {
++		*out = ufs_rd(REG_UICARG3);
++	}
++	return (int)(ufs_rd(REG_UICARG2) & 0xff);
++}
++
++static const uint8_t *ucd_dbg;
++
++static int
++ufs_query(uint8_t opcode, uint8_t idn, uint8_t index, uint16_t length,
++    uint32_t value, uint32_t *out)
++{
++	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
++	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
++	uint64_t ucd_pa = su.dma_pa + DMA_UCD;
++
++	bzero(utrd, sizeof(*utrd));
++	bzero(ucd, sizeof(*ucd));
++
++	ucd->cmd[0] = 0x16;			/* QUERY REQUEST UPIU */
++	ucd->cmd[1] = 0;
++	ucd->cmd[2] = 0;			/* LUN 0 */
++	ucd->cmd[3] = ++su.tag;
++	ucd->cmd[4] = 0;
++	ucd->cmd[5] = (opcode == 0x01 || opcode == 0x03 ||
++	    opcode == 0x05) ? 0x01 : 0x81;	/* read / write function */
++	ucd->cmd[6] = 0;
++	ucd->cmd[7] = 0;
++	ucd->cmd[12] = opcode;
++	ucd->cmd[13] = idn;
++	ucd->cmd[14] = index;
++	ucd->cmd[15] = 0;
++	/* reserved_osf is bytes 16-17, the descriptor length is 18-19 */
++	ucd->cmd[18] = (uint8_t)(length >> 8);
++	ucd->cmd[19] = (uint8_t)length;
++	ucd->cmd[20] = (uint8_t)(value >> 24);
++	ucd->cmd[21] = (uint8_t)(value >> 16);
++	ucd->cmd[22] = (uint8_t)(value >> 8);
++	ucd->cmd[23] = (uint8_t)value;
++
++	/* Query commands are native UFS commands (command type 1). */
++	utrd->dw0 = (1u << 28) | (1u << 24);
++	utrd->dw2 = 0x0f;
++	utrd->ucdba = (uint32_t)ucd_pa;
++	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
++	utrd->resp = (512u / 4) << 16 | (512u / 4);
++
++	dma_sync(DMA_UTRL, sizeof(*utrd));
++	dma_sync(DMA_UCD, sizeof(*ucd));
++	__builtin_arm_dsb(0xf);
++
++	ufs_wr(REG_UTRLDBR, 1);
++	uint64_t deadline;
++	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	while (ufs_rd(REG_UTRLDBR) & 1) {
++		if (mach_absolute_time() > deadline) {
++			ufs_wr(REG_UTRLCLR, ~1u);
++			printf("LIUQIN UFS: query 0x%02x timed out\n", opcode);
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++	__builtin_arm_dsb(0xf);
++	ufs_wr(REG_IS, ufs_rd(REG_IS));
++	dma_sync(DMA_UCD + offsetof(struct ucd, resp), sizeof(ucd->resp));
++	ucd_dbg = ucd->resp;
++
++	if (ucd->resp[0] != 0x36 || ucd->resp[6]) {
++		printf("LIUQIN UFS: query 0x%02x idn 0x%02x failed: upiu 0x%x response 0x%x\n",
++		    opcode, idn, ucd->resp[0], ucd->resp[6]);
+ 		return EIO;
+ 	}
++	if (out) {
++		*out = (uint32_t)ucd->resp[20] << 24 |
++		    (uint32_t)ucd->resp[21] << 16 |
++		    (uint32_t)ucd->resp[22] << 8 | ucd->resp[23];
++	}
+ 	return 0;
+ }
+ 
++/* Same, addressed to an explicit LUN (0x81 is the REPORT LUNS well-known LU). */
++static int
++ufs_scsi_lun(uint32_t lun, const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
++{
++	uint32_t save = su.lun;
++	su.lun = lun;
++	int e = ufs_scsi(cdb, cdb_len, len, write);
++	su.lun = save;
++	return e;
++}
++
+ /* READ(10) of count device blocks at lba into the bounce buffer. */
+ static int
+ ufs_read_blocks(uint64_t lba, uint32_t count)
+@@ -300,52 +528,78 @@
+ static int
+ ufs_find_partition(const char *want)
+ {
+-	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
+-	int error = ufs_read_blocks(1, 1);
+-	if (error) {
+-		return error;
+-	}
+-	if (memcmp(b, "EFI PART", 8) != 0) {
+-		printf("LIUQIN UFS: LUN %u has no GPT\n", su.lun);
+-		return ENXIO;
+-	}
+-	uint64_t entry_lba;
+-	uint32_t nent, esz;
+-	memcpy(&entry_lba, b + 72, 8);
+-	memcpy(&nent, b + 80, 4);
+-	memcpy(&esz, b + 84, 4);
+-	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
+-		printf("LIUQIN UFS: unsupported GPT entries %u x %u\n", nent, esz);
+-		return ENXIO;
+-	}
+-	error = ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
+-	if (error) {
+-		return error;
+-	}
+-	for (uint32_t i = 0; i < nent; i++) {
+-		const uint8_t *e = b + i * esz;
+-		char name[37];
+-		unsigned c;
+-		for (c = 0; c < 36; c++) {
+-			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
+-			if (ch == 0 || ch > 0x7f) {
+-				break;
+-			}
+-			name[c] = (char)ch;
++	const uint8_t *buf = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	static const uint8_t tur[6] = { 0x00 };
++
++	for (uint32_t lun = 0; lun < 8; lun++) {
++		su.lun = lun;
++		int error = ufs_scsi(tur, sizeof(tur), 0, false);
++		for (int i = 0; i < 10 && error; i++) {
++			delay(10000);           /* clear the post-reset unit attention */
++			error = ufs_scsi(tur, sizeof(tur), 0, false);
+ 		}
+-		name[c] = 0;
+-		if (strcmp(name, want) != 0) {
++		if (error) {
++			printf("LIUQIN UFS: lun %u tur %d\n", lun, error);
+ 			continue;
+ 		}
+-		uint64_t first, last;
+-		memcpy(&first, e + 32, 8);
+-		memcpy(&last, e + 40, 8);
+-		if (last < first) {
+-			return ENXIO;
++		/* 4 KiB logical blocks: the GPT header is at LBA 1 (byte 4096). */
++		error = ufs_read_blocks(1, 1);
++		if (error) {
++			printf("LIUQIN UFS: lun %u read %d\n", lun, error);
++			continue;
+ 		}
+-		su.first_block = first;
+-		su.nblocks = last - first + 1;
+-		return 0;
++		if (memcmp(buf, "EFI PART", 8) != 0) {
++			printf("LIUQIN UFS: lun %u hdr %02x%02x%02x%02x\n",
++			    lun, buf[0], buf[1], buf[2], buf[3]);
++			continue;
++		}
++		printf("LIUQIN UFS: lun %u gpt ok\n", lun);
++		uint64_t entry_lba;
++		uint32_t nent, esz;
++		memcpy(&entry_lba, buf + 72, 8);
++		memcpy(&nent, buf + 80, 4);
++		memcpy(&esz, buf + 84, 4);
++		if (esz != 128 || nent == 0 || nent > 256) {
++			printf("LIUQIN UFS: lun %u entries %u x %u\n", lun, nent, esz);
++			continue;
++		}
++		uint32_t nblk = (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK;
++		if (entry_lba > UINT32_MAX || nblk > BOUNCE_SIZE / UFS_BLOCK) {
++			continue;
++		}
++		error = ufs_read_blocks(entry_lba, nblk);
++		if (error) {
++			printf("LIUQIN UFS: lun %u ent read %d\n", lun, error);
++			continue;
++		}
++		for (uint32_t i = 0; i < nent; i++) {
++			const uint8_t *e = buf + i * esz;
++			char name[37];
++			unsigned c;
++			for (c = 0; c < 36; c++) {
++				uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++				if (ch == 0 || ch > 0x7f) {
++					break;
++				}
++				name[c] = (char)ch;
++			}
++			name[c] = 0;
++			if (strcmp(name, want) != 0) {
++				continue;
++			}
++			uint64_t first, last;
++			memcpy(&first, e + 32, 8);
++			memcpy(&last, e + 40, 8);
++			if (last < first) {
++				continue;
++			}
++			su.first_block = first;
++			su.nblocks = last - first + 1;
++			printf("LIUQIN UFS: lun %u found \"%s\" at block 0x%llx (%llu blocks)\n",
++			    lun, want, first, su.nblocks);
++			return 0;
++		}
++		printf("LIUQIN UFS: lun %u no \"%s\"\n", lun, want);
+ 	}
+ 	printf("LIUQIN UFS: no GPT partition named \"%s\"\n", want);
+ 	return ENOENT;
+@@ -606,6 +860,8 @@
+ 	su.wait = (wait == 1);
+ 
+ 	su.regs = ml_io_map(reg[0], reg[1]);
++	su.phy = ml_io_map(0x1d80000, 0x2000);   /* QMP UFS PHY (ufsphy_mem) */
++	su.gcc = ml_io_map(0x100000, 0x200000); /* GCC */
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("LIUQIN UFS: no contiguous DMA memory\n");
+@@ -622,10 +878,126 @@
+ 	lck_mtx_lock(&liuqin_ufs_lock);
+ 	error = ufs_take_over_host();
+ 	if (!error) {
++		/* Do NOT touch HCE: stopping it kills the Qualcomm PHY and the
++		 * controller never comes back without the vendor init sequence.
++		 * Try to bring the link back up instead. */
++		ufs_gcc_clocks_on();
++		ufs_gcc_phy_reset();
++		{
++			volatile uint32_t *a = (volatile uint32_t *)(su.phy + 0x1000);
++			volatile uint32_t *b = (volatile uint32_t *)(su.phy + 0x1800);
++			printf("LIUQIN UFS: pcsA %08x %08x %08x %08x\n",
++			    a[0x000 / 4], a[0x004 / 4], a[0x008 / 4], a[0x180 / 4]);
++			printf("LIUQIN UFS: pcsB %08x %08x %08x %08x\n",
++			    b[0x000 / 4], b[0x004 / 4], b[0x008 / 4], b[0x180 / 4]);
++		}
++		int pw = ufs_phy_wake();
++		int rr = ufs_uic(0x14, 0, 0, 0, NULL);  /* DME_RESET */
++		int re = ufs_uic(0x12, 0, 0, 0, NULL);  /* DME_ENABLE */
++		int rp = ufs_uic(0x10, 0, 0, 0, NULL);  /* DME_POWERON */
++		int rl = ufs_uic(0x16, 0, 0, 0, NULL);  /* DME_LINKSTARTUP */
++		printf("LIUQIN UFS: uic reset %d enable %d poweron %d link %d\n",
++		    rr, re, rp, rl);
++		uint32_t pm = 0;
++		int pq = ufs_query(0x03, 0x02, 0, 0, 0, &pm);
++		if (pq || pm != 0x11) {
++			panic("LIUQIN UFS diag: phy=%d reset=%d en=%d pon=%d link=%d pmode=0x%x query=%d",
++			    pw, rr, re, rp, rl, pm, pq);
++		}
++	}
++	if (!error) {
++		uint32_t v = 0;
++		int qe;
++		/* Poll and retry for up to ~5 s while the device powers up. */
++		for (int i = 0; i < 50; i++) {
++			qe = ufs_query(0x03, 0x02, 0, 0, 0, &v);
++			if (!qe && v == 0x11) {
++				break;
++			}
++			if (!qe) {
++				ufs_query(0x04, 0x02, 0, 0, 0x11, NULL);
++			}
++			delay(100000);      /* 100 ms; delay() is microseconds */
++		}
++		printf("LIUQIN UFS: power mode 0x%x (query %d)\n", v, qe);
++		qe = ufs_query(0x05, 0x01, 0, 0, 0, &v);        /* READ_FLAG fDeviceInit */
++		printf("LIUQIN UFS: READ_FLAG fDeviceInit -> %d val 0x%x\n", qe, v);
++		qe = ufs_query(0x03, 0x02, 0, 0, 0, &v);        /* READ_ATTR power mode */
++		printf("LIUQIN UFS: READ_ATTR power mode -> %d val 0x%x\n", qe, v);
++		qe = ufs_query(0x01, 0x00, 0, 0x40, 0, NULL);   /* READ_DESC device */
++		printf("LIUQIN UFS: READ_DESC device -> %d\n", qe);
++		if (!qe) {
++			printf("LIUQIN UFS: devdesc %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n",
++			    ucd_dbg[32], ucd_dbg[33], ucd_dbg[34], ucd_dbg[35],
++			    ucd_dbg[36], ucd_dbg[37], ucd_dbg[38], ucd_dbg[39],
++			    ucd_dbg[40], ucd_dbg[41], ucd_dbg[42], ucd_dbg[43],
++			    ucd_dbg[44], ucd_dbg[45], ucd_dbg[46], ucd_dbg[47]);
++			printf("LIUQIN UFS: devdesc+16 %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n",
++			    ucd_dbg[48], ucd_dbg[49], ucd_dbg[50], ucd_dbg[51],
++			    ucd_dbg[52], ucd_dbg[53], ucd_dbg[54], ucd_dbg[55],
++			    ucd_dbg[56], ucd_dbg[57], ucd_dbg[58], ucd_dbg[59],
++			    ucd_dbg[60], ucd_dbg[61], ucd_dbg[62], ucd_dbg[63]);
++		}
++		qe = ufs_query(0x01, 0x01, 0, 0x90, 0, NULL);   /* READ_DESC configuration */
++		printf("LIUQIN UFS: READ_DESC config -> %d\n", qe);
++		if (!qe) {
++			printf("LIUQIN UFS: cfgdesc %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n",
++			    ucd_dbg[32], ucd_dbg[33], ucd_dbg[34], ucd_dbg[35],
++			    ucd_dbg[36], ucd_dbg[37], ucd_dbg[38], ucd_dbg[39],
++			    ucd_dbg[40], ucd_dbg[41], ucd_dbg[42], ucd_dbg[43],
++			    ucd_dbg[44], ucd_dbg[45], ucd_dbg[46], ucd_dbg[47]);
++		}
++	}
++	if (!error) {
++		uint32_t flag = 1;
++		int qe = ufs_query(0x06, 0x01, 0, 0, 0, NULL);   /* SET_FLAG fDeviceInit */
++		printf("LIUQIN UFS: SET_FLAG fDeviceInit -> %d\n", qe);
++		if (!qe) {
++			for (int i = 0; i < 200; i++) {
++				if (ufs_query(0x05, 0x01, 0, 0, 0, &flag) || !flag) {
++					break;
++				}
++				delay(10);
++			}
++			printf("LIUQIN UFS: fDeviceInit flag 0x%x\n", flag);
++		}
++	}
++	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
+ 		/* The first command after the bootloader may report a unit attention. */
+-		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++		for (int i = 0; i < 200 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++			delay(25000);       /* 25 ms */
+ 		}
++		if (error) {
++			printf("LIUQIN UFS: cap %08x ver %08x did %08x hcs %08x is %08x\n",
++			    ufs_rd(0x00), ufs_rd(0x08), ufs_rd(0x10), ufs_rd(0x30), ufs_rd(0x20));
++			static const uint8_t report[12] = {
++				0xa0, 0, 0, 0, 0, 0, 0, 0, 0x02, 0, 0, 0
++			};
++			int rl = ufs_scsi_lun(0x81, report, sizeof(report), 512, false);
++			printf("LIUQIN UFS: REPORT LUNS -> %d\n", rl);
++			if (!rl) {
++				const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++				printf("LIUQIN UFS: lunlist %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n",
++				    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
++				    b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
++			}
++			static const uint8_t rd10[10] = { 0x28, 0, 0, 0, 0, 0, 0, 0, 0x01, 0 };
++			int rr = ufs_scsi_lun(0, rd10, sizeof(rd10), UFS_BLOCK, false);
++			printf("LIUQIN UFS: READ(10) lba0 -> %d\n", rr);
++			printf("LIUQIN UFS: LUN 0 not ready, probing other LUNs\n");
++			for (uint32_t l = 1; l < 4 && error; l++) {
++				su.lun = l;
++				int e = ufs_scsi(tur, sizeof(tur), 0, false);
++				printf("LIUQIN UFS: LUN %u TUR -> %d\n", l, e);
++				if (!e) {
++					error = 0;
++				}
++			}
++			if (error) {
++				su.lun = 0;
++			}
++		}
+ 	}
+ 	if (!error) {
+ 		error = ufs_find_partition(want);
+@@ -654,7 +1026,7 @@
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	liuqin_log_start();
+ 	liuqin_sample_start();
+-	liuqin_usb_probe();
++	/* liuqin_usb_probe(); -- faults on this unit (data abort); USB is not needed for bring-up */
+ 	return 0;
+ }
+ 

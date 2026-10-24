@@ -1,0 +1,35 @@
+--- a/iokit/NativeAdreno/ShengGmuSource.h	2026-10-24 10:11:54
++++ b/iokit/NativeAdreno/ShengGmuSource.h	2026-10-24 10:11:54
+@@ -19,6 +19,8 @@
+ #define REG_GMU_HFI_QTBL_ADDR UINT32_C(0x5985)   /* ladder (a6xx_gmu.xml 0x5185) */
+ #define REG_GMU_HFI_CTRL_INIT UINT32_C(0x5986)   /* ladder (a6xx_gmu.xml 0x5186) */
+ #define REG_GMU_GMU2HOST_INTR_INFO UINT32_C(0x5992)   /* ladder (a6xx_gmu.xml 0x5192) */
++#define REG_GMU_GMU2HOST_INTR_CLR UINT32_C(0x5991)    /* ladder (a6xx_gmu.xml 0x5191) */
++#define REG_GMU_GMU2HOST_INTR_MASK UINT32_C(0x5993)   /* ladder (a6xx_gmu.xml 0x5193) */
+ #define REG_GMU_HOST2GMU_INTR_SET UINT32_C(0x5994)   /* ladder (a6xx_gmu.xml 0x5194) */
+ #define REG_GMU_GENERAL_8 UINT32_C(0x59cd)   /* ladder (a6xx_gmu.xml 0x51cd) */
+ #define REG_GMU_GENERAL_9 UINT32_C(0x59ce)   /* ladder (a6xx_gmu.xml 0x51ce) */
+--- a/iokit/NativeAdreno/ShengGmu.c	2026-10-24 10:11:54
++++ b/iokit/NativeAdreno/ShengGmu.c	2026-10-24 10:11:54
+@@ -181,7 +181,9 @@
+     }
+     if(sheng_gmu_stop_stage==3) {sheng_gmu_stopped_at=3;return ShengGmuStateMismatch;}
+     r->phase=4;
+-    if(core_write(d,REG_GMU_CM3_FW_INIT_RESULT,0,r) ||
++    if(core_write(d,REG_GMU_GMU2HOST_INTR_CLR,UINT32_MAX,r) ||
++        core_write(d,REG_GMU_GMU2HOST_INTR_MASK,~UINT32_C(1),r) ||
++        core_write(d,REG_GMU_CM3_FW_INIT_RESULT,0,r) ||
+         core_write(d,REG_GMU_CM3_BOOT_CONFIG,2,r) ||
+         core_write(d,REG_GMU_HFI_QTBL_ADDR,(uint32_t)c->hfi.iova,r) ||
+         core_write(d,REG_GMU_HFI_QTBL_INFO,1,r) ||
+@@ -243,6 +245,10 @@
+     ShengGmuStartupResult *r=c->result;uint32_t reset,status;
+     /* Drop the CPU's stale lines over the response queue before polling. */
+     if(d->services.invalidate && d->services.invalidate(d->services.cookie,d->hfi.shared,0x4000))return 1;
++    /* The GMU's response interrupt has to be acknowledged (the ladder does
++     * this before reading the response queue). */
++    if(core_read(d,REG_GMU_GMU2HOST_INTR_INFO,&status,&r->load))return 1;
++    if(status&1)(void)core_write(d,REG_GMU_GMU2HOST_INTR_CLR,1,&r->load);
+     r->health_status=check_faults(d,&r->load);
+     if(r->health_status!=ShengGmuSuccess)return 1;
+     if(core_read(d,REG_GMU_CM3_SYSRESET,&reset,&r->load) ||

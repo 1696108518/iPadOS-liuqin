@@ -1,0 +1,26 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp	2026-10-24 09:29:45
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp	2026-10-24 09:29:45
+@@ -516,17 +516,20 @@
+                                             sheng_gmu_stop_stage=stop;
+                                             sheng_gmu_stopped_at=0;
+                                         }
+-                                        ShengGmuStartupLimits limits{8,200,5000,200000};
++                                        ShengGmuStartupLimits limits{512,200,100000,200000};
+                                         const ShengGmuStatus started=ShengGmuColdStart(
+                                             &gmu_device_,&config,&startup,&limits,&gmu_startup_);
+                                         {
+                                             extern volatile uint32_t sheng_gmu_stopped_at;
+-                                            IOLog("NativeAdreno: ColdStart status=%d fw_ready=%u hfi_ready=%u stage=%u stopped_at=%u fw_init=0x%x hfi=0x%x polls=%u\n",
++                                            IOLog("NativeAdreno: ColdStart status=%d fw_ready=%u hfi_ready=%u stage=%u stopped_at=%u fw_init=0x%x hfi=0x%x polls=%u proto stage=%u polls=%u transport=%u fwerr=0x%x elapsed=%llu us\n",
+                                             started,gmu_startup_.load.firmware_ready_observed,
+                                             gmu_startup_.load.hfi_ready_observed,
+                                             gmu_startup_.protocol.stage,sheng_gmu_stopped_at,
+                                             gmu_startup_.load.firmware_init_result,gmu_startup_.load.hfi_status,
+-                                            gmu_startup_.load.poll_reads);
++                                            gmu_startup_.load.poll_reads,
++                                            gmu_startup_.protocol.stage,gmu_startup_.protocol.poll_reads,
++                                            gmu_startup_.protocol.transport_status,gmu_startup_.protocol.firmware_error,
++                                            (unsigned long long)gmu_startup_.protocol.elapsed_us);
+                                         }
+                                     if(started==ShengGmuSuccess) {
+                                         /* GPU bank/asid 2, streams 0 and 1 (the ladder's

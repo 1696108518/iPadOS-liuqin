@@ -1,0 +1,648 @@
+diff --git a/iokit/NativeAdreno/NativeAdrenoService.cpp b/iokit/NativeAdreno/NativeAdrenoService.cpp
+index 95ce358..af8117a 100644
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -41,6 +41,9 @@
+ #include "ShengGmuCommandDbSource.h"
+ #define NATIVE_ADRENO_HAVE_COMMAND_DB 1
+ #endif
++/* The GMU and SQE firmware live in the boot image's firmware area, not in
++ * the kernel: liuqin_fw_get() is the loader in bsd/dev/liuqin_ufs.c. */
++extern "C" const void *liuqin_fw_get(const char *name,uint32_t *size);
+ extern "C" const uint8_t native_adreno_firmware_image[] __attribute__((weak));
+ extern "C" const uint64_t native_adreno_firmware_image_size __attribute__((weak));
+ extern "C" const uint8_t native_adreno_sqe_firmware_image[] __attribute__((weak));
+@@ -230,25 +233,52 @@ bool NativeAdrenoGpuService::start(IOService *provider)
+         IOService::stop(provider);
+         return false;
+     }
+-    for(unsigned index=0;index<2;++index) {
++    /* The GPU node's reg order is kgsl_3d0_reg_memory, cx_dbgc, rscc,
++     * isense_cntl, cx_misc, qdss_gfx, rdpm_cx: the Sheng CX window is
++     * cx_misc, not the cx_dbgc at index 1. */
++    unsigned cx_index=1;
++    if(OSData *names=OSDynamicCast(OSData,provider->getProperty("reg-names"))) {
++        const char *text=static_cast<const char *>(names->getBytesNoCopy());
++        const size_t length=names->getLength();
++        if(text&&length) {
++            unsigned index=0;
++            for(size_t at=0;at<length;++index) {
++                const char *name=text+at;
++                size_t used=strnlen(name,length-at);
++                if(used==7&&!memcmp(name,"cx_misc",7)){cx_index=index;break;}
++                at+=used+1;
++            }
++        }
++    }
++    if(count<=cx_index) {
++        IOLog("NativeAdreno: GPU node has no cx_misc window (index %u of %lu)\n",
++            cx_index,static_cast<unsigned long>(count));
++        IOService::stop(provider);
++        return false;
++    }
++    const unsigned map_indices[2]={0,cx_index};
++    for(unsigned slot=0;slot<2;++slot) {
++        const unsigned index=map_indices[slot];
+         IODeviceMemory *memory=provider->getDeviceMemoryWithIndex(index);
+         if(!memory) {
+             IOLog("NativeAdreno: provider window %u has no device memory\n",index);
+             stop(provider);
+             return false;
+         }
+-        maps_[index]=OSSharedPtr<IOMemoryMap>(memory->map(kIOMapAnywhere|kIOMapInhibitCache),
++        maps_[slot]=OSSharedPtr<IOMemoryMap>(memory->map(kIOMapAnywhere|kIOMapInhibitCache),
+             OSNoRetain);
+-        if(!maps_[index]) {
++        if(!maps_[slot]) {
+             IOLog("NativeAdreno: GPU window %u did not map\n",index);
+             stop(provider);
+             return false;
+         }
+     }
+-    IOLog("NativeAdreno: %lu windows, GPU window at 0x%llx/0x%llx mapped\n",
++    IOLog("NativeAdreno: %lu windows, GPU window at 0x%llx/0x%llx mapped, CX window at 0x%llx/0x%llx\n",
+         static_cast<unsigned long>(count),
+         static_cast<unsigned long long>(windows[0].base),
+-        static_cast<unsigned long long>(windows[0].bytes));
++        static_cast<unsigned long long>(windows[0].bytes),
++        static_cast<unsigned long long>(windows[cx_index].base),
++        static_cast<unsigned long long>(windows[cx_index].bytes));
+     /* The GMU node publishes its bases so no DT phandle resolution is needed.
+      * Discovery does not imply readiness: bring-up still needs board power,
+      * firmware and the SMMU context before any register may be touched. */
+@@ -354,24 +384,28 @@ bool NativeAdrenoGpuService::start(IOService *provider)
+                     IOLog("NativeAdreno: GMU payloads mapped, bank=%u asid=%u sid=%u slot=%u ttbr0=0x%llx\n",
+                         bank,asid,sid,slot,static_cast<unsigned long long>(report.ttbr0));
+ #ifdef NATIVE_ADRENO_HAVE_GMU_RULES
+-                    if(reinterpret_cast<uintptr_t>(native_adreno_firmware_image) &&
+-                        reinterpret_cast<uintptr_t>(&native_adreno_firmware_image_size)) {
++                    uint32_t loaded_bytes=0;
++                    const void *loaded=liuqin_fw_get("gmu_gen70000.bin",&loaded_bytes);
++                    if(!loaded || !loaded_bytes) {
++                        loaded=native_adreno_firmware_image;
++                        loaded_bytes=static_cast<uint32_t>(native_adreno_firmware_image_size);
++                    }
++                    if(loaded && loaded_bytes>1) {
+                         NativeAdrenoFirmwareRules rules{};
+                         rules.bytes=SHENG_GMU_FIRMWARE_BYTES;
+                         for(unsigned i=0;i<32;++i)rules.sha256[i]=sheng_gmu_firmware_sha256[i];
+                         const IOReturn checked=NativeAdrenoFirmware::validate(
+-                            native_adreno_firmware_image,native_adreno_firmware_image_size,
+-                            &rules,&firmware_);
++                            static_cast<const uint8_t *>(loaded),loaded_bytes,&rules,&firmware_);
+                         if(checked)
+                             IOLog("NativeAdreno: embedded GMU firmware failed validation 0x%x\n",
+                                 checked);
+                         else {
+                             firmware_valid_=true;
+-                            IOLog("NativeAdreno: embedded GMU firmware validated (%lu bytes)\n",
++                            IOLog("NativeAdreno: GMU firmware validated (%lu bytes)\n",
+                                 static_cast<unsigned long>(firmware_.length));
+                         }
+                     } else {
+-                        IOLog("NativeAdreno: no embedded GMU firmware in this image\n");
++                        IOLog("NativeAdreno: no GMU firmware in the firmware area or the kernel\n");
+                     }
+ #else
+                     IOLog("NativeAdreno: GMU rules not generated for this build\n");
+diff --git a/b/iokit/NativeAdreno/ShengGmu.c b/iokit/NativeAdreno/ShengGmu.c
+new file mode 100644
+index 0000000..5f4445e
+--- /dev/null
++++ b/iokit/NativeAdreno/ShengGmu.c
+@@ -0,0 +1,282 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++#include "ShengGmu.h"
++#include "AdrenoFirmware.h"
++/* Generated only from exact pinned XML/catalog/DT/firmware policy; ignored.
++ * In particular, no vendor firmware or sequencer payload is stored in Git. */
++#include "ShengGmuSource.h"
++#if !defined(__aarch64__) || __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
++#error sheng GMU requires little-endian AArch64
++#endif
++static int extent(uintptr_t at,size_t bytes)
++{return at && bytes && bytes-1<=UINTPTR_MAX-at;}
++static int overlap(uintptr_t a,size_t na,uintptr_t b,size_t nb)
++{return a<=b?(b-a<na):(a-b<nb);}
++static size_t core_offset(uint32_t word)
++{return ((size_t)word<<2)-SHENG_GMU_CORE_GPU_DELTA;}
++static int read32(ShengGmuDevice *d,unsigned window,size_t at,uint32_t *v,ShengGmuResult *r)
++{++r->read_attempts;return d->io.read32(d->io.cookie,window,at,v);}
++static int write32(ShengGmuDevice *d,unsigned window,size_t at,uint32_t v,ShengGmuResult *r)
++{++r->write_attempts;return d->io.write32(d->io.cookie,window,at,v);}
++static int core_read(ShengGmuDevice *d,uint32_t word,uint32_t *v,ShengGmuResult *r)
++{return read32(d,ShengGmuCore,core_offset(word),v,r);}
++static int core_write(ShengGmuDevice *d,uint32_t word,uint32_t v,ShengGmuResult *r)
++{return write32(d,ShengGmuCore,core_offset(word),v,r);}
++static ShengGmuStatus check_faults(ShengGmuDevice *d,ShengGmuResult *r)
++{
++    if(core_read(d,REG_GMU_AO_HOST_INTERRUPT_STATUS,&r->ao_fault_status,r) ||
++        core_read(d,REG_GMU_GMU2HOST_INTR_INFO,&r->cm3_fault_status,r))return ShengGmuIoError;
++    return (r->ao_fault_status&SHENG_GMU_AO_FATAL_MASK) ||
++        (r->cm3_fault_status&SHENG_GMU_CM3_FATAL_MASK)?ShengGmuFault:ShengGmuSuccess;
++}
++static int notify(void *cookie)
++{
++    ShengGmuDevice *d=cookie;
++    return d->io.barrier(d->io.cookie) ||
++        d->io.write32(d->io.cookie,ShengGmuCore,core_offset(REG_GMU_HOST2GMU_INTR_SET),1) ||
++        d->io.barrier(d->io.cookie);
++}
++static ShengGmuStatus poll(ShengGmuDevice *d,uint32_t reg,uint32_t mask,
++    uint32_t expected,unsigned budget,uint32_t *observed,ShengGmuResult *r)
++{
++    uint64_t start,last,now;
++    if(d->services.now_us(d->services.cookie,&start))return ShengGmuClockError;
++    last=start;
++    for(unsigned i=0;i<budget;++i) {
++        if(d->services.now_us(d->services.cookie,&now) || now<last)return ShengGmuClockError;
++        if(now-start>=10000)return ShengGmuTimeout;
++        last=now;++r->poll_reads;
++        ShengGmuStatus fault=check_faults(d,r);if(fault!=ShengGmuSuccess)return fault;
++        if(core_read(d,reg,observed,r))return ShengGmuIoError;
++        if((*observed&mask)==expected) {
++            if(d->io.barrier(d->io.cookie))return ShengGmuIoError;
++            return ShengGmuSuccess;
++        }
++        if(i+1<budget && d->services.wait_us(d->services.cookie,100))return ShengGmuClockError;
++    }
++    return ShengGmuTimeout;
++}
++static void reset_after_failure(ShengGmuDevice *d,ShengGmuResult *r)
++{
++    uint32_t actual;r->reset_verified=0;d->poisoned=1;d->hfi.poisoned=1;
++    if(!core_write(d,REG_GMU_CM3_SYSRESET,1,r) && !d->io.barrier(d->io.cookie) &&
++        !core_read(d,REG_GMU_CM3_SYSRESET,&actual,r) && actual==1)r->reset_verified=1;
++}
++static uint32_t le32(const uint8_t *p)
++{return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;}
++static ShengGmuStatus validate(ShengGmuDevice *d,const ShengGmuConfig *c,ShengGmuResult *r)
++{
++    if(!d || !c || !d->io.read32 || !d->io.write32 || !d->io.barrier ||
++        !d->services.sha256 || !d->services.now_us || !d->services.wait_us ||
++        c->chip_id!=SHENG_GMU_CHIP_ID || !c->firmware || c->firmware_bytes!=SHENG_GMU_FIRMWARE_BYTES ||
++        !extent((uintptr_t)c->firmware,c->firmware_bytes) || !c->poll_budget || c->poll_budget>1024)
++        return ShengGmuArgument;
++    if(d->poisoned)return ShengGmuPoisoned;
++    if(d->boot_attempted)return ShengGmuBusy;
++    for(unsigned i=0;i<ShengGmuWindows;++i)if(d->io.bytes[i]!=sheng_gmu_window_bytes[i])return ShengGmuArgument;
++    const ShengGmuMemory *mem[]={&c->icache,&c->dummy,&c->debug,&c->log,&c->hfi};
++    const size_t sizes[]={0xffc000,0x4000,0x7000,0x4000,0x4000};
++    for(unsigned i=0;i<5;++i) {
++        const ShengGmuMemory *m=mem[i];
++        if(m->bytes!=sizes[i] || !extent((uintptr_t)m->cpu,m->bytes) || ((uintptr_t)m->cpu&4095) ||
++            !m->iova || (m->iova&4095) || m->iova>UINT32_MAX-(m->bytes-1) ||
++            overlap((uintptr_t)m->cpu,m->bytes,(uintptr_t)c->firmware,c->firmware_bytes))return ShengGmuArgument;
++        for(unsigned j=0;j<i;++j)if(overlap((uintptr_t)m->cpu,m->bytes,(uintptr_t)mem[j]->cpu,mem[j]->bytes) ||
++            overlap((uintptr_t)m->iova,m->bytes,(uintptr_t)mem[j]->iova,mem[j]->bytes))return ShengGmuArgument;
++    }
++    if(c->icache.iova!=0x4000 || c->dummy.iova!=0x60000000 || c->debug.iova!=0x60400000)return ShengGmuArgument;
++    if(d->services.sha256(d->services.cookie,c->firmware,c->firmware_bytes,r->complete_sha256))return ShengGmuFirmware;
++    for(unsigned i=0;i<32;++i)if(r->complete_sha256[i]!=sheng_gmu_firmware_sha256[i])return ShengGmuFirmware;
++    r->complete_hash_verified=1;return ShengGmuSuccess;
++}
++ShengGmuStatus ShengGmuLoadAndStartHfi(ShengGmuDevice *d,const ShengGmuConfig *c,ShengGmuResult *r)
++{
++    if(!r)return ShengGmuArgument;
++    *r=(ShengGmuResult){0};r->resources_must_retain=1;
++    ShengGmuStatus status=validate(d,c,r);if(status!=ShengGmuSuccess)return status;
++    const AdrenoFirmwareRegion regions[]={{0,0x4000,1},{0x4000,0xffc000,2},{0x10004000,0x4000,3}};
++    AdrenoFirmwareBlock blocks[32];size_t count=0;
++    if(AdrenoFirmwarePlanGmu(c->firmware,c->firmware_bytes,regions,3,blocks,32,&count)!=AdrenoFirmwareSuccess || count!=15)
++        return ShengGmuFirmware;
++    r->phase=1;uint32_t value;
++    if(core_read(d,REG_GMU_CM3_SYSRESET,&value,r))return ShengGmuIoError;
++    if(value!=1)return ShengGmuBusy;
++    r->reset_verified=1;
++    if(read32(d,ShengGmuCxMisc,REG_CX_MISC_TCM_RET_CNTL*4,&value,r))return ShengGmuIoError;
++    if(value)return ShengGmuStateMismatch;
++    if(read32(d,ShengGmuRscc,REG_RSCC_SEQ_BUSY_DRV0*4,&value,r))return ShengGmuIoError;
++    if(value)return ShengGmuBusy;
++    if(core_read(d,REG_GMU_HFI_CTRL_STATUS,&value,r))return ShengGmuIoError;
++    if(value&1)return ShengGmuStateMismatch; /* A stale ready bit cannot pass. */
++    status=check_faults(d,r);if(status!=ShengGmuSuccess)return status;
++    r->phase=2;
++    d->boot_attempted=1;
++    for(unsigned i=0;i<SHENG_GMU_RSC_SETUP_COUNT;++i) {
++        const ShengGmuSetupWrite *w=sheng_gmu_rsc_setup+i;
++        if(write32(d,w->window,w->byte_offset,w->value,r)) {status=ShengGmuIoError;goto failed;}
++    }
++    if(d->io.barrier(d->io.cookie)) {status=ShengGmuIoError;goto failed;}
++    if(core_write(d,REG_GPU_GMU_CX_GMU_CX_FALNEXT_INTF,1,r) ||
++        core_write(d,REG_GPU_GMU_CX_GMU_CX_FAL_INTF,1,r) ||
++        write32(d,ShengGmuCxMisc,REG_CX_MISC_TCM_RET_CNTL*4,1,r)) {status=ShengGmuIoError;goto failed;}
++    if(d->io.barrier(d->io.cookie) || read32(d,ShengGmuCxMisc,REG_CX_MISC_TCM_RET_CNTL*4,&value,r)) {status=ShengGmuIoError;goto failed;}
++    if(value!=1) {status=ShengGmuStateMismatch;goto failed;}
++    /* All shared allocations are real owned coherent memory, not simulated
++     * GMU addresses. Zero only after actual stopped/idle checks above. */
++    const ShengGmuMemory *memory[]={&c->icache,&c->dummy,&c->debug,&c->log};
++    r->memory_changed=1;
++    for(unsigned m=0;m<4;++m)for(size_t i=0;i<memory[m]->bytes/4;++i)memory[m]->cpu[i]=0;
++    if(AdrenoHfiInitializeStopped(&d->hfi,c->hfi.cpu,c->hfi.bytes,c->hfi.iova,d,notify)!=AdrenoHfiSuccess) {
++        status=ShengGmuArgument;goto failed;
++    }
++    r->phase=3;
++    for(size_t i=0;i<count;++i) {
++        const AdrenoFirmwareBlock *b=blocks+i;
++        /* Zero-size records authorize no allocation or write. The pinned
++         * loader skips them; all real extents were independently supplied. */
++        if(!b->bytes)continue;
++        for(size_t at=0;at<b->bytes;at+=4) {
++            uint32_t word=le32(c->firmware+b->payload_offset+at);
++            if(b->region_identifier==2)c->icache.cpu[(b->address-0x4000+at)/4]=word;
++            else {
++                uint32_t reg=b->region_identifier==1?REG_GMU_CM3_ITCM_START+b->address/4:
++                    REG_GMU_CM3_DTCM_START+(b->address-0x10004000)/4;
++                if(core_write(d,reg+(uint32_t)(at/4),word,r)) {status=ShengGmuIoError;goto failed;}
++            }
++        }
++    }
++    if(d->io.barrier(d->io.cookie)) {status=ShengGmuIoError;goto failed;}
++    /* Read every TCM payload word before releasing reset. CPU cache readback
++     * checks copied bytes only; actual GMU coherency is still a prerequisite. */
++    for(size_t i=0;i<count;++i) {
++        const AdrenoFirmwareBlock *b=blocks+i;
++        for(size_t at=0;at<b->bytes;at+=4) {
++            if(b->region_identifier==2)value=c->icache.cpu[(b->address-0x4000+at)/4];
++            else {
++                uint32_t reg=b->region_identifier==1?REG_GMU_CM3_ITCM_START+b->address/4:
++                    REG_GMU_CM3_DTCM_START+(b->address-0x10004000)/4;
++                if(core_read(d,reg+(uint32_t)(at/4),&value,r)) {status=ShengGmuIoError;goto failed;}
++            }
++            if(value!=le32(c->firmware+b->payload_offset+at)) {status=ShengGmuStateMismatch;goto failed;}
++        }
++    }
++    r->phase=4;
++    if(core_write(d,REG_GMU_CM3_FW_INIT_RESULT,0,r) ||
++        core_write(d,REG_GMU_CM3_BOOT_CONFIG,2,r) ||
++        core_write(d,REG_GMU_HFI_QTBL_ADDR,(uint32_t)c->hfi.iova,r) ||
++        core_write(d,REG_GMU_HFI_QTBL_INFO,1,r) ||
++        core_write(d,REG_GMU_AHB_FENCE_RANGE_0,UINT32_C(0x80000000)|(0x32u<<18)|0x8a0,r) ||
++        core_write(d,REG_GMU_CM3_CFG,0x4052,r) ||
++        core_write(d,REG_GMU_GENERAL_10,SHENG_GMU_FW_CHIP_ID,r) ||
++        core_write(d,REG_GMU_GENERAL_8,(uint32_t)c->log.iova|3,r)) {status=ShengGmuIoError;goto failed;}
++    for(unsigned i=0;i<4;++i)if(write32(d,ShengGmuGpu,(REG_GBIF_QSB_SIDE0+i)*4,0x71620,r)) {status=ShengGmuIoError;goto failed;}
++    if(core_write(d,REG_GMU_SYS_BUS_CONFIG,1,r) || core_write(d,REG_GMU_ICACHE_CONFIG,1,r) ||
++        core_write(d,REG_GMU_DCACHE_CONFIG,1,r) || core_read(d,REG_GMU_CM3_DTCM_START+0xff8,&value,r)) {status=ShengGmuIoError;goto failed;}
++    uint32_t mask=value<=UINT32_C(0x20010004)?UINT32_MAX:0x1ff;
++    uint32_t ready=mask==UINT32_MAX?UINT32_C(0xbabeface):0x100;
++    if(core_write(d,REG_GMU_CM3_SYSRESET,1,r) || core_write(d,REG_GMU_GENERAL_9,0,r) ||
++        d->io.barrier(d->io.cookie)) {status=ShengGmuIoError;goto failed;}
++    const uint32_t config_regs[]={REG_GMU_CM3_FW_INIT_RESULT,REG_GMU_CM3_BOOT_CONFIG,
++        REG_GMU_HFI_QTBL_ADDR,REG_GMU_HFI_QTBL_INFO,REG_GMU_CM3_CFG,REG_GMU_GENERAL_10,
++        REG_GMU_GENERAL_8,REG_GMU_AHB_FENCE_RANGE_0,REG_GMU_SYS_BUS_CONFIG,
++        REG_GMU_ICACHE_CONFIG,REG_GMU_DCACHE_CONFIG};
++    const uint32_t config_values[]={0,2,(uint32_t)c->hfi.iova,1,0x4052,SHENG_GMU_FW_CHIP_ID,
++        (uint32_t)c->log.iova|3,UINT32_C(0x80000000)|(0x32u<<18)|0x8a0,1,1,1};
++    for(unsigned i=0;i<sizeof(config_regs)/sizeof(config_regs[0]);++i) {
++        if(core_read(d,config_regs[i],&value,r)) {status=ShengGmuIoError;goto failed;}
++        if(value!=config_values[i]) {status=ShengGmuStateMismatch;goto failed;}
++    }
++    r->reset_verified=0;
++    if(core_write(d,REG_GMU_CM3_SYSRESET,0,r) || d->io.barrier(d->io.cookie)) {status=ShengGmuIoError;goto failed;}
++    r->phase=5;
++    status=poll(d,REG_GMU_CM3_FW_INIT_RESULT,mask,ready,c->poll_budget,&r->firmware_init_result,r);
++    if(status!=ShengGmuSuccess)goto failed;
++    r->firmware_ready_observed=1;
++    if(core_write(d,REG_GMU_HFI_CTRL_INIT,1,r) || d->io.barrier(d->io.cookie)) {status=ShengGmuIoError;goto failed;}
++    r->phase=6;
++    status=poll(d,REG_GMU_HFI_CTRL_STATUS,1,1,c->poll_budget,&r->hfi_status,r);
++    if(status!=ShengGmuSuccess)goto failed;
++    status=check_faults(d,r);if(status!=ShengGmuSuccess)goto failed;
++    if(d->io.barrier(d->io.cookie)) {status=ShengGmuIoError;goto failed;}
++    r->hfi_ready_observed=1;r->phase=7;return ShengGmuSuccess;
++failed:
++    reset_after_failure(d,r);return status;
++}
++typedef struct {
++    ShengGmuDevice *device;
++    ShengGmuStartupResult *result;
++} StartupContext;
++static int startup_now(void *cookie,uint64_t *value)
++{
++    ShengGmuDevice *d=((StartupContext *)cookie)->device;
++    return d->services.now_us(d->services.cookie,value);
++}
++static int startup_wait(void *cookie,unsigned us)
++{
++    ShengGmuDevice *d=((StartupContext *)cookie)->device;
++    return d->services.wait_us(d->services.cookie,us);
++}
++static int startup_health(void *cookie)
++{
++    StartupContext *c=cookie;ShengGmuDevice *d=c->device;
++    ShengGmuStartupResult *r=c->result;uint32_t reset,status;
++    r->health_status=check_faults(d,&r->load);
++    if(r->health_status!=ShengGmuSuccess)return 1;
++    if(core_read(d,REG_GMU_CM3_SYSRESET,&reset,&r->load) ||
++        core_read(d,REG_GMU_HFI_CTRL_STATUS,&status,&r->load))r->health_status=ShengGmuIoError;
++    else if(reset!=0 || !(status&1))r->health_status=ShengGmuStateMismatch;
++    return r->health_status!=ShengGmuSuccess;
++}
++ShengGmuStatus ShengGmuColdStart(ShengGmuDevice *d,const ShengGmuConfig *c,
++    const AdrenoHfiStartupConfig *config,const ShengGmuStartupLimits *limits,ShengGmuStartupResult *r)
++{
++    if(!r)return ShengGmuArgument;
++    *r=(ShengGmuStartupResult){0};r->load.resources_must_retain=r->protocol.resources_must_retain=1;
++    r->protocol_status=AdrenoHfiStartupInvalid; /* Not attempted until the load succeeds. */
++    if(!d || !c || !limits || AdrenoHfiStartupValidate(config)!=AdrenoHfiStartupSuccess)return ShengGmuArgument;
++    StartupContext context={d,r};
++    AdrenoHfiStartupServices services={&context,startup_now,startup_wait,startup_health,
++        limits->polls_per_command,limits->wait_interval_us,limits->command_timeout_us,limits->total_timeout_us};
++    if(AdrenoHfiStartupValidateServices(&services)!=AdrenoHfiStartupSuccess)return ShengGmuArgument;
++    if(d->poisoned || d->startup.poisoned)return ShengGmuPoisoned;
++    if(d->startup.attempted || d->startup.completed)return ShengGmuBusy;
++    ShengGmuStatus status=ShengGmuLoadAndStartHfi(d,c,&r->load);
++    if(status!=ShengGmuSuccess)return status;
++    r->protocol_status=AdrenoHfiStartupRun(&d->startup,&d->hfi,config,&services,&r->protocol);
++    if(r->protocol_status==AdrenoHfiStartupSuccess)return ShengGmuSuccess;
++    switch(r->protocol_status) {
++    case AdrenoHfiStartupClockError:case AdrenoHfiStartupWaitError:status=ShengGmuClockError;break;
++    case AdrenoHfiStartupTimeout:status=ShengGmuTimeout;break;
++    case AdrenoHfiStartupPlatformFault:status=r->health_status;break;
++    default:status=ShengGmuProtocolError;break;
++    }
++    reset_after_failure(d,&r->load);d->startup.poisoned=1;
++    return status;
++}
++static int fits(ShengGmuMmio *m,unsigned window,size_t at)
++{
++    if(!m || window>=ShengGmuWindows)return 0;
++    ShengGmuMmioWindow *w=m->windows+window;
++    return extent((uintptr_t)w->cpu,w->bytes) && !((uintptr_t)w->cpu&3) && !(at&3) &&
++        at<=w->bytes && w->bytes-at>=4;
++}
++static int mmio_read(void *cookie,unsigned window,size_t at,uint32_t *v)
++{ShengGmuMmio *m=cookie;if(!v || !fits(m,window,at))return 1;*v=*(volatile uint32_t *)(m->windows[window].cpu+at);return 0;}
++static int mmio_write(void *cookie,unsigned window,size_t at,uint32_t v)
++{ShengGmuMmio *m=cookie;if(!fits(m,window,at))return 1;*(volatile uint32_t *)(m->windows[window].cpu+at)=v;return 0;}
++static int mmio_barrier(void *cookie)
++{(void)cookie;__asm__ volatile("dsb sy":::"memory");return 0;}
++ShengGmuStatus ShengGmuBindMmio(ShengGmuMmio *m,ShengGmuIo *out)
++{
++    if(!out)return ShengGmuArgument;
++    *out=(ShengGmuIo){0};
++    if(!m)return ShengGmuArgument;
++    for(unsigned i=0;i<ShengGmuWindows;++i) {
++        const ShengGmuMmioWindow *w=m->windows+i;
++        if(!fits(m,i,0) || w->physical!=sheng_gmu_window_physical[i] ||
++            w->bytes!=sheng_gmu_window_bytes[i])return ShengGmuArgument;
++        for(unsigned j=0;j<i;++j)if(overlap((uintptr_t)w->cpu,w->bytes,(uintptr_t)m->windows[j].cpu,m->windows[j].bytes))return ShengGmuArgument;
++    }
++    out->cookie=m;out->read32=mmio_read;out->write32=mmio_write;out->barrier=mmio_barrier;
++    for(unsigned i=0;i<ShengGmuWindows;++i)out->bytes[i]=m->windows[i].bytes;
++    return ShengGmuSuccess;
++}
+diff --git a/b/iokit/NativeAdreno/ShengGmuCommandDb.c b/iokit/NativeAdreno/ShengGmuCommandDb.c
+new file mode 100644
+index 0000000..da859da
+--- /dev/null
++++ b/iokit/NativeAdreno/ShengGmuCommandDb.c
+@@ -0,0 +1,47 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++#include "ShengGmuCommandDb.h"
++#include "ShengGmuCommandDbSource.h"
++static uint16_t u16(const uint8_t *p){return (uint16_t)(p[0]|(uint16_t)p[1]<<8);}
++static uint32_t u32(const uint8_t *p){return u16(p)|(uint32_t)u16(p+2)<<16;}
++static int range(size_t at,size_t len,size_t size){return at<=size && len<=size-at;}
++static int overlaps(size_t a,size_t n,size_t b,size_t m){return n && m && a<b+m && b<a+n;}
++static int equal(const uint8_t *a,const char *b)
++{for(unsigned i=0;i<8;++i)if(a[i]!=(uint8_t)b[i])return 0;return 1;}
++ShengGmuDbStatus ShengGmuCommandDbInputs(const uint8_t *data,size_t bytes,uint32_t expected,ShengGmuVoteInputs *out)
++{
++    if(!data || !out || bytes!=SHENG_GMU_COMMAND_DB_BYTES || !expected)return ShengGmuDbArgument;
++    if(u32(data)!=expected)return ShengGmuDbVersion;
++    if(u32(data+4)!=0x0c0330db)return ShengGmuDbCorrupt;
++    /* cmd_db_get_header: the slave table ends at the first zero slv_id, and every slave type is searched (int-011:
++     * the sheng AOP database failed the earlier 3..5-only, no-gap rule). Only extents are checked for records that
++     * are not used here; the records used below get the full address/slave/aux checks. */
++    size_t heads[8]={0},sizes[8]={0},aux[8]={0};unsigned rows=0;
++    for(unsigned i=0;i<8;++i) {
++        const uint8_t *r=data+8+16*i;unsigned id=u16(r),count=u16(r+6);
++        if(!id)break;
++        heads[i]=144u+u16(r+2);sizes[i]=(size_t)count*24;aux[i]=144u+u16(r+4);
++        if(!range(heads[i],sizes[i],bytes) || !range(aux[i],0,bytes))return ShengGmuDbCorrupt;
++        ++rows;
++    }
++    static const char names[8][8]={{'g','f','x','.','l','v','l',0},{'m','x','.','l','v','l',0,0},
++        {'c','x','.','l','v','l',0,0},{'g','m','x','c','.','l','v','l'},
++        {'S','H','0',0,0,0,0,0},{'M','C','0',0,0,0,0,0},{'A','C','V',0,0,0,0,0},{'C','N','0',0,0,0,0,0}};
++    ShengGmuAux found[8]={{0}};uint32_t addresses[8]={0};unsigned seen=0;
++    for(unsigned i=0;i<rows;++i)for(size_t at=heads[i];at<heads[i]+sizes[i];at+=24) {
++        const uint8_t *e=data+at;uint32_t address=u32(e+16);size_t len=u16(e+20),offset=aux[i]+u16(e+22);
++        unsigned slave=u16(data+8+16*i);
++        for(unsigned name=0;name<8;++name)if(equal(e,names[name])) {
++            if(seen&(1u<<name))return ShengGmuDbDuplicate;
++            if(!address || (address&3) || ((address>>16)&7)!=slave || !range(offset,len,bytes))return ShengGmuDbCorrupt;
++            for(unsigned j=0;j<rows;++j)if(overlaps(offset,len,heads[j],sizes[j]))return ShengGmuDbCorrupt;
++            if(slave!=(name<4?3u:5u))return ShengGmuDbCorrupt;
++            seen|=1u<<name;found[name]=(ShengGmuAux){data+offset,len};addresses[name]=address;
++        }
++    }
++    if((seen&0xf7)!=0xf7)return ShengGmuDbMissing;
++    ShengGmuVoteInputs result=*out;
++    result.gfx=found[0];result.mx=found[1];result.cx=found[2];result.gmxc=found[3];result.gmxc_present=(seen>>3)&1;
++    result.sh0=(ShengGmuBcmInput){addresses[4],found[4]};result.mc0=(ShengGmuBcmInput){addresses[5],found[5]};
++    result.acv=(ShengGmuBcmInput){addresses[6],found[6]};result.cn0_address=addresses[7];
++    *out=result;return ShengGmuDbSuccess;
++}
+diff --git a/b/iokit/NativeAdreno/ShengGmuCommandDbSource.h b/iokit/NativeAdreno/ShengGmuCommandDbSource.h
+new file mode 100644
+index 0000000..a777a1a
+--- /dev/null
++++ b/iokit/NativeAdreno/ShengGmuCommandDbSource.h
+@@ -0,0 +1,7 @@
++/* Generated by tools/prepare-liuqin-gmu.py: the ladder's command-db
++ * reservation (CMD_DB_PHYS/CMD_DB_SIZE).  Not observed memory. */
++#ifndef SHENG_GMU_COMMAND_DB_SOURCE_H
++#define SHENG_GMU_COMMAND_DB_SOURCE_H
++#define SHENG_GMU_COMMAND_DB_BASE UINT64_C(0x80860000)
++#define SHENG_GMU_COMMAND_DB_BYTES 131072u
++#endif
+diff --git a/b/iokit/NativeAdreno/ShengGmuSource.h b/iokit/NativeAdreno/ShengGmuSource.h
+new file mode 100644
+index 0000000..8f2630f
+--- /dev/null
++++ b/iokit/NativeAdreno/ShengGmuSource.h
+@@ -0,0 +1,67 @@
++/* Generated by tools/prepare-liuqin-gmu.py from the A730 ladder
++ * constants and gmu_gen70000.bin.  Do not edit. */
++#ifndef SHENG_GMU_SOURCE_H
++#define SHENG_GMU_SOURCE_H
++#include <stdint.h>
++#include <stddef.h>
++
++#define REG_GMU_CM3_ITCM_START UINT32_C(0x1400)   /* ladder (a6xx_gmu.xml 0xc00 + GMU base) */
++#define REG_GMU_CM3_DTCM_START UINT32_C(0x2400)   /* ladder (a6xx_gmu.xml 0x1c00) */
++#define REG_GMU_ICACHE_CONFIG UINT32_C(0x5400)   /* ladder (a6xx_gmu.xml 0x4c00) */
++#define REG_GMU_DCACHE_CONFIG UINT32_C(0x5401)   /* ladder (a6xx_gmu.xml 0x4c01) */
++#define REG_GMU_SYS_BUS_CONFIG UINT32_C(0x540f)   /* ladder (a6xx_gmu.xml 0x4c0f) */
++#define REG_GMU_CM3_SYSRESET UINT32_C(0x5800)   /* ladder (a6xx_gmu.xml 0x5000) */
++#define REG_GMU_CM3_BOOT_CONFIG UINT32_C(0x5801)   /* ladder (a6xx_gmu.xml 0x5001) */
++#define REG_GMU_CM3_FW_INIT_RESULT UINT32_C(0x581c)   /* ladder (a6xx_gmu.xml 0x501c) */
++#define REG_GMU_CM3_CFG UINT32_C(0x582d)   /* ladder (a6xx_gmu.xml 0x502d) */
++#define REG_GMU_HFI_CTRL_STATUS UINT32_C(0x5980)   /* ladder (a6xx_gmu.xml 0x5180) */
++#define REG_GMU_HFI_QTBL_INFO UINT32_C(0x5984)   /* ladder (a6xx_gmu.xml 0x5184) */
++#define REG_GMU_HFI_QTBL_ADDR UINT32_C(0x5985)   /* ladder (a6xx_gmu.xml 0x5185) */
++#define REG_GMU_HFI_CTRL_INIT UINT32_C(0x5986)   /* ladder (a6xx_gmu.xml 0x5186) */
++#define REG_GMU_GMU2HOST_INTR_INFO UINT32_C(0x5992)   /* ladder (a6xx_gmu.xml 0x5192) */
++#define REG_GMU_HOST2GMU_INTR_SET UINT32_C(0x5994)   /* ladder (a6xx_gmu.xml 0x5194) */
++#define REG_GMU_GENERAL_8 UINT32_C(0x59cd)   /* ladder (a6xx_gmu.xml 0x51cd) */
++#define REG_GMU_GENERAL_9 UINT32_C(0x59ce)   /* ladder (a6xx_gmu.xml 0x51ce) */
++#define REG_GMU_GENERAL_10 UINT32_C(0x59cf)   /* ladder (a6xx_gmu.xml 0x51cf) */
++#define REG_GMU_AO_HOST_INTERRUPT_STATUS UINT32_C(0x9b05)   /* a6xx_gmu.xml 0x9305 + GMU base */
++#define REG_GMU_AHB_FENCE_RANGE_0 UINT32_C(0x9b11)   /* ladder (a6xx_gmu.xml 0x9311) */
++#define REG_GPU_GMU_CX_GMU_CX_FAL_INTF UINT32_C(0x58f0)   /* ladder (a6xx_gmu.xml 0x50f0) */
++#define REG_GPU_GMU_CX_GMU_CX_FALNEXT_INTF UINT32_C(0x58f1)   /* ladder (a6xx_gmu.xml 0x50f1) */
++#define REG_CX_MISC_TCM_RET_CNTL UINT32_C(0x39)   /* ladder CX_MISC_TCM_RET_CNTL (byte 0xe4) */
++#define REG_RSCC_SEQ_BUSY_DRV0 UINT32_C(0x101)   /* ladder RSCC_SEQ_BUSY_DRV0 (byte 0x404) */
++#define REG_GBIF_QSB_SIDE0 UINT32_C(0x3c03)   /* ladder GPU_GBIF_QSB_SIDE0 (dword, GPU space) */
++
++#define SHENG_GMU_CHIP_ID UINT32_C(0x7030000)
++#define SHENG_GMU_FW_CHIP_ID UINT32_C(0x7030100)
++#define SHENG_GMU_CORE_GPU_DELTA 0u
++#define SHENG_GMU_FIRMWARE_BYTES 57272u
++#define SHENG_GMU_AO_FATAL_MASK UINT32_C(0x29)
++#define SHENG_GMU_CM3_FATAL_MASK UINT32_C(0x800000)
++static const uint8_t sheng_gmu_firmware_sha256[32]={0xb2,0xd3,0xf0,0xe2,0xa9,0x8f,0xd6,0x25,0x9a,0xb9,0xff,0xef,0x16,0xdf,0x63,0x26,0x55,0x42,0xe6,0xcc,0x9a,0x97,0x0d,0x53,0xd4,0x76,0xe8,0x23,0xd4,0x32,0x04,0x2a};
++static const uint64_t sheng_gmu_window_physical[5]={UINT64_C(0x2d68000),UINT64_C(0x2d50000),UINT64_C(0xa290000),UINT64_C(0x2d00000),UINT64_C(0x2d9e000)};
++static const size_t sheng_gmu_window_bytes[5]={0x37000,0x10000,0x10000,0x40000,0x1000};
++typedef struct {unsigned window;size_t byte_offset;uint32_t value;} ShengGmuSetupWrite;
++#define SHENG_GMU_RSC_SETUP_COUNT 19u
++static const ShengGmuSetupWrite sheng_gmu_rsc_setup[19]={
++    {1,0x10,UINT32_C(0x1000000)},
++    {1,0x2c,UINT32_C(0x1)},
++    {1,0x38,UINT32_C(0x0)},
++    {1,0x34,UINT32_C(0x0)},
++    {1,0x40,UINT32_C(0x0)},
++    {1,0x3c,UINT32_C(0x0)},
++    {1,0x48,UINT32_C(0x80000000)},
++    {1,0x44,UINT32_C(0x0)},
++    {1,0x400,UINT32_C(0x0)},
++    {1,0x20,UINT32_C(0x4520)},
++    {1,0x24,UINT32_C(0x4510)},
++    {1,0x28,UINT32_C(0x4514)},
++    {1,0x600,UINT32_C(0xeaaae5a0)},
++    {1,0x604,UINT32_C(0xe1a1ebab)},
++    {1,0x608,UINT32_C(0xa2e0a581)},
++    {1,0x60c,UINT32_C(0xecac82e2)},
++    {1,0x610,UINT32_C(0x20edad)},
++    {2,0x4520,UINT32_C(0x0)},
++    {2,0x4500,UINT32_C(0x80000001)},
++};
++
++#endif
+diff --git a/b/iokit/NativeAdreno/ShengGmuVotes.c b/iokit/NativeAdreno/ShengGmuVotes.c
+new file mode 100644
+index 0000000..7c502b2
+--- /dev/null
++++ b/iokit/NativeAdreno/ShengGmuVotes.c
+@@ -0,0 +1,46 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++#include "ShengGmuVotes.h"
++#include "ShengGmuVotesSource.h"
++AdrenoHfiStartupStatus ShengGmuBuildStartup(const ShengGmuVoteInputs *in,AdrenoHfiStartupConfig *out)
++{
++    if(!in || !out || in->chip_id!=SHENG_GMU_VOTES_CHIP_ID || in->gmxc_present>1 ||
++        in->enable_acd>1 || in->enable_ifpc>1 ||
++        (!in->gmxc_present && (in->gmxc.data || in->gmxc.bytes)))return AdrenoHfiStartupInvalid;
++    AdrenoHfiStartupConfig c={0};uint32_t votes[16],levels[16];
++    const ShengGmuAux *gpu_secondary=in->gmxc_present?&in->gmxc:&in->mx;
++    for(unsigned i=0;i<SHENG_GPU_OPPS;++i)levels[i]=sheng_gpu_opps[i].level;
++    if(AdrenoHfiArcVotes(levels,SHENG_GPU_OPPS,in->gfx.data,in->gfx.bytes,
++        gpu_secondary->data,gpu_secondary->bytes,votes,16))return AdrenoHfiStartupInvalid;
++    c.gpu_count=SHENG_GPU_OPPS;
++    for(unsigned i=0;i<c.gpu_count;++i) {
++        c.gpu[i]=(AdrenoHfiPerformanceLevel){sheng_gpu_opps[i].hz,votes[i]};
++        if(in->enable_acd && sheng_gpu_opps[i].acd_present) {
++            c.acd_enable_mask|=1u<<i;c.acd_data[c.acd_count++]=sheng_gpu_opps[i].acd;
++        }
++    }
++    if(c.acd_count)c.acd_version=c.acd_stride=1;
++    for(unsigned i=0;i<SHENG_GMU_OPPS;++i)levels[i]=sheng_gmu_opps[i].level;
++    if(AdrenoHfiArcVotes(levels,SHENG_GMU_OPPS,in->cx.data,in->cx.bytes,
++        in->mx.data,in->mx.bytes,votes,16))return AdrenoHfiStartupInvalid;
++    c.gmu_count=SHENG_GMU_OPPS;
++    for(unsigned i=0;i<c.gmu_count;++i)c.gmu[i]=(AdrenoHfiPerformanceLevel){sheng_gmu_opps[i].hz,votes[i]};
++    const ShengGmuBcmInput *inputs[]={&in->sh0,&in->mc0,&in->acv};AdrenoHfiBcm bcms[3];
++    for(unsigned i=0;i<3;++i) {
++        bcms[i]=sheng_bcm_policy[i];bcms[i].address=inputs[i]->address;
++        if(AdrenoHfiBcmAux(bcms+i,inputs[i]->aux.data,inputs[i]->aux.bytes))return AdrenoHfiStartupInvalid;
++    }
++    if(AdrenoHfiBuildBandwidth(sheng_gpu_bandwidths,SHENG_GPU_BANDWIDTHS,bcms,3,in->cn0_address,&c))
++        return AdrenoHfiStartupInvalid;
++    c.enable_ifpc=in->enable_ifpc;
++    if(AdrenoHfiStartupValidate(&c))return AdrenoHfiStartupInvalid;
++    *out=c;return AdrenoHfiStartupSuccess;
++}
++unsigned ShengGmuPerfVote(unsigned perf,unsigned *bandwidth)
++{
++    if(perf<1)perf=1;
++    if(perf>=SHENG_GPU_OPPS)perf=SHENG_GPU_OPPS-1;
++    unsigned bw=1;
++    for(unsigned i=1;i<SHENG_GPU_BANDWIDTHS;++i)if(sheng_gpu_bandwidths[i]==sheng_gpu_opps[perf].kbps){bw=i;break;}
++    if(bandwidth)*bandwidth=bw;
++    return perf;
++}
+diff --git a/b/iokit/NativeAdreno/ShengGmuVotesSource.h b/iokit/NativeAdreno/ShengGmuVotesSource.h
+new file mode 100644
+index 0000000..b0fc050
+--- /dev/null
++++ b/iokit/NativeAdreno/ShengGmuVotesSource.h
+@@ -0,0 +1,42 @@
++/* Generated by tools/prepare-liuqin-gmu.py from the vendor DTB
++ * (qcom,gpu-pwrlevels + qcom,bus-table-ddr) and the ladder's GMU OPPs.
++ * The BCM policy is the one A730 value that is not in mainline;
++ * confirm or override it before trusting bandwidth votes. */
++#ifndef SHENG_GMU_VOTES_SOURCE_H
++#define SHENG_GMU_VOTES_SOURCE_H
++#include <stdint.h>
++
++#define SHENG_GMU_VOTES_CHIP_ID UINT32_C(0x7030000)
++typedef struct {uint64_t hz;uint32_t level,kbps,acd_present,acd;} ShengGmuOpp;
++#define SHENG_GPU_OPPS 14u
++static const ShengGmuOpp sheng_gpu_opps[]={
++    {0ull,0u,0u,0u,0u},
++    {220000000ull,48u,1720u,1u,3358089213u},
++    {285000000ull,56u,1720u,1u,3224133629u},
++    {324000000ull,64u,1720u,1u,3224002557u},
++    {364000000ull,80u,2086u,1u,3223871485u},
++    {439000000ull,96u,5931u,1u,3223871485u},
++    {515000000ull,128u,5931u,1u,2284740605u},
++    {580000000ull,144u,7980u,1u,2284740605u},
++    {645000000ull,192u,7980u,1u,2284675069u},
++    {710000000ull,224u,12191u,1u,2284609533u},
++    {765000000ull,256u,12191u,1u,2284609533u},
++    {815000000ull,320u,12779u,1u,2284543997u},
++    {862000000ull,384u,12779u,1u,2284543997u},
++    {900000000ull,416u,12779u,1u,2284543997u},
++};
++#define SHENG_GMU_OPPS 3u
++static const ShengGmuOpp sheng_gmu_opps[]={
++    {0ull,0u,0u,0u,0u},
++    {200000000ull,64u,0u,0u,0u},
++    {500000000ull,128u,0u,0u,0u},
++};
++#define SHENG_GPU_BANDWIDTHS 6u
++static const uint32_t sheng_gpu_bandwidths[]={1720,2086,5931,7980,12191,12779};
++static const AdrenoHfiBcm sheng_bcm_policy[3]={
++    /* SH0 */ {.buswidth=16,.fixed=0,.perfmode=0,.perfmode_kbps=0},
++    /* MC0 */ {.buswidth=4,.fixed=0,.perfmode=0,.perfmode_kbps=0},
++    /* ACV */ {.buswidth=0,.fixed=1,.perfmode=32,.perfmode_kbps=12000},
++};
++
++#endif
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 57176c2..482c4fc 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -36,6 +36,9 @@ iokit/NativeAdreno/NativeAdrenoMemory.cpp                            optional io
+ iokit/NativeAdreno/NativeAdrenoPwrup.cpp                            optional iokitcpp
+ iokit/NativeAdreno/NativeAdrenoRing.cpp                            optional iokitcpp
+ iokit/NativeAdreno/NativeAdrenoService.cpp                            optional iokitcpp
++iokit/NativeAdreno/ShengGmu.c                            optional iokitcpp
++iokit/NativeAdreno/ShengGmuVotes.c                            optional iokitcpp
++iokit/NativeAdreno/ShengGmuCommandDb.c                            optional iokitcpp
+ iokit/NativeAdreno/NativeAdrenoSha256.cpp                            optional iokitcpp
+ iokit/NativeAdreno/NativeAdrenoSmmuContext.cpp                            optional iokitcpp
+ iokit/NativeAdreno/NativeAdrenoSmmuMemory.cpp                            optional iokitcpp

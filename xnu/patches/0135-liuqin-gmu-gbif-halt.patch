@@ -1,0 +1,13 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -268,6 +268,10 @@
+ {
+     if(!b || !pwrup_cpu)return kIOReturnBadArgument;
+     struct {uint32_t reg,value;} const regs[]={
++        /* The ladder writes GBIF_HALT before anything else; with the GBIF
++         * halted the SQE's first instruction fetch never completes and the
++         * CP_SQE_CNTL write stalls the bus. */
++        {0x3c45,0},                                  /* GBIF_HALT */
+         {0x0016,0},                                  /* RBBM_GBIF_HALT */
+         {0xf803,0},                                  /* RBBM_SECVID_TSB_CNTL */
+         {0xf802,0},                                  /* RBBM_SECVID_TSB_SIZE */

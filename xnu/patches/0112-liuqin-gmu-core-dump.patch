@@ -1,0 +1,23 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp	2026-10-24 09:48:28
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp	2026-10-24 09:48:28
+@@ -534,8 +534,18 @@
+-                                                IOLog("NativeAdreno: HFI hdr %08x %08x %08x %08x %08x %08x q0 %08x %08x %08x idx %08x %08x %08x\n",
++                                                IOLog("NativeAdreno: HFI hdr %08x %08x %08x %08x %08x %08x q0 %08x %08x %08x idx %08x %08x %08x q1 %08x %08x %08x\n",
+                                                     config.hfi.cpu[0],config.hfi.cpu[1],config.hfi.cpu[2],config.hfi.cpu[3],
+                                                     config.hfi.cpu[4],config.hfi.cpu[5],
+                                                     config.hfi.cpu[6],config.hfi.cpu[7],config.hfi.cpu[8],
+-                                                    config.hfi.cpu[15],config.hfi.cpu[16],config.hfi.cpu[17]);
++                                                    config.hfi.cpu[15],config.hfi.cpu[16],config.hfi.cpu[17],
++                                                    config.hfi.cpu[27],config.hfi.cpu[28],config.hfi.cpu[29]);
++                                                auto core=[&](uint32_t reg)->uint32_t {
++                                                    uint32_t v=0xdeadbeef;
++                                                    return gmu_io_.read32(gmu_io_.cookie,0,size_t(reg)*4u,&v)?0xdeadbeefu:v;
++                                                };
++                                                IOLog("NativeAdreno: GMU core sysreset=0x%x fw_init=0x%x hfi_status=0x%x qtbl_info=0x%x qtbl_addr=0x%x ctrl_init=0x%x gmu2host=0x%x ao=0x%x\n",
++                                                    core(REG_GMU_CM3_SYSRESET),core(REG_GMU_CM3_FW_INIT_RESULT),
++                                                    core(REG_GMU_HFI_CTRL_STATUS),core(REG_GMU_HFI_QTBL_INFO),
++                                                    core(REG_GMU_HFI_QTBL_ADDR),core(REG_GMU_HFI_CTRL_INIT),
++                                                    core(REG_GMU_GMU2HOST_INTR_INFO),core(REG_GMU_AO_HOST_INTERRUPT_STATUS));
+                                             }
+                                         }
+                                     if(started==ShengGmuSuccess) {

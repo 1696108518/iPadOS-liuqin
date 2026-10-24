@@ -1,0 +1,88 @@
+--- a/bsd/dev/liuqin_usb.c
++++ b/bsd/dev/liuqin_usb.c
+@@ -73,6 +73,61 @@
+ 	return v;
+ }
+ 
++static void
++usb_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dmb oshst" ::: "memory");
++}
++
++/*
++ * Bring the controller's power domain and clocks up ourselves.  ABL hands the
++ * machine over with USB30_PRIM collapsed and the branches gated (it used the
++ * controller for fastboot and then tore its driver down), so reading the DWC3
++ * block would hang and the gadget never starts.  Writing GCC is safe: it is
++ * always on.  liuqinusb=2 only.
++ */
++static bool
++usb_power_up(vm_offset_t gcc, uint32_t gdscr, const uint32_t *cbcr, unsigned cbcr_count)
++{
++	bool ok = true;
++	if (!(gdscr & (1u << 31))) {
++		usb_wr(gcc, GCC_USB30_PRIM_GDSCR, (gdscr & ~1u) | (1u << 31));
++		for (int i = 0; i < 100; i++) {
++			if (usb_rd(gcc, GCC_USB30_PRIM_GDSCR) & (1u << 31)) {
++				break;
++			}
++			delay(1000);
++		}
++		gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++		ok = (gdscr & (1u << 31)) != 0;
++		printf("LIUQIN USB: powered usb30_prim GDSCR 0x%08x (%s)\n", gdscr,
++		    ok ? "on" : "STILL OFF");
++	}
++	for (unsigned i = 0; i < cbcr_count; i++) {
++		if (!(cbcr[i] & CBCR_CLK_OFF)) {
++			continue;
++		}
++		if (usb_cbcr[i].off == 0x8c010) {
++			continue;   /* stays on from ABL; not ours to gate */
++		}
++		usb_wr(gcc, usb_cbcr[i].off, (cbcr[i] & ~CBCR_CLK_OFF) | 1u);
++		for (int n = 0; n < 100; n++) {
++			if (!(usb_rd(gcc, usb_cbcr[i].off) & CBCR_CLK_OFF)) {
++				break;
++			}
++			delay(1000);
++		}
++		const uint32_t now = usb_rd(gcc, usb_cbcr[i].off);
++		printf("LIUQIN USB: enabled clk %-12s CBCR 0x%08x (%s)\n", usb_cbcr[i].name, now,
++		    (now & CBCR_CLK_OFF) ? "STILL OFF" : "on");
++		if (now & CBCR_CLK_OFF) {
++			ok = false;
++		}
++	}
++	return ok;
++}
++
+ void
+ liuqin_usb_probe(void)
+ {
+@@ -97,8 +152,22 @@
+ 		printf("LIUQIN USB: clk %-12s CBCR 0x%08x (%s)\n", usb_cbcr[i].name, cbcr[i],
+ 		    (cbcr[i] & CBCR_CLK_OFF) ? "off" : "on");
+ 	}
+-	/* DWC3 registers need the GDSC, the master clock and the config-NoC path. */
++	/* DWC3 registers need the GDSC, the master clock and the config-NoC path.
++	 * When starting the device, raise them first instead of giving up: after
++	 * `fastboot boot` ABL has collapsed the domain. */
+ 	clocks_on = (gdscr & (1u << 31)) && !(cbcr[0] & CBCR_CLK_OFF) && !(cbcr[3] & CBCR_CLK_OFF);
++	if (!clocks_on && enabled >= 2) {
++		const unsigned count = sizeof(usb_cbcr) / sizeof(usb_cbcr[0]);
++		if (!usb_power_up(gcc, gdscr, cbcr, count)) {
++			printf("LIUQIN USB: controller could not be powered; DWC3 not read\n");
++			return;
++		}
++		gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++		for (unsigned i = 0; i < count; i++) {
++			cbcr[i] = usb_rd(gcc, usb_cbcr[i].off);
++		}
++		clocks_on = (gdscr & (1u << 31)) && !(cbcr[0] & CBCR_CLK_OFF) && !(cbcr[3] & CBCR_CLK_OFF);
++	}
+ 	if (!clocks_on) {
+ 		printf("LIUQIN USB: controller unpowered or unclocked; DWC3 not read\n");
+ 		return;

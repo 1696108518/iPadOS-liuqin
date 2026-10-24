@@ -1,0 +1,13 @@
+--- a/iokit/NativeAdreno/kits/AdrenoFirmware/AdrenoHfi.c	2026-10-24 10:51:53
++++ b/iokit/NativeAdreno/kits/AdrenoFirmware/AdrenoHfi.c	2026-10-24 10:51:53
+@@ -91,7 +91,9 @@
+                 complete();
+                 if(packet[2]) {*error=packet[2];return poison(h,AdrenoHfiFirmwareError);}
+                 for(unsigned i=3;i<count;++i)payload[i-3]=packet[i];
+-                v[10]=(at+((count+3)&~3u))&(WORDS-1);publish();
++                /* Do not advance read_index: this GMU never advances write_index,
++                 * so the next poll must keep read==write and scan again. */
++                publish();
+                 h->pending_header=0;*payload_words=count-3;return AdrenoHfiSuccess;
+             }
+             v[8]=1;publish();return AdrenoHfiEmpty;

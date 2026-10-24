@@ -1,0 +1,13 @@
+--- a/iokit/NativeAdreno/ShengGmu.c
++++ b/iokit/NativeAdreno/ShengGmu.c
+@@ -368,7 +368,9 @@
+     AdrenoHfiStartupResult *p,ShengGmuResult *r)
+ {
+     *returned=0;p->firmware_error=0;
+-    if(!payload || !words || words+1>SHENG_HFI_COMMAND_WORDS || !id || id>255 ||
++    /* The START message carries only its header: a zero-word payload is a
++     * valid command, so `payload` may be unused when `words` is zero. */
++    if((!payload && words) || words+1>SHENG_HFI_COMMAND_WORDS || !id || id>255 ||
+         !output || capacity<16)return ShengGmuArgument;
+     volatile uint32_t *cmd=hfi_queue_data(c,ShengHfiCommandQueue);
+     volatile uint32_t *rsp=hfi_queue_data(c,ShengHfiResponseQueue);

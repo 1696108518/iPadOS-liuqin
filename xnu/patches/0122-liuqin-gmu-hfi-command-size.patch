@@ -1,0 +1,51 @@
+--- a/iokit/NativeAdreno/ShengGmu.c
++++ b/iokit/NativeAdreno/ShengGmu.c
+@@ -307,7 +307,8 @@
+ #define SHENG_HFI_QUEUE_BYTES 4096u
+ #define SHENG_HFI_TABLE_WORDS 6u
+ #define SHENG_HFI_QHDR_WORDS 12u
+-#define SHENG_HFI_PACKET_WORDS 19u
++#define SHENG_HFI_PACKET_WORDS 19u     /* an ACK: header + return + error + 16 */
++#define SHENG_HFI_COMMAND_WORDS 254u    /* header count is 8 bits; the ring is 1024 words */
+ #define SHENG_HFI_RSP_SLOTS 4u
+ enum {ShengHfiCommandQueue=0,ShengHfiResponseQueue=1};
+ /* The wire sequence is one message per value, as the ladder numbers them. */
+@@ -359,7 +360,7 @@
+     AdrenoHfiStartupResult *p,ShengGmuResult *r)
+ {
+     *returned=0;p->firmware_error=0;
+-    if(!payload || !words || words+1>SHENG_HFI_PACKET_WORDS || !id || id>255 ||
++    if(!payload || !words || words+1>SHENG_HFI_COMMAND_WORDS || !id || id>255 ||
+         !output || capacity<16)return ShengGmuArgument;
+     volatile uint32_t *cmd=hfi_queue_data(c,ShengHfiCommandQueue);
+     volatile uint32_t *rsp=hfi_queue_data(c,ShengHfiResponseQueue);
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -516,7 +516,9 @@
+                                             sheng_gmu_stop_stage=stop;
+                                             sheng_gmu_stopped_at=0;
+                                         }
+-                                        ShengGmuStartupLimits limits{512,200,100000,200000};
++                                        /* Six startup messages of up to 100 ms each; the
++                                         * total budget must not cut the sequence short. */
++                                        ShengGmuStartupLimits limits{512,200,100000,2000000};
+                                         /* sheng-gpu-hfi=1: exchange the startup
+                                          * messages through the ladder's
+                                          * interrupt-driven transport (this GMU
+@@ -529,7 +531,7 @@
+                                             &gmu_device_,&config,&startup,&limits,&gmu_startup_);
+                                         {
+                                             extern volatile uint32_t sheng_gmu_stopped_at;
+-                                            IOLog("NativeAdreno: ColdStart status=%d mode=%s fw_ready=%u hfi_ready=%u stage=%u stopped_at=%u fw_init=0x%x hfi=0x%x polls=%u proto stage=%u polls=%u transport=%u fwerr=0x%x elapsed=%llu us\n",
++                                            IOLog("NativeAdreno: ColdStart status=%d mode=%s fw_ready=%u hfi_ready=%u stage=%u stopped_at=%u fw_init=0x%x hfi=0x%x polls=%u proto stage=%u polls=%u transport=%u fwerr=0x%x ack=0x%x elapsed=%llu us\n",
+                                             started,hfi_mode?"intr":"poll",
+                                             gmu_startup_.load.firmware_ready_observed,
+                                             gmu_startup_.load.hfi_ready_observed,
+@@ -538,6 +540,7 @@
+                                             gmu_startup_.load.poll_reads,
+                                             gmu_startup_.protocol.stage,gmu_startup_.protocol.poll_reads,
+                                             gmu_startup_.protocol.transport_status,gmu_startup_.protocol.firmware_error,
++                                            gmu_startup_.protocol.acknowledged_stages,
+                                             (unsigned long long)gmu_startup_.protocol.elapsed_us);
+                                             if(started!=ShengGmuSuccess) {
+                                                 /* Drop any stale CPU lines before reading DRAM. */

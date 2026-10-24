@@ -1,0 +1,34 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -619,17 +619,25 @@
+                                         PE_parse_boot_argn("sheng-gpu-gpuslot1",&gslot1,sizeof(gslot1));
+                                         IOLog("NativeAdreno: A2 bank=%u asid=%u smmu=%p bytes=%u\n",
+                                             gpubank,gpuasid,(void *)smmu_base,(unsigned)smmu_bytes);
++                                        /* SMR/S2CR are only implemented for the SMMU's real
++                                         * streams; reading the unused tail faults on this
++                                         * qsmmu (the A3 breadcrumb at slot 16 was the last
++                                         * line of the previous boot).  Scan the first 16
++                                         * slots only and stop as soon as both are found. */
+                                         volatile uint32_t *smmu=reinterpret_cast<volatile uint32_t *>(smmu_base);
+-                                        for(unsigned i=0;i<32;++i) {
++                                        const bool slots_given=gslot0!=0xffffffffu && gslot1!=0xffffffffu;
++                                        if(slots_given) IOLog("NativeAdreno: A3 slots from boot args\n");
++                                        for(unsigned i=0;!slots_given && i<16;++i) {
+                                             if(i==slot)continue;
+-                                            if((i&7)==0) IOLog("NativeAdreno: A3 i=%u smr=%08x s2cr=%08x\n",
+-                                                i,static_cast<unsigned>(smmu[0x800/4+i]),
+-                                                static_cast<unsigned>(smmu[0xc00/4+i]));
+-                                            const bool free=!(smmu[0x800/4+i]&0x80000000u) &&
+-                                                ((smmu[0xc00/4+i]>>16)&3)==2;
++                                            const uint32_t smr=smmu[0x800/4+i];
++                                            const uint32_t s2cr=smmu[0xc00/4+i];
++                                            const bool free=!(smr&0x80000000u) && ((s2cr>>16)&3)==2;
++                                            IOLog("NativeAdreno: A3 i=%u smr=%08x s2cr=%08x free=%u\n",
++                                                i,smr,s2cr,free?1u:0u);
+                                             if(!free || i==gslot0 || i==gslot1)continue;
+                                             if(gslot0==0xffffffffu)gslot0=i;
+                                             else if(gslot1==0xffffffffu)gslot1=i;
++                                            if(gslot0!=0xffffffffu && gslot1!=0xffffffffu)break;
+                                         }
+                                         IOLog("NativeAdreno: A4 slots %u/%u\n",gslot0,gslot1);
+                                         if(gslot0==0xffffffffu || gslot1==0xffffffffu) {

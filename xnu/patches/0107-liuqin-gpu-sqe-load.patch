@@ -1,0 +1,70 @@
+diff --git a/iokit/NativeAdreno/NativeAdrenoGpuContext.cpp b/iokit/NativeAdreno/NativeAdrenoGpuContext.cpp
+index dfac46d..62ed793 100644
+--- a/iokit/NativeAdreno/NativeAdrenoGpuContext.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoGpuContext.cpp
+@@ -114,6 +114,11 @@ extern "C" IOReturn NativeAdrenoGpuContextBuffers(NativeAdrenoGpuBuffer out[5])
+     }
+     return kIOReturnSuccess;
+ }
++extern "C" void *NativeAdrenoGpuContextBufferCpu(unsigned index)
++{
++    if(!board_gpu_context || !board_gpu_context->ready() || index>=GpuBufferCount)return nullptr;
++    return board_gpu_context->buffer(index).mapping();
++}
+ extern "C" NativeAdrenoVm *NativeAdrenoGpuContextVm()
+ {
+     return board_gpu_context?board_gpu_context->vm():nullptr;
+diff --git a/iokit/NativeAdreno/NativeAdrenoGpuContext.h b/iokit/NativeAdreno/NativeAdrenoGpuContext.h
+index dbe915a..2228b38 100644
+--- a/iokit/NativeAdreno/NativeAdrenoGpuContext.h
++++ b/iokit/NativeAdreno/NativeAdrenoGpuContext.h
+@@ -45,6 +45,8 @@ extern "C" IOReturn NativeAdrenoGpuContextBringup(volatile uint8_t *smmu,size_t
+     NativeAdrenoGmuContextReport *report);
+ /* sqe, ring, memptrs, pwrup, scratch: physical base, size and GPU address, only after Ready. */
+ extern "C" IOReturn NativeAdrenoGpuContextBuffers(NativeAdrenoGpuBuffer out[5]);
++/* CPU mapping of buffer i (0 sqe, 1 ring, 2 memptrs, 3 pwrup, 4 scratch), null before Ready. */
++extern "C" void *NativeAdrenoGpuContextBufferCpu(unsigned index);
+ /* The live VM of the ready GPU context (null before Ready), for the user-client core. */
+ extern "C" NativeAdrenoVm *NativeAdrenoGpuContextVm();
+ #endif
+diff --git a/iokit/NativeAdreno/NativeAdrenoService.cpp b/iokit/NativeAdreno/NativeAdrenoService.cpp
+index 8adb4ea..aa7a59f 100644
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -564,6 +564,36 @@ bool NativeAdrenoGpuService::start(IOService *provider)
+                                             }
+                                         }
+                                     }
++                                    {
++                                        /* Put the A730 SQE microcode into the GPU context's
++                                         * sqe buffer; the CP start and ring submission are the
++                                         * next step. */
++                                        uint32_t cp=0;
++                                        PE_parse_boot_argn("sheng-gpu-cp",&cp,sizeof(cp));
++                                        if(cp && !NativeAdrenoGpuContextBufferCpu(0)) {
++                                            IOLog("NativeAdreno: CP: no GPU context\n");
++                                        } else if(cp) {
++                                            uint32_t sqe_size=0;
++                                            const void *sqe=liuqin_fw_get("a730_sqe.fw",&sqe_size);
++                                            NativeAdrenoGpuBuffer b[5]{};
++                                            if(!sqe || sqe_size<8) IOLog("NativeAdreno: CP: no a730_sqe.fw\n");
++                                            else if(NativeAdrenoGpuContextBuffers(b))
++                                                IOLog("NativeAdreno: CP: buffers unavailable\n");
++                                            else if(sqe_size-4>GpuSqeBytes) IOLog("NativeAdreno: CP: sqe too large\n");
++                                            else {
++                                                uint8_t *dst=static_cast<uint8_t *>(NativeAdrenoGpuContextBufferCpu(0));
++                                                memcpy(dst,static_cast<const uint8_t *>(sqe)+4,sqe_size-4);
++                                                for(unsigned i=1;i<GpuBufferCount;++i) {
++                                                    uint8_t *p=static_cast<uint8_t *>(NativeAdrenoGpuContextBufferCpu(i));
++                                                    if(p) memset(p,0,b[i].bytes);
++                                                }
++                                                NativeAdrenoMaintainOwnedPages(dst,GpuSqeBytes,NativeAdrenoCleanInvalidate);
++                                                IOLog("NativeAdreno: CP: sqe %u bytes at 0x%llx ring 0x%llx memptrs 0x%llx\n",
++                                                    sqe_size-4,(unsigned long long)b[0].iova,
++                                                    (unsigned long long)b[1].iova,(unsigned long long)b[2].iova);
++                                            }
++                                        }
++                                    }
+                                     if(started==ShengGmuSuccess && !gpu_context_ready_) {
+                                         IOLog("NativeAdreno: ring/SQE refused: the GPU context (iommus 0/1) is not built\n");
+                                     } else if(started==ShengGmuSuccess) {

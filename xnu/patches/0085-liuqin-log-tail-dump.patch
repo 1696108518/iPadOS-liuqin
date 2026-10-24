@@ -1,0 +1,421 @@
+--- a/bsd/dev/liuqin_ufs.c
++++ b/bsd/dev/liuqin_ufs.c
+@@ -49,10 +49,15 @@
+ extern void thread_deallocate(thread_t);
+ extern int hz;
+ static void liuqin_log_start(void);
++static void liuqin_wdt_start(void);
++static void liuqin_log_dump(void);
++static void liuqin_fw_load(void);
++extern void liuqin_adreno_init(void);
+ extern void liuqin_sample_start(void);
+ extern void liuqin_usb_probe(void);
+ 
+ #define REG_CAP         0x00
++#define REG_AHIT        0x18    /* auto-hibernate idle timer */
+ #define REG_IS          0x20
+ #define REG_IE          0x24
+ #define REG_HCS         0x30
+@@ -117,6 +122,14 @@
+ 	dev_t bdev;
+ 	bool ready;
+ } su;
++
++/* Readahead window: sequential page-ins from the dyld cache are served from
++ * one big read instead of one command per 4 KiB page. */
++#define RA_BLOCKS       128u            /* 512 KiB */
++static bool ra_valid;
++static int ra_enable;                   /* boot-arg liuqinra=1 */
++static uint64_t ra_start;               /* partition-relative 4 KiB block */
++static uint32_t ra_blocks;
+ 
+ static LCK_GRP_DECLARE(liuqin_ufs_grp, "liuqin_ufs");
+ static LCK_MTX_DECLARE(liuqin_ufs_lock, &liuqin_ufs_grp);
+@@ -253,6 +266,29 @@
+ 		dma_sync(DMA_BOUNCE, len);
+ 	}
+ 
++	/* Throughput instrumentation: every 1024 commands, report ops, MiB and
++	 * average latency so a slow boot can be classified as I/O vs waiting. */
++	{
++		static uint64_t st_ops, st_bytes, st_ns;
++		st_ops++;
++		st_bytes += len;
++		uint64_t now = mach_absolute_time();
++		uint64_t t0 = st_ns ? st_ns : now;
++		if (st_ns == 0) {
++			st_ns = now ? now : 1;
++			t0 = now;
++		}
++		uint64_t elapsed = 0;
++		absolutetime_to_nanoseconds(now - t0, &elapsed);
++		if ((st_ops & 0x3ff) == 0 && elapsed > 0) {
++			uint64_t us = elapsed / 1000;
++			printf("LIUQIN UFS: %llu ops, %llu MiB, %llu ms, %llu KiB/s, %llu us/op\n",
++			    st_ops, st_bytes >> 20, elapsed / 1000000,
++			    (st_bytes / 1024) * 1000000 / elapsed,
++			    us / st_ops);
++		}
++	}
++
+ 	uint32_t ocs = utrd->dw2 & 0xff;
+ 	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
+ 		printf("LIUQIN UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x key 0x%x asc 0x%x ascq 0x%x\n",
+@@ -489,6 +525,7 @@
+ 	if (lba > UINT32_MAX || count > BOUNCE_SIZE / UFS_BLOCK) {
+ 		return EINVAL;
+ 	}
++	ra_valid = false;
+ 	uint8_t cdb[10] = {
+ 		0x28, 0,
+ 		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
+@@ -504,6 +541,7 @@
+ static int
+ ufs_write_blocks(uint64_t lba, uint32_t count)
+ {
++	ra_valid = false;
+ 	if (!su.writable || !su.nblocks || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
+ 	    lba < su.first_block || lba - su.first_block >= su.nblocks ||
+ 	    count > su.nblocks - (lba - su.first_block) || lba + count - 1 > UINT32_MAX) {
+@@ -630,6 +668,12 @@
+ 	ufs_wr(REG_UTRLBA, (uint32_t)list);
+ 	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
+ 	ufs_wr(REG_UTRLRSR, 1);
++	/*
++	 * Disable auto-hibernate: with one polled command at a time the link
++	 * otherwise goes to sleep between commands and every read pays a
++	 * multi-millisecond wake-up.
++	 */
++	ufs_wr(REG_AHIT, 0);
+ 	/* Never ring a doorbell unless the host uses our list. */
+ 	if (ufs_rd(REG_UTRLBA) != (uint32_t)list || ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
+ 	    !(ufs_rd(REG_UTRLRSR) & 1)) {
+@@ -691,9 +735,32 @@
+ 		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
+ 		void *bounce = (void *)(su.dma + DMA_BOUNCE);
+ 		if (rd) {
+-			error = ufs_read_blocks(su.first_block + lba, blocks);
+-			if (!error) {
+-				memcpy(vaddr + done, (const char *)bounce + skip, want);
++			if (ra_enable && ra_valid && lba >= ra_start &&
++			    lba + blocks <= ra_start + ra_blocks) {
++				memcpy(vaddr + done, (const char *)bounce +
++				    (lba - ra_start) * UFS_BLOCK + skip, want);
++			} else if (ra_enable) {
++				uint64_t start = lba;
++				uint32_t n = RA_BLOCKS;
++				if (n < blocks) {
++					n = blocks;
++				}
++				if (start + n > su.nblocks) {
++					n = (uint32_t)(su.nblocks - start);
++				}
++				error = ufs_read_blocks(su.first_block + start, n);
++				if (!error) {
++					ra_start = start;
++					ra_blocks = n;
++					ra_valid = true;
++					memcpy(vaddr + done, (const char *)bounce +
++					    (lba - start) * UFS_BLOCK + skip, want);
++				}
++			} else {
++				error = ufs_read_blocks(su.first_block + lba, blocks);
++				if (!error) {
++					memcpy(vaddr + done, (const char *)bounce + skip, want);
++				}
+ 			}
+ 		} else {
+ 			/* Partial device blocks at either end: read, merge, write back. */
+@@ -1024,6 +1091,8 @@
+ 	printf("LIUQIN UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
++	liuqin_fw_load();
++	liuqin_adreno_init();
+ 	liuqin_log_start();
+ 	liuqin_sample_start();
+ 	/* liuqin_usb_probe(); -- faults on this unit (data abort); USB is not needed for bring-up */
+@@ -1045,6 +1114,20 @@
+  */
+ #define LIUQIN_LOG_SIZE          (4u << 20)
+ #define LIUQIN_LOG_BLOCKS        (1 + LIUQIN_LOG_SIZE / UFS_BLOCK)
++
++#include <libkern/crypto/sha2.h>
++
++/*
++ * Firmware area: 8 MiB right before the persistent log at the end of the
++ * userdata partition (tools/mkfwarea.py builds it; the sparse image writes
++ * just that range).  Block 0 is a header:
++ *   "LIUQINFW" | u32 version 1 | u32 count | count x { char name[48];
++ *   u32 offset, u32 size, u8 sha256[32] } then the files, 4 KiB aligned.
++ */
++#define LIUQIN_FW_SIZE           (8u << 20)
++#define LIUQIN_FW_BLOCKS         (LIUQIN_FW_SIZE / UFS_BLOCK)
++#define LIUQIN_FW_MAX            16
++
+ #define LIUQIN_LOG_SECS          10u
+ 
+ static char liuqin_log_ring[LIUQIN_LOG_SIZE];
+@@ -1052,7 +1135,6 @@
+ static int liuqin_log_chan;
+ static uint32_t liuqin_log_secs = LIUQIN_LOG_SECS;
+ 
+-/* Called for all console output, any context: never blocks. */
+ void liuqin_log_append(const char *c, int size);
+ 
+ void
+@@ -1067,11 +1149,6 @@
+ 	}
+ }
+ 
+-/*
+- * Copy console bytes [*pos, total) (at most max) for live log streaming
+- * (liuqin_usb.c). A reader that fell more than the ring behind skips ahead.
+- * Returns the byte count; *pos advances.
+- */
+ uint32_t liuqin_log_copy(uint64_t *pos, char *out, uint32_t max);
+ 
+ uint32_t
+@@ -1103,9 +1180,104 @@
+ 	uint64_t total, seq;
+ };
+ 
++struct liuqin_fw_entry {
++	char name[48];
++	uint32_t offset, size;
++	uint8_t sha256[32];
++};
++struct liuqin_fw_header {
++	char magic[8];
++	uint32_t version, count;
++	struct liuqin_fw_entry entry[LIUQIN_FW_MAX];
++};
++
++static uint8_t *liuqin_fw_data;
++static struct liuqin_fw_header liuqin_fw_hdr;
++static uint32_t liuqin_fw_ok;
++
++const void *liuqin_fw_get(const char *name, uint32_t *size);
++
++const void *
++liuqin_fw_get(const char *name, uint32_t *size)
++{
++	for (uint32_t i = 0; liuqin_fw_data && i < liuqin_fw_hdr.count && i < LIUQIN_FW_MAX; i++) {
++		if ((liuqin_fw_ok & (1u << i)) &&
++		    strncmp(liuqin_fw_hdr.entry[i].name, name, 48) == 0) {
++			*size = liuqin_fw_hdr.entry[i].size;
++			return liuqin_fw_data + liuqin_fw_hdr.entry[i].offset;
++		}
++	}
++	return NULL;
++}
++
+ static void
++liuqin_fw_load(void)
++{
++	void const *prop = NULL;
++	unsigned int len = 0;
++	DTEntry mmap;
++	uint64_t phys = 0, size = 0;
++
++	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &mmap) != kSuccess ||
++	    SecureDTGetProperty(mmap, "LIUQINFW", &prop, &len) != kSuccess ||
++	    len < 2 * sizeof(uint64_t)) {
++		printf("LIUQIN FW: no LIUQINFW firmware area in the memory map\n");
++		return;
++	}
++	memcpy(&phys, prop, sizeof(uint64_t));
++	memcpy(&size, (const char *)prop + sizeof(uint64_t), sizeof(uint64_t));
++	if (size < sizeof(struct liuqin_fw_header) || size > (64u << 20)) {
++		printf("LIUQIN FW: bad firmware area (0x%llx phys, 0x%llx bytes)\n", phys, size);
++		return;
++	}
++	vm_offset_t io = ml_io_map(phys, (vm_size_t)size);
++	if (!io) {
++		printf("LIUQIN FW: cannot map the firmware area\n");
++		return;
++	}
++	/*
++	 * The memory map points at Device memory: unaligned or wide accesses
++	 * there fault (the first attempt panicked in memcpy). Copy it into
++	 * normal kernel memory with 4-byte aligned reads and parse that.
++	 */
++	vm_offset_t copy = 0;
++	if (kmem_alloc(kernel_map, &copy, (vm_size_t)size, KMA_DATA | KMA_ZERO,
++	    VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
++		printf("LIUQIN FW: no memory to copy the firmware area\n");
++		return;
++	}
++	const volatile uint32_t *src = (const volatile uint32_t *)io;
++	uint32_t *dst = (uint32_t *)copy;
++	for (uint64_t i = 0; i < size / 4; i++) {
++		dst[i] = src[i];
++	}
++	liuqin_fw_data = (uint8_t *)copy;
++	memcpy(&liuqin_fw_hdr, liuqin_fw_data, sizeof(liuqin_fw_hdr));
++	if (memcmp(liuqin_fw_hdr.magic, "LIUQINFW", 8) != 0 ||
++	    liuqin_fw_hdr.version != 1 || liuqin_fw_hdr.count > LIUQIN_FW_MAX) {
++		printf("LIUQIN FW: no firmware area (magic %.8s count %u)\n",
++		    liuqin_fw_hdr.magic, liuqin_fw_hdr.count);
++		liuqin_fw_data = NULL;
++		return;
++	}
++	for (uint32_t i = 0; i < liuqin_fw_hdr.count; i++) {
++		struct liuqin_fw_entry *e = &liuqin_fw_hdr.entry[i];
++		if (e->offset + e->size <= size && e->offset >= sizeof(liuqin_fw_hdr)) {
++			liuqin_fw_ok |= 1u << i;
++		}
++	}
++	printf("LIUQIN FW: %u files at 0x%llx (%llu KiB, mask 0x%x)\n",
++	    liuqin_fw_hdr.count, phys, size >> 10, liuqin_fw_ok);
++	for (uint32_t i = 0; i < liuqin_fw_hdr.count; i++) {
++		printf("LIUQIN FW: %.48s %u bytes\n", liuqin_fw_hdr.entry[i].name,
++		    liuqin_fw_hdr.entry[i].size);
++	}
++}
++
++static void
+ liuqin_log_thread(__unused void *arg, __unused wait_result_t wr)
+ {
++	liuqin_log_dump();
+ 	uint64_t base = su.first_block + su.nblocks - LIUQIN_LOG_BLOCKS;
+ 	uint64_t flushed = 0, seq = 0;
+ 	void *bounce = (void *)(su.dma + DMA_BOUNCE);
+@@ -1134,7 +1306,7 @@
+ 		}
+ 		if (!error) {
+ 			struct liuqin_log_header h = {
+-				.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
++				.magic = { 'L', 'I', 'U', 'Q', 'I', 'N', 'L', 'O' },
+ 				.version = 1, .size = LIUQIN_LOG_SIZE, .total = total, .seq = ++seq,
+ 			};
+ 			bzero(bounce, UFS_BLOCK);
+@@ -1142,7 +1314,10 @@
+ 			error = ufs_write_blocks(base, 1);
+ 		}
+ 		if (!error) {
+-			error = ufs_sync_cache();
++			int se = ufs_sync_cache();
++			if (se != 0) {
++				printf("LIUQIN LOG: sync failed (%d), continuing\n", se);
++			}
+ 		}
+ 		lck_mtx_unlock(&liuqin_ufs_lock);
+ 		if (error) {
+@@ -1153,7 +1328,101 @@
+ 	}
+ }
+ 
++/*
++ * Print the tail of the persistent console log left by the previous boot.
++ * A hang in userland then shows up on screen after a power cycle.
++ */
+ static void
++liuqin_log_dump(void)
++{
++	uint64_t base = su.first_block + su.nblocks - LIUQIN_LOG_BLOCKS;
++	void *bounce = (void *)(su.dma + DMA_BOUNCE);
++	struct liuqin_log_header *h = (struct liuqin_log_header *)bounce;
++	uint32_t want = 4000;
++
++	int e = ufs_read_blocks(base, 1);
++	printf("LIUQIN LOG: hdr rd=%d magic=%02x%02x%02x%02x%02x%02x%02x%02x ver=%u size=%u total=%llu\n",
++	    e, (uint8_t)h->magic[0], (uint8_t)h->magic[1], (uint8_t)h->magic[2], (uint8_t)h->magic[3],
++	    (uint8_t)h->magic[4], (uint8_t)h->magic[5], (uint8_t)h->magic[6], (uint8_t)h->magic[7],
++	    h->version, h->size, h->total);
++	if (e != 0) {
++		return;
++	}
++	if (memcmp(h->magic, "SWEETLOG", 8) != 0 &&
++	    memcmp(h->magic, "LIUQINLOG", 8) != 0) {
++		return;
++	}
++	uint64_t total = h->total;
++	uint32_t size = h->size;
++	if (size == 0 || size > LIUQIN_LOG_SIZE) {
++		return;
++	}
++	if (total < want) {
++		want = (uint32_t)total;
++	}
++	uint64_t start = total - want;
++	uint64_t ring_off = start % size;
++	if (ring_off + want > size) {
++		want = (uint32_t)(size - ring_off);
++	}
++	uint32_t block = (uint32_t)(ring_off / UFS_BLOCK);
++	uint32_t in_block = (uint32_t)(ring_off % UFS_BLOCK);
++	uint32_t nblocks = (in_block + want + UFS_BLOCK - 1) / UFS_BLOCK;
++	if (ufs_read_blocks(base + 1 + block, nblocks) != 0) {
++		return;
++	}
++	uint8_t *tp = (uint8_t *)bounce + in_block;
++	for (uint32_t i = 0; i < want; i++) {
++		if (tp[i] == 0) {
++			tp[i] = '.';
++		}
++	}
++	printf("LIUQIN LOG: previous boot tail (%u of %llu bytes):\n", want, total);
++	printf("%.*s\n", (int)want, (char *)tp);
++	printf("LIUQIN LOG: end of previous tail\n");
++	delay(60000000);        /* 60 s so the screen can be photographed */
++}
++
++/*
++ * Boot watchdog: if userland has not finished booting after 180 s, print the
++ * tail of the in-memory console ring (authoritative, no disk round-trip) and
++ * panic so the text stays on screen.
++ */
++static void
++liuqin_wdt_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static char tail[2400];
++	uint32_t secs = 0;
++
++	PE_parse_boot_argn("liuqinwdt", &secs, sizeof(secs));
++	if (secs == 0) {
++		return;
++	}
++	delay((uint64_t)secs * 1000000);
++	uint64_t total = os_atomic_load(&liuqin_log_total, relaxed);
++	uint32_t want = (uint32_t)MIN(total, (uint64_t)sizeof(tail));
++	uint64_t start = total - want;
++	for (uint32_t i = 0; i < want; i++) {
++		char c = liuqin_log_ring[(start + i) % LIUQIN_LOG_SIZE];
++		tail[i] = (c == 0) ? '.' : c;
++	}
++	extern int liuqin_console_muted;
++	liuqin_console_muted = 0;       /* draw the tail even when muted */
++	printf("LIUQIN WDT: ring tail (%u of %llu):\n", want, total);
++	printf("%.*s\n", (int)want, tail);
++	panic("LIUQIN watchdog: boot did not finish in 180 s");
++}
++
++static void
++liuqin_wdt_start(void)
++{
++	thread_t t;
++	if (kernel_thread_start(liuqin_wdt_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++}
++
++static void
+ liuqin_log_start(void)
+ {
+ 	uint32_t on = 1;
+@@ -1164,12 +1433,14 @@
+ 		return;
+ 	}
+ 	PE_parse_boot_argn("ufslogsecs", &liuqin_log_secs, sizeof(liuqin_log_secs));
++	PE_parse_boot_argn("liuqinra", &ra_enable, sizeof(ra_enable));
+ 	if (liuqin_log_secs == 0 || liuqin_log_secs > 60) {
+ 		liuqin_log_secs = LIUQIN_LOG_SECS;
+ 	}
+ 	if (kernel_thread_start(liuqin_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	liuqin_wdt_start();
+ }
+ 
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */

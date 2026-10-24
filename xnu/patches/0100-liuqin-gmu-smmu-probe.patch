@@ -1,0 +1,17 @@
+diff --git a/iokit/NativeAdreno/NativeAdrenoService.cpp b/iokit/NativeAdreno/NativeAdrenoService.cpp
+index ddfb5b7..3f152f0 100644
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -465,6 +465,12 @@ bool NativeAdrenoGpuService::start(IOService *provider)
+                                             rd(4,REG_CX_MISC_TCM_RET_CNTL),rd(1,REG_RSCC_SEQ_BUSY_DRV0),
+                                             rd(0,REG_GMU_AO_HOST_INTERRUPT_STATUS),
+                                             rd(0,REG_GMU_GMU2HOST_INTR_INFO));
++                                        if(smmu_bytes>0xc04) {
++                                            volatile uint32_t *m=reinterpret_cast<volatile uint32_t *>(smmu_base);
++                                            IOLog("NativeAdreno: smmu scr0 0x%x smr0 0x%x s2cr0 0x%x smr1 0x%x s2cr1 0x%x cb1_sctlr 0x%x\n",
++                                                m[0x000/4],m[0x800/4],m[0xc00/4],m[0x804/4],m[0xc04/4],
++                                                m[0x8000/4+0x00/4]);
++                                        }
+                                     }
+                                     else if(ShengGmuBuildStartup(&inputs,&startup)!=AdrenoHfiStartupSuccess) {
+                                         extern volatile uint32_t sheng_gmu_vote_stage,sheng_gmu_vote_info[8];

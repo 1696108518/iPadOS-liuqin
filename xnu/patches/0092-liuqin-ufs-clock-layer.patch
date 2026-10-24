@@ -1,0 +1,820 @@
+diff --git a/bsd/dev/liuqin_ufs.c b/bsd/dev/liuqin_ufs.c
+index 9facf85..de2ca42 100644
+--- a/bsd/dev/liuqin_ufs.c
++++ b/bsd/dev/liuqin_ufs.c
+@@ -112,6 +112,16 @@ extern void liuqin_usb_probe(void);
+ #define REG_UICARG2     0x98
+ #define REG_UICARG3     0x9c
+ 
++/* Qualcomm host controller vendor registers (Linux drivers/ufs/host/ufs-qcom.h). */
++#define REG_UFS_SYS1CLK_1US  0xC0
++#define REG_UFS_CFG0         0xD8
++#define REG_UFS_CFG1         0xDC
++#define REG_UFS_HW_VERSION   0xE4
++#define CFG1_QUNIPRO_SEL         (1u << 0)
++#define CFG1_UFS_PHY_SOFT_RESET  (1u << 1)
++#define CFG1_DEV_REF_CLK_EN      (1u << 26)
++#define CFG0_QUNIPRO_G4_SEL      (1u << 5)
++
+ #define HCS_DP          (1u << 0)
+ #define HCS_UTRLRDY     (1u << 1)
+ #define CAP_64AS        (1u << 24)              /* 64-bit DMA addressing */
+@@ -349,9 +359,11 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 			uint64_t us = elapsed / 1000;
+ 			extern int liuqin_console_force;
+ 			liuqin_console_force = 1;      /* visible even with liuqinmute=1 */
+-			printf("LIUQIN UFS: %llu ops, %llu MiB, %llu ms, %llu KiB/s, %llu us/op\n",
++			/* Bytes/ns * 1e9 / 2^20 is MiB/s; the old label said
++			 * KiB/s but the printed number was already MiB/s. */
++			printf("LIUQIN UFS: %llu ops, %llu MiB, %llu ms, %llu MiB/s, %llu us/op\n",
+ 			    st_ops, st_bytes >> 20, elapsed / 1000000,
+-			    (st_bytes / 1024) * 1000000 / elapsed,
++			    (st_bytes * 1000000000ull / elapsed) >> 20,
+ 			    us / st_ops);
+ 			printf("LIUQIN UFS: lat min/avg/max %llu/%llu/%llu us, over 1/10/50 ms: %u/%u/%u of %llu\n",
+ 			    lat_min / 1000, (lat_sum / st_ops) / 1000, lat_max / 1000,
+@@ -388,47 +400,421 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+  * initialisation flag sequence, which the bootloader may not have run.
+  * Returns 0 on success and stores the query value in *out.
+  */
+-/* Deassert the GCC UFS PHY block reset; the bootloader may leave it asserted
+- * after powering the block down, which makes every PHY register read zero. */
++/*
++ * ---------------------------------------------------------------------------
++ * GCC UFS_PHY clock layer
++ *
++ * Linux drives this block through the clock framework: a power domain, one
++ * branch clock per GCC output, an RCG rate per clock source and a block
++ * reset.  This driver only ever flipped the branch enable bits, so every
++ * rate stayed at whatever ABL programmed and the PHY's qref clock was never
++ * enabled at all.
++ *
++ * Offsets are from drivers/clk/qcom/gcc-sm8450.c (SM8475 uses the same GCC):
++ *   ufs_phy_gdsc              0x87004  bit 0 collapse, bit 31 power-on
++ *   gcc_ufs_phy_axi_clk       0x87018  rcg 0x8702c
++ *   gcc_ufs_phy_ahb_clk       0x87020
++ *   gcc_ufs_phy_tx_symbol_0   0x87024
++ *   gcc_ufs_phy_rx_symbol_0   0x87028
++ *   gcc_ufs_phy_unipro_core   0x87064  rcg 0x8708c
++ *   gcc_ufs_phy_ice_core      0x8706c  rcg 0x87074
++ *   gcc_ufs_phy_phy_aux       0x870a4  rcg 0x870a8
++ *   gcc_ufs_phy_rx_symbol_1   0x870c0
++ *   gcc_aggre_ufs_phy_axi     0x870d4
++ *   gcc_ufs_0_clkref_en       0x9c000  PHY qref
++ *
++ * RCG layout (drivers/clk/qcom/clk-rcg2.c): command at +0 (bit 0 update,
++ * bit 1 root enable), config at +4 (bits 0..4 divider, 8..10 source,
++ * bit 20 hardware control).  The divider field is 2*div-1, so 300 MHz from
++ * GPLL0 main (600 MHz) is field 3 source 1, and 19.2 MHz from XO is field 1
++ * source 0.
++ */
++#define GCC_UFS_PHY_BCR              0x87000
++#define GCC_UFS_PHY_GDSCR            0x87004
++#define GCC_UFS_PHY_AXI_CBCR         0x87018
++#define GCC_UFS_PHY_AHB_CBCR         0x87020
++#define GCC_UFS_PHY_TX_SYMBOL_CBCR   0x87024
++#define GCC_UFS_PHY_RX_SYMBOL0_CBCR  0x87028
++#define GCC_UFS_PHY_UNIPRO_CBCR      0x87064
++#define GCC_UFS_PHY_ICE_CBCR         0x8706c
++#define GCC_UFS_PHY_AUX_CBCR         0x870a4
++#define GCC_UFS_PHY_RX_SYMBOL1_CBCR  0x870c0
++#define GCC_AGGRE_UFS_PHY_AXI_CBCR   0x870d4
++#define GCC_UFS_0_CLKREF_EN          0x9c000
++
++#define GCC_UFS_PHY_AXI_RCGR         0x8702c
++#define GCC_UFS_PHY_ICE_RCGR         0x87074
++#define GCC_UFS_PHY_UNIPRO_RCGR      0x8708c
++#define GCC_UFS_PHY_AUX_RCGR         0x870a8
++
++#define GCC_RCG_UPDATE               (1u << 0)
++#define GCC_RCG_ROOT_EN              (1u << 1)
++#define GCC_RCG_DIV_MASK             0x1fu
++#define GCC_RCG_SRC_MASK             (0x7u << 8)
++#define GCC_RCG_MODE_MASK            (0x3u << 12)
++#define GCC_RCG_HW_CTRL              (1u << 20)
++#define GCC_CBCR_HW_CTRL             (1u << 1)
++#define GCC_CBCR_CLK_OFF             (1u << 31)
++#define GCC_GDSC_PWR_ON              (1u << 31)
++
++#define GCC_RCG_DIV_300MHZ           3       /* GPLL0 main 600 MHz / 2 */
++#define GCC_RCG_DIV_19P2MHZ          1       /* XO / 1 */
++
++static inline uint32_t
++gcc_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(su.gcc + off);
++}
++
++static inline void
++gcc_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(su.gcc + off) = v;
++}
++
++/* Rate of one UFS RCG, for the boot log; the parent map is
++ * gcc_parent_map_0 (XO 0, GPLL0 main 1, GPLL0 even 6) for every RCG here
++ * except phy_aux, which only has XO. */
++static uint32_t
++gcc_rcg_rate(uint32_t cmd_rcgr, uint32_t *divp, uint32_t *srcp)
++{
++	uint32_t cfg = gcc_rd(cmd_rcgr + 4);
++	uint32_t div = cfg & GCC_RCG_DIV_MASK;
++	uint32_t src = (cfg >> 8) & 0x7;
++	uint32_t parent;
++
++	switch (src) {
++	case 0:  parent = 19200000;  break;     /* bi_tcxo */
++	case 1:  parent = 600000000; break;     /* gcc_gpll0_out_main */
++	case 6:  parent = 300000000; break;     /* gcc_gpll0_out_even */
++	default: parent = 0;         break;
++	}
++	if (divp) {
++		*divp = div;
++	}
++	if (srcp) {
++		*srcp = src;
++	}
++	return parent ? parent * 2 / (div + 1) : 0;
++}
++
++/* Reproduce clk_rcg2_configure() + update_config(). */
++static int
++gcc_rcg_set(uint32_t cmd_rcgr, uint32_t div, uint32_t src, const char *name)
++{
++	uint32_t cmd = gcc_rd(cmd_rcgr);
++	uint32_t cfg = gcc_rd(cmd_rcgr + 4);
++	int i;
++
++	if (!(cmd & GCC_RCG_ROOT_EN)) {
++		gcc_wr(cmd_rcgr, cmd | GCC_RCG_ROOT_EN);
++	}
++	cfg &= ~(GCC_RCG_DIV_MASK | GCC_RCG_SRC_MASK | GCC_RCG_MODE_MASK);
++	cfg |= div | (src << 8) | GCC_RCG_HW_CTRL;
++	gcc_wr(cmd_rcgr + 4, cfg);
++	gcc_wr(cmd_rcgr, gcc_rd(cmd_rcgr) | GCC_RCG_UPDATE);
++	for (i = 0; i < 100; i++) {
++		if (!(gcc_rd(cmd_rcgr) & GCC_RCG_UPDATE)) {
++			return 0;
++		}
++		delay(1);
++	}
++	printf("LIUQIN UFS: gcc %s rate update timed out (cmd 0x%x)\n",
++	    name, gcc_rd(cmd_rcgr));
++	return ETIMEDOUT;
++}
++
++/* Branch clock: set ENABLE and wait for the halt status like
++ * clk_branch2_enable() does.  A hardware-gated branch has no usable halt
++ * bit, so bit 1 means "on" there. */
++static int
++gcc_branch_on(uint32_t cbcr, const char *name)
++{
++	uint32_t v = gcc_rd(cbcr);
++	int i;
++
++	if (!(v & 1u)) {
++		gcc_wr(cbcr, v | 1u);
++	}
++	for (i = 0; i < 200; i++) {
++		v = gcc_rd(cbcr);
++		if (!(v & GCC_CBCR_CLK_OFF) || (v & GCC_CBCR_HW_CTRL)) {
++			return 0;
++		}
++		delay(1);
++	}
++	printf("LIUQIN UFS: gcc %s did not start (cbcr 0x%x)\n", name, v);
++	return ETIMEDOUT;
++}
++
+ static void
+-ufs_gcc_phy_reset(void)
++gcc_ufs_power_domain_on(void)
+ {
+-	if (!su.gcc) {
++	uint32_t v = gcc_rd(GCC_UFS_PHY_GDSCR);
++	int i;
++
++	if (v & GCC_GDSC_PWR_ON) {
+ 		return;
+ 	}
+-	volatile uint32_t *bcr = (volatile uint32_t *)(su.gcc + 0x87000);
+-	printf("LIUQIN UFS: gcc bcr before %08x\n", *bcr);
+-	*bcr = 0;
+-	delay(2000);
+-	printf("LIUQIN UFS: gcc bcr after %08x\n", *bcr);
++	gcc_wr(GCC_UFS_PHY_GDSCR, v & ~1u);
++	for (i = 0; i < 1000; i++) {
++		if (gcc_rd(GCC_UFS_PHY_GDSCR) & GCC_GDSC_PWR_ON) {
++			return;
++		}
++		delay(1);
++	}
++	printf("LIUQIN UFS: gcc ufs_phy_gdsc stuck at 0x%x\n",
++	    gcc_rd(GCC_UFS_PHY_GDSCR));
+ }
+ 
+-/* Turn on the GCC clocks that gate the UFS PHY register interface.  The
+- * bootloader leaves the PHY core running (the link works) but gates the
+- * aux/apb clock, so the PCS registers read back as zero. */
++/* Deassert - or, for the HS bring-up, pulse - the GCC UFS PHY block reset.
++ * Linux asserts this for 200 us and deasserts it before touching the PHY
++ * (ufs_qcom_host_reset()), which also resets the host controller, so the
++ * caller has to re-program the request list afterwards. */
+ static void
+-ufs_gcc_clocks_on(void)
++ufs_gcc_phy_reset(int pulse)
+ {
+-	static const uint32_t cbcr[] = {
+-		0x87018,        /* gcc_ufs_phy_axi_clk */
+-		0x87020,        /* gcc_ufs_phy_ahb_clk */
+-		0x87064,        /* gcc_ufs_phy_unipro_core_clk */
+-		0x8706c,        /* gcc_ufs_phy_ice_core_clk */
+-		0x870a4,        /* gcc_ufs_phy_phy_aux_clk */
+-	};
++	uint32_t v;
++
+ 	if (!su.gcc) {
+ 		return;
+ 	}
+-	for (unsigned i = 0; i < sizeof(cbcr) / sizeof(cbcr[0]); i++) {
+-		volatile uint32_t *r = (volatile uint32_t *)(su.gcc + cbcr[i]);
+-		*r = *r | 1u;
++	v = gcc_rd(GCC_UFS_PHY_BCR);
++	printf("LIUQIN UFS: gcc bcr before %08x (pulse %d)\n", v, pulse);
++	if (pulse) {
++		gcc_wr(GCC_UFS_PHY_BCR, v | 1u);
++		delay(200);
++		gcc_wr(GCC_UFS_PHY_BCR, gcc_rd(GCC_UFS_PHY_BCR) & ~1u);
++		delay(1000);
++	} else {
++		gcc_wr(GCC_UFS_PHY_BCR, v & ~1u);
++		delay(2000);
+ 	}
+-	/* root generator enable for the aux clock */
+-	{
+-		volatile uint32_t *r = (volatile uint32_t *)(su.gcc + 0x870a8);
+-		*r = *r | 1u;
++	printf("LIUQIN UFS: gcc bcr after %08x\n", gcc_rd(GCC_UFS_PHY_BCR));
++}
++
++/* The clock tree as it stands after the setup, with rates computed from the
++ * RCG configs rather than assumed. */
++static void
++ufs_gcc_report(void)
++{
++	uint32_t axid = 0, axis = 0;
++	uint32_t axi = gcc_rcg_rate(GCC_UFS_PHY_AXI_RCGR, &axid, &axis);
++	uint32_t ice = gcc_rcg_rate(GCC_UFS_PHY_ICE_RCGR, NULL, NULL);
++	uint32_t uni = gcc_rcg_rate(GCC_UFS_PHY_UNIPRO_RCGR, NULL, NULL);
++	uint32_t aux = gcc_rcg_rate(GCC_UFS_PHY_AUX_RCGR, NULL, NULL);
++
++	printf("LIUQIN UFS: gcc gdsc 0x%x bcr 0x%x\n",
++	    gcc_rd(GCC_UFS_PHY_GDSCR), gcc_rd(GCC_UFS_PHY_BCR));
++	printf("LIUQIN UFS: gcc rates axi %u.%03u MHz (src %u div %u) unipro %u.%03u MHz ice %u.%03u MHz aux %u.%03u MHz\n",
++	    axi / 1000000, (axi / 1000) % 1000, axis, axid,
++	    uni / 1000000, (uni / 1000) % 1000,
++	    ice / 1000000, (ice / 1000) % 1000,
++	    aux / 1000000, (aux / 1000) % 1000);
++	printf("LIUQIN UFS: gcc cbcr axi 0x%x ahb 0x%x unipro 0x%x ice 0x%x aux 0x%x aggre 0x%x qref 0x%x sym tx 0x%x rx0 0x%x rx1 0x%x\n",
++	    gcc_rd(GCC_UFS_PHY_AXI_CBCR), gcc_rd(GCC_UFS_PHY_AHB_CBCR),
++	    gcc_rd(GCC_UFS_PHY_UNIPRO_CBCR), gcc_rd(GCC_UFS_PHY_ICE_CBCR),
++	    gcc_rd(GCC_UFS_PHY_AUX_CBCR), gcc_rd(GCC_AGGRE_UFS_PHY_AXI_CBCR),
++	    gcc_rd(GCC_UFS_0_CLKREF_EN), gcc_rd(GCC_UFS_PHY_TX_SYMBOL_CBCR),
++	    gcc_rd(GCC_UFS_PHY_RX_SYMBOL0_CBCR),
++	    gcc_rd(GCC_UFS_PHY_RX_SYMBOL1_CBCR));
++}
++
++/* Bring the whole UFS_PHY clock tree up.  The core/unipro/ice rates are only
++ * touched for HS: the default PWM path keeps ABL's rates so a failure here
++ * cannot take a working boot down with it. */
++static int
++ufs_gcc_clocks_on(int hs)
++{
++	int err = 0;
++
++	if (!su.gcc) {
++		return EIO;
++	}
++	gcc_ufs_power_domain_on();
++
++	if (hs) {
++		err |= gcc_rcg_set(GCC_UFS_PHY_AXI_RCGR,
++		    GCC_RCG_DIV_300MHZ, 1, "axi");
++		err |= gcc_rcg_set(GCC_UFS_PHY_UNIPRO_RCGR,
++		    GCC_RCG_DIV_300MHZ, 1, "unipro");
++		err |= gcc_rcg_set(GCC_UFS_PHY_ICE_RCGR,
++		    GCC_RCG_DIV_300MHZ, 1, "ice");
++	}
++	err |= gcc_rcg_set(GCC_UFS_PHY_AUX_RCGR, GCC_RCG_DIV_19P2MHZ, 0, "aux");
++
++	err |= gcc_branch_on(GCC_UFS_PHY_AXI_CBCR, "axi");
++	err |= gcc_branch_on(GCC_UFS_PHY_AHB_CBCR, "ahb");
++	err |= gcc_branch_on(GCC_UFS_PHY_UNIPRO_CBCR, "unipro");
++	err |= gcc_branch_on(GCC_UFS_PHY_ICE_CBCR, "ice");
++	err |= gcc_branch_on(GCC_UFS_PHY_AUX_CBCR, "aux");
++	err |= gcc_branch_on(GCC_AGGRE_UFS_PHY_AXI_CBCR, "aggre");
++	if (hs) {
++		/* HS uses both lanes, so the PHY symbol clocks and the 19.2 MHz
++		 * reference buffer (qref) have to be running.  The minimal PWM
++		 * bring-up never needed any of them. */
++		err |= gcc_branch_on(GCC_UFS_PHY_TX_SYMBOL_CBCR, "tx_sym");
++		err |= gcc_branch_on(GCC_UFS_PHY_RX_SYMBOL0_CBCR, "rx_sym0");
++		err |= gcc_branch_on(GCC_UFS_PHY_RX_SYMBOL1_CBCR, "rx_sym1");
++		err |= gcc_branch_on(GCC_UFS_0_CLKREF_EN, "qref");
+ 	}
+ 	delay(1000);
++
++	{
++		extern int liuqin_console_force;
++		liuqin_console_force = 1;
++		ufs_gcc_report();
++		liuqin_console_force = 0;
++	}
++	return err ? EIO : 0;
++}
++
++static int ufs_uic(uint8_t opcode, uint32_t a1, uint32_t a2, uint32_t a3,
++    uint32_t *out);
++
++/* Host-side clocks.  The UTP timers count core_clk, and UniPro needs its
++ * mode select; Linux programs both from the actual rates
++ * (ufs_qcom_select_unipro_mode(), ufs_qcom_cfg_timers()). */
++static void
++ufs_hc_clock_init(void)
++{
++	uint32_t ver = ufs_rd(REG_UFS_HW_VERSION);
++	uint32_t major = (ver >> 28) & 0xf;
++	uint32_t axi = su.gcc ? gcc_rcg_rate(GCC_UFS_PHY_AXI_RCGR, NULL, NULL) : 0;
++
++	if (!axi) {
++		axi = 300000000;
++	}
++	ufs_wr(REG_UFS_CFG1, ufs_rd(REG_UFS_CFG1) | CFG1_QUNIPRO_SEL);
++	if (major >= 5) {
++		/* HW v5 only supports HS-G5 rate A (ufs_qcom_select_unipro_mode). */
++		ufs_wr(REG_UFS_CFG0, ufs_rd(REG_UFS_CFG0) & ~CFG0_QUNIPRO_G4_SEL);
++	}
++	ufs_wr(REG_UFS_SYS1CLK_1US, axi / 1000000);
++	(void)ufs_rd(REG_UFS_SYS1CLK_1US);
++	printf("LIUQIN UFS: hc ver 0x%x cfg1 0x%x sys1clk %u MHz\n",
++	    ver, ufs_rd(REG_UFS_CFG1), ufs_rd(REG_UFS_SYS1CLK_1US));
++}
++
++/* Device reference clock (CFG1 bit 26).  Linux enables it before a power
++ * mode change to HS (ufs_qcom_pwr_change_notify, PRE_CHANGE). */
++static void
++ufs_dev_ref_clock(int on)
++{
++	uint32_t v = ufs_rd(REG_UFS_CFG1);
++
++	if (on) {
++		v |= CFG1_DEV_REF_CLK_EN;
++	} else {
++		v &= ~CFG1_DEV_REF_CLK_EN;
++	}
++	ufs_wr(REG_UFS_CFG1, v);
++	(void)ufs_rd(REG_UFS_CFG1);
++	delay(10);
++	printf("LIUQIN UFS: device ref clock %s (cfg1 0x%x)\n",
++	    on ? "on" : "off", v);
++}
++
++/* DME attributes that tell UniPro how fast its clocks run.  Values mirror
++ * ufs_qcom_set_core_clk_ctrl(): 1 us is core_clk_unipro in MHz (300) and
++ * 40 ns is core_clk_unipro / 25 = 12 cycles, with the divider disabled. */
++static void
++ufs_dme_clock_init(void)
++{
++	uint32_t cycles = 300;                 /* core_clk_unipro, MHz */
++	uint32_t v = 0;
++	int r;
++
++	r = ufs_uic(0x01, 0xD002u << 16, 0, 0, &v);
++	if (!r) {
++		v &= ~(0x3ffu << 16);
++		v |= (cycles & 0x3ff) << 16;
++		v &= ~(1u << 8);               /* DME_VS_CORE_CLK_CTRL_DIV_EN */
++		r = ufs_uic(0x02, 0xD002u << 16, 0, v, NULL);
++	}
++	printf("LIUQIN UFS: dme core clk ctrl 0x%x -> %d\n", v, r);
++
++	v = 0;
++	r = ufs_uic(0x01, 0x9007u << 16, 0, 0, &v);
++	if (!r) {
++		v = (v & ~0x7fu) | (cycles / 25);
++		r = ufs_uic(0x02, 0x9007u << 16, 0, v, NULL);
++	}
++	printf("LIUQIN UFS: dme 40ns cycles 0x%x -> %d\n", v, r);
++}
++
++/*
++ * Request HS mode.  PA_PWRMODE packs two nibbles - RX mode in 7..4, TX mode
++ * in 3..0 - so FAST/FAST is 0x11, not 1.  The earlier probe wrote 1 and the
++ * device answered "invalid value" (UIC result 10); that is unrelated to
++ * READ_ATTR bCurrentPowerMode, which returns 0x11 for SLOW (PWM).  The rest
++ * of the sequence is ufshcd_change_power_mode(): RX attributes first, then
++ * TX, HS series, and only then the power mode that retrains the link.
++ */
++static int
++ufs_set_hs_gear(const char *tag)
++{
++	uint32_t maxhs = 0, tx = 0, rx = 0, pm = 0, txl = 0, rxl = 0;
++	uint32_t want, cs = 0xff;
++	int e1, e2, e3, e4, e5, e6;
++	int s_rx, s_lane_rx, s_tx, s_lane_tx, s_adapt, s_pm = -1;
++	int series = 1;
++
++	e1 = ufs_uic(0x01, 0x1587u << 16, 0, 0, &maxhs);   /* PA_MAXRXHSGEAR */
++	e2 = ufs_uic(0x01, 0x1568u << 16, 0, 0, &tx);      /* PA_TXGEAR */
++	e3 = ufs_uic(0x01, 0x1583u << 16, 0, 0, &rx);      /* PA_RXGEAR */
++	e4 = ufs_uic(0x01, 0x1571u << 16, 0, 0, &pm);      /* PA_PWRMODE */
++	e5 = ufs_uic(0x01, 0x1560u << 16, 0, 0, &txl);     /* PA_ACTIVETXDATALANES */
++	e6 = ufs_uic(0x01, 0x1580u << 16, 0, 0, &rxl);     /* PA_ACTIVERXDATALANES */
++	if (e1 || maxhs < 1) {
++		printf("LIUQIN UFS: %s no HS gear (maxhs %u err %d)\n",
++		    tag, maxhs, e1);
++		return EIO;
++	}
++	want = maxhs > 4 ? 4 : maxhs;
++
++	s_rx = ufs_uic(0x02, 0x1583u << 16, 0, want, NULL);
++	s_lane_rx = ufs_uic(0x02, 0x1580u << 16, 0, 2, NULL);
++	ufs_uic(0x02, 0x1584u << 16, 0, 1, NULL);          /* RX termination */
++	s_tx = ufs_uic(0x02, 0x1568u << 16, 0, want, NULL);
++	s_lane_tx = ufs_uic(0x02, 0x1560u << 16, 0, 2, NULL);
++	ufs_uic(0x02, 0x1569u << 16, 0, 1, NULL);          /* TX termination */
++	s_adapt = ufs_uic(0x02, 0x15D4u << 16, 0, 1, NULL); /* PA_INITIAL_ADAPT */
++
++	/* Rate A first, then B; the device only has to accept one. */
++	for (series = 1; series <= 2; series++) {
++		ufs_uic(0x02, 0x156Au << 16, 0, (uint32_t)series, NULL); /* PA_HSSERIES */
++		s_pm = ufs_uic(0x02, 0x1571u << 16, 0, 0x11u, NULL);     /* FAST/FAST */
++		if (!s_pm) {
++			break;
++		}
++	}
++	for (int i = 0; i < 100; i++) {
++		if (!ufs_uic(0x01, 0x4020u << 16, 0, 0, &cs) && cs == 1) {
++			break;
++		}
++		delay(1000);
++	}
++	uint32_t ntx = 0, nrx = 0, npm = 0, ntxl = 0, nrxl = 0;
++	ufs_uic(0x01, 0x1568u << 16, 0, 0, &ntx);
++	ufs_uic(0x01, 0x1583u << 16, 0, 0, &nrx);
++	ufs_uic(0x01, 0x1571u << 16, 0, 0, &npm);
++	ufs_uic(0x01, 0x1560u << 16, 0, 0, &ntxl);
++	ufs_uic(0x01, 0x1580u << 16, 0, 0, &nrxl);
++
++	{
++		extern int liuqin_console_force;
++		liuqin_console_force = 1;
++		printf("LIUQIN UFS: %s pre maxhs %u(%d) tx %u(%d) rx %u(%d) pm 0x%x(%d) lanes %u(%d)/%u(%d)\n",
++		    tag, maxhs, e1, tx, e2, rx, e3, pm, e4, txl, e5, rxl, e6);
++		printf("LIUQIN UFS: %s set gear %u rx=%d lanes_rx=%d tx=%d lanes_tx=%d adapt=%d pwr 0x11 -> %d series %d conn 0x%x\n",
++		    tag, want, s_rx, s_lane_rx, s_tx, s_lane_tx, s_adapt, s_pm,
++		    series > 2 ? 2 : series, cs);
++		printf("LIUQIN UFS: %s after tx %u rx %u pm 0x%x lanes %u/%u\n",
++		    tag, ntx, nrx, npm, ntxl, nrxl);
++		liuqin_console_force = 0;
++	}
++	return s_pm ? EIO : 0;
+ }
+ 
+ /* QMP UFS PHY, HS-capable (SM8475).  Ported from the Linux driver's
+@@ -490,7 +876,7 @@ enum { PHY_SERDES = 0x000, PHY_PCS = 0x400, PHY_TX = 0x1000, PHY_RX = 0x1200,
+        PHY_TX2 = 0x1800, PHY_RX2 = 0x1a00 };
+ 
+ static int
+-ufs_phy_wake(void)
++ufs_phy_wake(int hs)
+ {
+ 	if (!su.phy) {
+ 		return EIO;
+@@ -505,48 +891,46 @@ ufs_phy_wake(void)
+ 	    pcs[0x000 / 4], pcs[0x004 / 4], pre_rd);
+ 	liuqin_console_force = 0;
+ 
+-	/*
+-	 * The HS tables are opt-in: with them applied the PCS reaches its ready
+-	 * state but the UIC commands are refused, so the GCC-side ufsphy reset and
+-	 * reference-clock rate that Linux sets up are still missing.  Default boot
+-	 * keeps the minimal power-on, which brings the link up in PWM.
+-	 */
+-	uint32_t hs = 0;
+-	PE_parse_boot_argn("ufsphyhs", &hs, sizeof(hs));
+ 	if (hs) {
+-	ufs_phy_apply(phy, PHY_SERDES, PHY_TBL(liuqin_phy_serdes));
+-	ufs_phy_apply(phy, PHY_TX, PHY_TBL(liuqin_phy_tx));
+-	ufs_phy_apply(phy, PHY_RX, PHY_TBL(liuqin_phy_rx));
+-	ufs_phy_apply(phy, PHY_TX2, PHY_TBL(liuqin_phy_tx));
+-	ufs_phy_apply(phy, PHY_RX2, PHY_TBL(liuqin_phy_rx));
+-	ufs_phy_apply(phy, PHY_PCS, PHY_TBL(liuqin_phy_pcs));
+-	ufs_phy_apply(phy, PHY_SERDES, PHY_TBL(liuqin_phy_g4_serdes));
+-	ufs_phy_apply(phy, PHY_TX, PHY_TBL(liuqin_phy_g4_tx));
+-	ufs_phy_apply(phy, PHY_RX, PHY_TBL(liuqin_phy_g4_rx));
+-	ufs_phy_apply(phy, PHY_TX2, PHY_TBL(liuqin_phy_g4_tx));
+-	ufs_phy_apply(phy, PHY_RX2, PHY_TBL(liuqin_phy_g4_rx));
+-	ufs_phy_apply(phy, PHY_PCS, PHY_TBL(liuqin_phy_g4_pcs));
+-	}
+-
+-	/*
+-	 * Order from qmp_ufs_com_init()/qmp_ufs_power_on(): hold the PCS powered
+-	 * down while the tables are written, release SW reset, start only the
+-	 * SerDes (PCS_START is not set by Linux), then release the power-down.
+-	 */
+-	if (hs) {
+-		pcs[0x004 / 4] = 0x1;          /* SW_PWRDN */
+-		pcs[0x008 / 4] = 0x1;          /* SW_RESET asserted */
++		/*
++		 * qmp_ufs_com_init()/qmp_ufs_phy_calibrate() order.  The
++		 * power-down control bit is SW_PWRUP, not SW_PWRDN: Linux
++		 * renamed it in 2024 because the old name read as "set =
++		 * power down" while the code always used it as power up.
++		 * The tables come after power-up, and SW_RESET is only ever
++		 * cleared - asserting it after the tables (the third attempt)
++		 * reset the PCS configuration and ready never came back.
++		 */
++		pcs[0x004 / 4] = pcs[0x004 / 4] | 0x1u;   /* SW_PWRUP */
+ 		__builtin_arm_dsb(0xf);
++		ufs_phy_apply(phy, PHY_SERDES, PHY_TBL(liuqin_phy_serdes));
++		ufs_phy_apply(phy, PHY_TX, PHY_TBL(liuqin_phy_tx));
++		ufs_phy_apply(phy, PHY_RX, PHY_TBL(liuqin_phy_rx));
++		ufs_phy_apply(phy, PHY_TX2, PHY_TBL(liuqin_phy_tx));
++		ufs_phy_apply(phy, PHY_RX2, PHY_TBL(liuqin_phy_rx));
++		ufs_phy_apply(phy, PHY_PCS, PHY_TBL(liuqin_phy_pcs));
++		ufs_phy_apply(phy, PHY_SERDES, PHY_TBL(liuqin_phy_g4_serdes));
++		ufs_phy_apply(phy, PHY_TX, PHY_TBL(liuqin_phy_g4_tx));
++		ufs_phy_apply(phy, PHY_RX, PHY_TBL(liuqin_phy_g4_rx));
++		ufs_phy_apply(phy, PHY_TX2, PHY_TBL(liuqin_phy_g4_tx));
++		ufs_phy_apply(phy, PHY_RX2, PHY_TBL(liuqin_phy_g4_rx));
++		ufs_phy_apply(phy, PHY_PCS, PHY_TBL(liuqin_phy_g4_pcs));
++		pcs[0x008 / 4] = pcs[0x008 / 4] & ~0x1u;  /* SW_RESET off */
++		/* Linux starts SerDes only; PCS_START (bit 1) is not used. */
++		pcs[0x000 / 4] = (pcs[0x000 / 4] & ~0x2u) | 0x1u;
++	} else {
++		/* Minimal power-on: unchanged, this is the path that boots. */
++		pcs[0x008 / 4] = 0;
++		pcs[0x004 / 4] = 0;
++		pcs[0x000 / 4] = pcs[0x000 / 4] | 0x3;
+ 	}
+-	pcs[0x008 / 4] = 0;
+-	pcs[0x004 / 4] = 0;
+-	pcs[0x000 / 4] = pcs[0x000 / 4] | 0x3;
+ 	for (int i = 0; i < 1000 && !(pcs[0x1a8 / 4] & 1); i++) {
+ 		delay(100);
+ 	}
+ 	uint32_t rd = pcs[0x1a8 / 4];
+ 	liuqin_console_force = 1;
+-	printf("LIUQIN UFS: phy post pwrdn 0x%x ready 0x%x\n", pcs[0x004 / 4], rd);
++	printf("LIUQIN UFS: phy post start 0x%x pwrdn 0x%x ready 0x%x (hs %d)\n",
++	    pcs[0x000 / 4], pcs[0x004 / 4], rd, hs);
+ 	liuqin_console_force = 0;
+ 	return (rd & 1) ? 0 : EIO;
+ }
+@@ -564,10 +948,30 @@ ufs_hba_restart(void)
+ 	for (int i = 0; i < 1000 && !(ufs_rd(REG_HCE) & 1); i++) {
+ 		delay(1);
+ 	}
+-	for (int i = 0; i < 1000 && ((ufs_rd(REG_HCS) & 0xf) != 0xf); i++) {
++	/* UIC ready (bit 3) comes up as soon as the UniPro clock runs; DP and
++	 * UTRLRDY (bits 0/1) only after the link is started, so do not wait
++	 * for 0xf here. */
++	for (int i = 0; i < 1000 && !(ufs_rd(REG_HCS) & 0x8); i++) {
+ 		delay(1);
+ 	}
+-	return (ufs_rd(REG_HCE) & 1) ? 0 : EIO;
++	/* A UFS_PHY block reset also clears the host's request-list registers,
++	 * so they have to be re-programmed before any command can go out. */
++	ufs_wr(REG_UTRLRSR, 0);
++	uint64_t list = su.dma_pa + DMA_UTRL;
++	ufs_wr(REG_UTRLBA, (uint32_t)list);
++	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
++	ufs_wr(REG_UTRLRSR, 1);
++	ufs_wr(REG_AHIT, 0);
++	ufs_wr(REG_IS, ufs_rd(REG_IS));
++	int ok = (ufs_rd(REG_HCE) & 1) && (ufs_rd(REG_HCS) & 0x8);
++	{
++		extern int liuqin_console_force;
++		liuqin_console_force = 1;
++		printf("LIUQIN UFS: host restart hce 0x%x hcs 0x%x %s\n",
++		    ufs_rd(REG_HCE), ufs_rd(REG_HCS), ok ? "ok" : "failed");
++		liuqin_console_force = 0;
++	}
++	return ok ? 0 : EIO;
+ }
+ 
+ /* One UIC command (link startup, DME get/set). Returns the result code. */
+@@ -1124,21 +1528,32 @@ liuqin_ufs_init(void)
+ 	 * and only issues SCSI, so the inherited state can be tested without
+ 	 * writing the PHY.
+ 	 */
+-	uint32_t skipinit = 0, softwake = 0;
++	uint32_t skipinit = 0, softwake = 0, pwm = 0;
++	int hs;
+ 	PE_parse_boot_argn("ufsskipinit", &skipinit, sizeof(skipinit));
+ 	PE_parse_boot_argn("ufssoftwake", &softwake, sizeof(softwake));
++	/* HS is the default now that it has booted to SpringBoard on hardware;
++	 * ufsphypwm=1 keeps the old three-write power-on as a fallback. */
++	PE_parse_boot_argn("ufsphypwm", &pwm, sizeof(pwm));
++	hs = !pwm;
+ 
+ 	lck_mtx_lock(&liuqin_ufs_lock);
+ 	error = ufs_take_over_host();
+ 	if (!error && !skipinit) {
+-		/* Do NOT touch HCE: stopping it kills the Qualcomm PHY and the
+-		 * controller never comes back without the vendor init sequence.
+-		 * Try to bring the link back up instead. */
+-		ufs_gcc_clocks_on();
++		/* Do not stop HCE in the PWM path: stopping it kills the
++		 * Qualcomm PHY and the controller never comes back without the
++		 * vendor init sequence.  The HS path does reset the PHY block
++		 * (and therefore the host) and re-enables it explicitly in
++		 * ufs_hba_restart(). */
++		ufs_gcc_clocks_on(hs);
+ 		/* softwake: keep whatever the bootloader programmed (its HS gear
+ 		 * survives a power-down; DME_RESET is what throws it away). */
+ 		if (!softwake) {
+-			ufs_gcc_phy_reset();
++			ufs_gcc_phy_reset(hs);
++		}
++		ufs_hc_clock_init();
++		if (hs) {
++			ufs_dev_ref_clock(1);
+ 		}
+ 		{
+ 			volatile uint32_t *a = (volatile uint32_t *)(su.phy + 0x1000);
+@@ -1148,16 +1563,32 @@ liuqin_ufs_init(void)
+ 			printf("LIUQIN UFS: pcsB %08x %08x %08x %08x\n",
+ 			    b[0x000 / 4], b[0x004 / 4], b[0x008 / 4], b[0x180 / 4]);
+ 		}
+-		int pw = ufs_phy_wake();
++		int pw = ufs_phy_wake(hs);
++		/*
++		 * The block reset also reset the host controller.  Linux powers
++		 * the PHY up first and enables HCE afterwards
++		 * (ufs_qcom_hce_enable_notify, PRE_CHANGE), so the UniPro clock
++		 * is already running when HCS is polled.
++		 */
++		if (hs && !softwake) {
++			ufs_hba_restart();
++		}
+ 		int rr = softwake ? 0 : ufs_uic(0x14, 0, 0, 0, NULL);  /* DME_RESET */
+ 		int re = softwake ? 0 : ufs_uic(0x12, 0, 0, 0, NULL);  /* DME_ENABLE */
+-		int rp = ufs_uic(0x10, 0, 0, 0, NULL);  /* DME_POWERON */
++		if (hs && !softwake && !re) {
++			/* The 300 MHz values are only right when the clock layer
++			 * above programmed unipro to 300 MHz; the PWM path keeps
++			 * ABL's attributes. */
++			ufs_dme_clock_init();
++		}
++		/* No DME_POWERON: Linux only does DME_RESET/DME_ENABLE and this
++		 * controller answers DME_POWERON with "invalid opcode" (1). */
+ 		int rl = ufs_uic(0x16, 0, 0, 0, NULL);  /* DME_LINKSTARTUP */
+ 		{
+ 			extern int liuqin_console_force;
+ 			liuqin_console_force = 1;
+-			printf("LIUQIN UFS: uic reset %d enable %d poweron %d link %d (softwake %u)\n",
+-			    rr, re, rp, rl, softwake);
++			printf("LIUQIN UFS: uic reset %d enable %d link %d (softwake %u)\n",
++			    rr, re, rl, softwake);
+ 			liuqin_console_force = 0;
+ 		}
+ 		if (softwake) {
+@@ -1176,8 +1607,8 @@ liuqin_ufs_init(void)
+ 		if (pq || (pm != 0x11 && pm != 0x10)) {
+ 			/* 0x10 = FAST (HS), 0x11 = SLOW (PWM), both are fine now that
+ 			 * the PHY can do either; anything else is worth a look. */
+-			printf("LIUQIN UFS: unexpected power mode (phy=%d reset=%d en=%d pon=%d link=%d pmode=0x%x query=%d)\n",
+-			    pw, rr, re, rp, rl, pm, pq);
++			printf("LIUQIN UFS: unexpected power mode (phy=%d reset=%d en=%d link=%d pmode=0x%x query=%d)\n",
++			    pw, rr, re, rl, pm, pq);
+ 		}
+ 	}
+ 	if (!error && skipinit) {
+@@ -1199,13 +1630,12 @@ liuqin_ufs_init(void)
+ 		}
+ 		printf("LIUQIN UFS: power mode 0x%x (query %d)\n", v, qe);
+ 		/*
+-		 * Bandwidth: the link comes up in PWM-G1 (a few Mbit/s) because
+-		 * nothing ever asks for a high-speed gear.  PA attribute ids are
++		 * Link state before the device is ready.  PA attribute ids are
+ 		 * from include/ufs/unipro.h: PA_TXGEAR 0x1568, PA_RXGEAR 0x1583,
+-		 * PA_PWRMODE 0x1571 (1 = FAST), PA_MAXRXHSGEAR 0x1587,
+-		 * PA_MAXRXPWMGEAR 0x1586, PA_ACTIVETXDATALANES 0x1560,
+-		 * PA_ACTIVERXDATALANES 0x1580, T_CONNECTIONSTATE 0x4020.
+-		 * Opt-in boot-arg ufsgear=1 until it is proven on hardware.
++		 * PA_PWRMODE 0x1571, PA_MAXRXHSGEAR 0x1587, PA_MAXRXPWMGEAR
++		 * 0x1586, PA_ACTIVETXDATALANES 0x1560, PA_ACTIVERXDATALANES
++		 * 0x1580, T_CONNECTIONSTATE 0x4020.  Read-only: the power mode
++		 * change is refused until fDeviceInit clears.
+ 		 */
+ 		uint32_t gear = 0;
+ 		if (PE_parse_boot_argn("ufsgear", &gear, sizeof(gear)) && gear) {
+@@ -1220,50 +1650,9 @@ liuqin_ufs_init(void)
+ 			int e6 = ufs_uic(0x01, 0x1560u << 16, 0, 0, &txl);
+ 			int e7 = ufs_uic(0x01, 0x1580u << 16, 0, 0, &rxl);
+ 			liuqin_console_force = 1;
+-			printf("LIUQIN UFS: gear before maxhs %u(%d) maxpwm %u(%d) tx %u(%d) rx %u(%d) pm %u(%d) lanes %u(%d)/%u(%d)\n",
++			printf("LIUQIN UFS: link before fDeviceInit maxhs %u(%d) maxpwm %u(%d) tx %u(%d) rx %u(%d) pm 0x%x(%d) lanes %u(%d)/%u(%d)\n",
+ 			    maxhs, e1, maxpwm, e2, tx, e3, rx, e4, pmode, e5, txl, e6, rxl, e7);
+ 			liuqin_console_force = 0;
+-
+-			if (!e1 && maxhs >= 1) {
+-				uint32_t want = maxhs > 4 ? 4 : maxhs;
+-				/*
+-				 * Probe what this controller accepts before trusting it:
+-				 * a write of the *current* power mode is the control (it
+-				 * must succeed for the channel to be usable), then FAST and
+-				 * FASTAUTO.  r_same != 0 means DME_SET itself is refused
+-				 * for this attribute, not that the mode was rejected.
+-				 */
+-				int r_same = ufs_uic(0x02, 0x1571u << 16, 0, pmode, NULL);
+-				int r_fast = ufs_uic(0x02, 0x1571u << 16, 0, 1, NULL);
+-				int r_auto = ufs_uic(0x02, 0x1571u << 16, 0, 4, NULL);
+-				{
+-					extern int liuqin_console_force;
+-					liuqin_console_force = 1;
+-					printf("LIUQIN UFS: pm probe same=%d fast=%d fastauto=%d\n",
+-					    r_same, r_fast, r_auto);
+-					liuqin_console_force = 0;
+-				}
+-				int s1 = ufs_uic(0x02, 0x1568u << 16, 0, want, NULL);
+-				int s2 = ufs_uic(0x02, 0x1583u << 16, 0, want, NULL);
+-				int s3 = (r_fast == 0 || r_auto == 0) ? 0 : r_fast;
+-				uint32_t cs = 0xff;
+-				for (int i = 0; i < 100; i++) {
+-					if (!ufs_uic(0x01, 0x4020u << 16, 0, 0, &cs) && cs == 1) {
+-						break;
+-					}
+-					delay(1000);
+-				}
+-				uint32_t ntx = 0, nrx = 0, npm = 0, ntxl = 0, nrxl = 0;
+-				int n1 = ufs_uic(0x01, 0x1568u << 16, 0, 0, &ntx);
+-				int n2 = ufs_uic(0x01, 0x1583u << 16, 0, 0, &nrx);
+-				int n3 = ufs_uic(0x01, 0x1571u << 16, 0, 0, &npm);
+-				int n4 = ufs_uic(0x01, 0x1560u << 16, 0, 0, &ntxl);
+-				int n5 = ufs_uic(0x01, 0x1580u << 16, 0, 0, &nrxl);
+-				liuqin_console_force = 1;
+-				printf("LIUQIN UFS: gear set %u (%d/%d/%d), conn 0x%x, after tx %u(%d) rx %u(%d) pm %u(%d) lanes %u(%d)/%u(%d)\n",
+-				    want, s1, s2, s3, cs, ntx, n1, nrx, n2, npm, n3, ntxl, n4, nrxl, n5);
+-				liuqin_console_force = 0;
+-			}
+ 		}
+ 		/*
+ 		 * The link is started but no gear is ever negotiated, so it runs at
+@@ -1333,45 +1722,17 @@ liuqin_ufs_init(void)
+ 			printf("LIUQIN UFS: fDeviceInit flag 0x%x\n", flag);
+ 		}
+ 		/*
+-		 * The power-mode change has to come AFTER the device finishes its own
+-		 * initialization (fDeviceInit cleared); before that the peer refuses
+-		 * every FAST/FASTAUTO write with UIC result 10 while accepting a
+-		 * write of the current value.  PA_TXHSADAPTTYPE (0x15D4) = 1
+-		 * (PA_INITIAL_ADAPT) is part of the standard gear-change sequence.
++		 * The power-mode change has to come AFTER the device finishes its
++		 * own initialization (fDeviceInit cleared); before that the peer
++		 * refuses it.  ufs_set_hs_gear() does the full
++		 * ufshcd_change_power_mode() sequence, including the FAST/FAST
++		 * value 0x11 that the earlier probe got wrong, and is also what
++		 * ufsphyhs=1 uses.
+ 		 */
+ 		uint32_t gear2 = 0;
+-		if (PE_parse_boot_argn("ufsgear", &gear2, sizeof(gear2)) && gear2) {
+-			extern int liuqin_console_force;
+-			uint32_t maxhs2 = 0, tx2 = 0, rx2 = 0, pm2 = 0, cs = 0xff;
+-			int g1 = ufs_uic(0x01, 0x1587u << 16, 0, 0, &maxhs2);
+-			int g2 = ufs_uic(0x01, 0x1568u << 16, 0, 0, &tx2);
+-			int g3 = ufs_uic(0x01, 0x1583u << 16, 0, 0, &rx2);
+-			int g4 = ufs_uic(0x01, 0x1571u << 16, 0, 0, &pm2);
+-			uint32_t want2 = (maxhs2 >= 1 && maxhs2 <= 4) ? maxhs2 : 4;
+-			int s1 = ufs_uic(0x02, 0x1568u << 16, 0, want2, NULL);
+-			int s2 = ufs_uic(0x02, 0x1583u << 16, 0, want2, NULL);
+-			int s3 = ufs_uic(0x02, 0x1571u << 16, 0, 1, NULL);
+-			int s4 = ufs_uic(0x02, 0x15D4u << 16, 0, 1, NULL);
+-			for (int i = 0; i < 100; i++) {
+-				if (!ufs_uic(0x01, 0x4020u << 16, 0, 0, &cs) && cs == 1) {
+-					break;
+-				}
+-				delay(1000);
+-			}
+-			uint32_t ntx = 0, nrx = 0, npm = 0, ntxl = 0, nrxl = 0;
+-			int n1 = ufs_uic(0x01, 0x1568u << 16, 0, 0, &ntx);
+-			int n2 = ufs_uic(0x01, 0x1583u << 16, 0, 0, &nrx);
+-			int n3 = ufs_uic(0x01, 0x1571u << 16, 0, 0, &npm);
+-			int n4 = ufs_uic(0x01, 0x1560u << 16, 0, 0, &ntxl);
+-			int n5 = ufs_uic(0x01, 0x1580u << 16, 0, 0, &nrxl);
+-			liuqin_console_force = 1;
+-			printf("LIUQIN UFS: gear2 pre maxhs %u(%d) tx %u(%d) rx %u(%d) pm %u(%d)\n",
+-			    maxhs2, g1, tx2, g2, rx2, g3, pm2, g4);
+-			printf("LIUQIN UFS: gear2 set %u tx=%d rx=%d pm=%d adapt=%d conn 0x%x\n",
+-			    want2, s1, s2, s3, s4, cs);
+-			printf("LIUQIN UFS: gear2 after tx %u(%d) rx %u(%d) pm %u(%d) lanes %u(%d)/%u(%d)\n",
+-			    ntx, n1, nrx, n2, npm, n3, ntxl, n4, nrxl, n5);
+-			liuqin_console_force = 0;
++		int do_gear = (PE_parse_boot_argn("ufsgear", &gear2, sizeof(gear2)) && gear2) || hs;
++		if (do_gear) {
++			ufs_set_hs_gear(hs ? "hs" : "probe");
+ 		}
+ 	}
+ 	if (!error) {

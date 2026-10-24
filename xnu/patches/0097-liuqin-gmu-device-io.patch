@@ -1,0 +1,16 @@
+diff --git a/iokit/NativeAdreno/NativeAdrenoService.cpp b/iokit/NativeAdreno/NativeAdrenoService.cpp
+index 065ddc8..905c48e 100644
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -461,6 +461,11 @@ bool NativeAdrenoGpuService::start(IOService *provider)
+                                     else if(NativeAdrenoGmuPlatform::services(&time,&services))
+                                         IOLog("NativeAdreno: GMU services refused\n");
+                                     else {
++                                        /* ShengGmuColdStart() validates d->io and
++                                         * d->services before touching the GMU; they
++                                         * are built here, not by the framework. */
++                                        gmu_device_.io=gmu_io_;
++                                        gmu_device_.services=services;
+                                         ShengGmuStartupLimits limits{4,100,1000,10000};
+                                         const ShengGmuStatus started=ShengGmuColdStart(
+                                             &gmu_device_,&config,&startup,&limits,&gmu_startup_);

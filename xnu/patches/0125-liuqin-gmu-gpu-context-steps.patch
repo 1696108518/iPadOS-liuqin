@@ -1,0 +1,88 @@
+--- a/iokit/NativeAdreno/NativeAdrenoGpuContext.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoGpuContext.cpp
+@@ -39,19 +39,31 @@
+         /* Not fatal: without it each pooled BO changes its pages' attribute itself, as a scattered one does. */
+         if(native_adreno_wc_enabled && NativeAdrenoMemory::poolBytes())native_adreno_pool_wc=(uint32_t)NativeAdrenoMemory::writeCombinePool()|1u<<31;
+     }
++    IOLog("NativeAdreno: GPU ctx enter tables %u KiB aperture 0x%x oas %u bank %u asid %u slots %u/%u\n",
++        (unsigned)(TablePages*4),(unsigned)GpuApertureBytes,report->output_bits,bank,asid,slots[0],slots[1]);
+     if(!status)status=tables_.allocate(TablePages*0x1000,report->output_bits,true,TablePages*0x1000);
++    IOLog("NativeAdreno: GPU ctx tables status 0x%x bytes %u map %p\n",status,
++        (unsigned)tables_.bytes(),tables_.mapping());
+     for(unsigned i=0;!status && i<GpuBufferCount;++i)
+         status=buffers_[i].allocate(kBytes[i],report->output_bits,true,kBytes[i]);
++    IOLog("NativeAdreno: GPU ctx buffers status 0x%x sqe %u ring %u maps %p %p\n",status,
++        (unsigned)buffers_[0].bytes(),(unsigned)buffers_[1].bytes(),
++        buffers_[0].mapping(),buffers_[1].mapping());
+     if(!status) {
+         step(Prepare);
++        IOLog("NativeAdreno: GPU ctx prepare start iova 0 leaves %u\n",
++            (unsigned)NativeAdrenoSmmuContext::MaxLeaves);
+         status=smmu_.prepare(&tables_,0,0,GpuApertureBytes,NativeAdrenoSmmuContext::MaxLeaves,
+             bank,asid,1000,report->output_bits);
++        IOLog("NativeAdreno: GPU ctx prepare status 0x%x\n",status);
+         if(!status)smmu_.setAliasScratch(alias_scratch_,sizeof alias_scratch_/sizeof *alias_scratch_);
+     }
+     if(!status) {
+         step(Program);
+         status=smmu_.program(io);
+         const ArmSmmu4KProgramResult *p=smmu_.programResult();
++        IOLog("NativeAdreno: GPU ctx program status 0x%x phase %u writes %u\n",
++            status,p->phase,p->writes);
+         report->program_phase=p->phase;report->program_writes=p->writes;
+         report->program_readback_valid=p->readback_valid;report->program_enabled=p->enabled;
+         report->id1=p->id1;report->program_status=smmu_.programStatus();
+@@ -62,6 +74,7 @@
+         const ArmSmmu4KStream routes[2]={{slots[0],sids[0]},{slots[1],sids[1]}};
+         status=smmu_.attach(routes,2);
+         const ArmSmmu4KStreamResult *s=smmu_.streamResult();
++        IOLog("NativeAdreno: GPU ctx attach status 0x%x verified %u\n",status,s->streams_verified);
+         report->route_status=smmu_.attachStatus();
+         report->route_phase=s->phase;report->route_writes=s->writes;report->routes_verified=s->streams_verified;
+     }
+@@ -71,12 +84,17 @@
+         /* 65536 spans: 256 MiB of BOs even when every page is its own span. The Metal runtime pools its memory in 64 MiB blocks,
+          * which XNU rarely finds physically contiguous; one scattered block is 16384 spans (int-070 ran out at 16384). */
+         status=vm_.attach(io,smmu_.configHandle(),smmu_.streamsHandle(),&lower,nullptr,131072,262144);
++        IOLog("NativeAdreno: GPU ctx vm attach status 0x%x spans %u\n",status,(unsigned)vm_.spanCount());
+     }
+     if(!status) {
+         step(Map);
+         /* adreno_fw_create_bo maps the SQE MSM_BO_GPU_READONLY without NOEXEC; every other kernel BO read/write. */
+-        for(unsigned i=0;!status && i<GpuBufferCount;++i)
++        for(unsigned i=0;!status && i<GpuBufferCount;++i) {
++            IOLog("NativeAdreno: GPU ctx map %u iova 0x%llx bytes %u\n",i,
++                (unsigned long long)kIovas[i],(unsigned)kBytes[i]);
+             status=vm_.map(&buffers_[i],0,kIovas[i],i?3u:5u,0,2,&handles_[i]);
++            IOLog("NativeAdreno: GPU ctx map %u status 0x%x spans %u\n",i,status,(unsigned)vm_.spanCount());
++        }
+         report->spans=uint32_t(vm_.spanCount());
+     }
+     if(!status) {
+@@ -96,7 +114,9 @@
+     if(!report || board_gpu_context || !smmu || !bytes || sid0>0xffff || sid1>0xffff)return kIOReturnBadArgument;
+     mmio={reinterpret_cast<volatile unsigned char *>(smmu),bytes};
+     if(ArmSmmu4KBindMmio(&mmio,&io)!=ArmSmmu4KSuccess)return kIOReturnBadArgument;
++    IOLog("NativeAdreno: GPU ctx allocate object\n");
+     board_gpu_context=new NativeAdrenoGpuContext;
++    IOLog("NativeAdreno: GPU ctx object %p\n",board_gpu_context);
+     if(!board_gpu_context)return kIOReturnNoMemory;
+     const unsigned slots[2]={slot0,slot1};
+     const uint16_t sids[2]={uint16_t(sid0),uint16_t(sid1)};
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -619,8 +619,13 @@
+                                             IOLog("NativeAdreno: GPU context: no free stream slots\n");
+                                         } else {
+                                             NativeAdrenoGmuContextReport gpu_report{};
++                                            IOLog("NativeAdreno: GPU ctx call bank %u asid %u slots %u/%u\n",
++                                                gpubank,gpuasid,gslot0,gslot1);
+                                             const IOReturn gpu_status=NativeAdrenoGpuContextBringup(smmu_base,smmu_bytes,
+-                                                gpubank,gpuasid,gslot0,0,gslot1,1,nullptr,&gpu_report);
++                                                gpubank,gpuasid,gslot0,0,gslot1,1,
++                                                [](uint32_t step) {
++                                                    IOLog("NativeAdreno: GPU ctx step %u\n",step);
++                                                },&gpu_report);
+                                             IOLog("NativeAdreno: GPU context status 0x%x step %u (bank %u asid %u slots %u/%u sids 0/1)\n",
+                                                 gpu_status,gpu_report.step,gpubank,gpuasid,gslot0,gslot1);
+                                             if(!gpu_status) {

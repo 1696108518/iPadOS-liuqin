@@ -1,0 +1,21 @@
+diff --git a/bsd/dev/arm/kern_machdep.c b/bsd/dev/arm/kern_machdep.c
+index 336b1cc..89746ed 100644
+--- a/bsd/dev/arm/kern_machdep.c
++++ b/bsd/dev/arm/kern_machdep.c
+@@ -82,6 +82,16 @@ grade_binary(cpu_type_t exectype, cpu_subtype_t execsubtype, cpu_subtype_t execf
+ 	switch (exectype) {
+ #if __arm64__
+ 	case CPU_TYPE_ARM64:
++		/*
++		 * LIUQIN: this kernel reports CPU_SUBTYPE_ARM64_ALL, which the
++		 * host switch below does not handle, and the shipped iPadOS 16
++		 * userland is arm64e.  Accept all three arm64 subtypes.
++		 */
++		if (execsubtype == CPU_SUBTYPE_ARM64E ||
++		    execsubtype == CPU_SUBTYPE_ARM64_V8 ||
++		    execsubtype == CPU_SUBTYPE_ARM64_ALL) {
++			return (execsubtype == CPU_SUBTYPE_ARM64E) ? 9 : 10;
++		}
+ 		switch (hostsubtype) {
+ 		case CPU_SUBTYPE_ARM64_V8:
+ 			switch (execsubtype) {

@@ -1,0 +1,38 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp	2026-10-24 10:04:41
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp	2026-10-24 10:04:41
+@@ -532,13 +532,18 @@
+                                             (unsigned long long)gmu_startup_.protocol.elapsed_us);
+                                             if(started!=ShengGmuSuccess) {
+                                                 /* Drop any stale CPU lines before reading DRAM. */
+-                                                NativeAdrenoMaintainOwnedPages((void *)(uintptr_t)config.hfi.cpu,0x4000,NativeAdrenoCleanInvalidate);
+-                                                IOLog("NativeAdreno: HFI hdr %08x %08x %08x %08x %08x %08x q0 %08x %08x %08x idx %08x %08x %08x q1 %08x %08x %08x\n",
++                                                const IOReturn inv=NativeAdrenoMaintainOwnedPages((void *)(uintptr_t)config.hfi.cpu,0x4000,NativeAdrenoCleanInvalidate);
++                                                IOLog("NativeAdreno: HFI inv=0x%x hdr %08x %08x %08x %08x %08x %08x\n",inv,
+                                                     config.hfi.cpu[0],config.hfi.cpu[1],config.hfi.cpu[2],config.hfi.cpu[3],
+-                                                    config.hfi.cpu[4],config.hfi.cpu[5],
+-                                                    config.hfi.cpu[6],config.hfi.cpu[7],config.hfi.cpu[8],
+-                                                    config.hfi.cpu[15],config.hfi.cpu[16],config.hfi.cpu[17],
+-                                                    config.hfi.cpu[27],config.hfi.cpu[28],config.hfi.cpu[29]);
++                                                    config.hfi.cpu[4],config.hfi.cpu[5]);
++                                                IOLog("NativeAdreno: HFI q0 %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
++                                                    config.hfi.cpu[6],config.hfi.cpu[7],config.hfi.cpu[8],config.hfi.cpu[9],
++                                                    config.hfi.cpu[10],config.hfi.cpu[11],config.hfi.cpu[12],config.hfi.cpu[13],
++                                                    config.hfi.cpu[14],config.hfi.cpu[15],config.hfi.cpu[16],config.hfi.cpu[17]);
++                                                IOLog("NativeAdreno: HFI q1 %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
++                                                    config.hfi.cpu[18],config.hfi.cpu[19],config.hfi.cpu[20],config.hfi.cpu[21],
++                                                    config.hfi.cpu[22],config.hfi.cpu[23],config.hfi.cpu[24],config.hfi.cpu[25],
++                                                    config.hfi.cpu[26],config.hfi.cpu[27],config.hfi.cpu[28],config.hfi.cpu[29]);
+                                                 auto core=[&](uint32_t reg)->uint32_t {
+                                                     uint32_t v=0xdeadbeef;
+                                                     return gmu_io_.read32(gmu_io_.cookie,0,size_t(reg)*4u,&v)?0xdeadbeefu:v;
+--- a/iokit/NativeAdreno/NativeAdrenoGmuPlatform.cpp	2026-10-24 10:04:41
++++ b/iokit/NativeAdreno/NativeAdrenoGmuPlatform.cpp	2026-10-24 10:04:41
+@@ -52,7 +52,7 @@
+ }
+ static int clean(void *,void *mapping,size_t bytes)
+ {
+-    return NativeAdrenoMaintainOwnedPages(mapping,bytes,NativeAdrenoClean)?1:0;
++    return NativeAdrenoMaintainOwnedPages(mapping,bytes,NativeAdrenoCleanInvalidate)?1:0;
+ }
+ static int invalidate(void *,void *mapping,size_t bytes)
+ {

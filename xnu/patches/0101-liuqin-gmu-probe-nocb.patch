@@ -1,0 +1,19 @@
+diff --git a/iokit/NativeAdreno/NativeAdrenoService.cpp b/iokit/NativeAdreno/NativeAdrenoService.cpp
+index 3f152f0..aa8fd25 100644
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -467,9 +467,11 @@ bool NativeAdrenoGpuService::start(IOService *provider)
+                                             rd(0,REG_GMU_GMU2HOST_INTR_INFO));
+                                         if(smmu_bytes>0xc04) {
+                                             volatile uint32_t *m=reinterpret_cast<volatile uint32_t *>(smmu_base);
+-                                            IOLog("NativeAdreno: smmu scr0 0x%x smr0 0x%x s2cr0 0x%x smr1 0x%x s2cr1 0x%x cb1_sctlr 0x%x\n",
+-                                                m[0x000/4],m[0x800/4],m[0xc00/4],m[0x804/4],m[0xc04/4],
+-                                                m[0x8000/4+0x00/4]);
++                                            /* No context-bank reads here: the qsmmu
++                                             * window only emulates the global
++                                             * registers, 0x8000 traps. */
++                                            IOLog("NativeAdreno: smmu scr0 0x%x smr0 0x%x s2cr0 0x%x smr1 0x%x s2cr1 0x%x\n",
++                                                m[0x000/4],m[0x800/4],m[0xc00/4],m[0x804/4],m[0xc04/4]);
+                                         }
+                                     }
+                                     else if(ShengGmuBuildStartup(&inputs,&startup)!=AdrenoHfiStartupSuccess) {

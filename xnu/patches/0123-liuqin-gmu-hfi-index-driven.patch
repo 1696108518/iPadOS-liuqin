@@ -1,0 +1,134 @@
+--- a/iokit/NativeAdreno/ShengGmu.c
++++ b/iokit/NativeAdreno/ShengGmu.c
+@@ -309,7 +309,6 @@
+ #define SHENG_HFI_QHDR_WORDS 12u
+ #define SHENG_HFI_PACKET_WORDS 19u     /* an ACK: header + return + error + 16 */
+ #define SHENG_HFI_COMMAND_WORDS 254u    /* header count is 8 bits; the ring is 1024 words */
+-#define SHENG_HFI_RSP_SLOTS 4u
+ enum {ShengHfiCommandQueue=0,ShengHfiResponseQueue=1};
+ /* The wire sequence is one message per value, as the ladder numbers them. */
+ static uint32_t sheng_hfi_sequence;
+@@ -351,9 +350,18 @@
+     }
+     return ShengGmuTimeout;
+ }
+-/* One command and its answer.  `id`/`payload` are the encoded startup message;
+- * `output` receives the message body of the ACK (header, return and error code
+- * excluded), exactly as the kit's transport delivers it. */
++/* One command and its answer, driven by the queue indices the firmware keeps.
++ * This GMU does maintain them (q0 read follows the commands it consumed, q1
++ * write follows the ACKs it published), so the ladder's transport applies
++ * unchanged: publish at the command write index, wait for GMU2HOST_INTR, read
++ * the packet at the response read index and advance it.  Nothing is scanned
++ * and no index is reset behind the firmware's back.
++ *
++ * `id`/`payload` are the encoded startup message.  `output` receives the body
++ * of the matching ACK (header, return and error code excluded), exactly as the
++ * kit's transport delivers it.  Replies to another sequence number and F2H
++ * error messages are consumed and skipped, as a6xx_hfi_wait_for_ack does; only
++ * a malformed queue aborts the exchange before the answer is found. */
+ static ShengGmuStatus hfi_exchange(ShengGmuDevice *d,const ShengGmuConfig *c,
+     const ShengGmuStartupLimits *limits,unsigned id,const uint32_t *payload,size_t words,
+     uint32_t *output,size_t capacity,size_t *returned,uint32_t *wire,
+@@ -370,15 +378,18 @@
+     if(!seq)seq=sheng_hfi_sequence=1;
+     const uint32_t count=(uint32_t)words+1,padded=(count+3)&~UINT32_C(3);
+     const uint32_t header=(seq<<20)|(count<<8)|(uint32_t)id;
+-    for(unsigned i=0;i<SHENG_HFI_PACKET_WORDS*4;++i) {cmd[i]=0;rsp[i]=0;}
+-    cmd[0]=header;
+-    for(unsigned i=0;i<words;++i)cmd[1+i]=payload[i];
+-    for(unsigned i=count;i<padded;++i)cmd[i]=UINT32_C(0xfafafafa);
+-    /* An empty ring whose first packet is this command: read 0, write padded. */
+-    cq[10]=0;cq[11]=padded;
+-    rq[10]=0;
+-    if(hfi_clean(d,cmd,SHENG_HFI_QUEUE_BYTES) || hfi_clean(d,rsp,SHENG_HFI_QUEUE_BYTES) ||
+-        hfi_clean(d,c->hfi.cpu,SHENG_HFI_QUEUE_BYTES))return ShengGmuIoError;
++    const uint32_t write=cq[11]&(SHENG_HFI_QUEUE_WORDS-1);
++    const uint32_t cqread=cq[10]&(SHENG_HFI_QUEUE_WORDS-1);
++    if(((cqread-write-1)&(SHENG_HFI_QUEUE_WORDS-1))<padded) {
++        p->transport_status=AdrenoHfiNoSpace;return ShengGmuProtocolError;
++    }
++    for(unsigned i=0;i<count;++i)
++        cmd[(write+i)&(SHENG_HFI_QUEUE_WORDS-1)]=i?payload[i-1]:header;
++    for(unsigned i=count;i<padded;++i)
++        cmd[(write+i)&(SHENG_HFI_QUEUE_WORDS-1)]=UINT32_C(0xfafafafa);
++    if(hfi_clean(d,cmd,SHENG_HFI_QUEUE_BYTES))return ShengGmuIoError;
++    cq[11]=(write+padded)&(SHENG_HFI_QUEUE_WORDS-1);
++    if(hfi_clean(d,c->hfi.cpu,SHENG_HFI_QUEUE_BYTES))return ShengGmuIoError;
+     if(core_write(d,REG_GMU_GMU2HOST_INTR_CLR,1,r) || d->io.barrier(d->io.cookie) ||
+         core_write(d,REG_GMU_HOST2GMU_INTR_SET,1,r) || d->io.barrier(d->io.cookie))
+         return ShengGmuIoError;
+@@ -391,25 +402,35 @@
+     if(core_write(d,REG_GMU_GMU2HOST_INTR_CLR,1,r) || d->io.barrier(d->io.cookie) ||
+         hfi_invalidate(d,c->hfi.cpu,SHENG_HFI_QUEUE_BYTES) ||
+         hfi_invalidate(d,rsp,SHENG_HFI_QUEUE_BYTES))return ShengGmuIoError;
+-    /* Only a complete packet naming this command's id and sequence is an
+-     * answer.  Both windows were zeroed before the doorbell, so a match can
+-     * only come from this exchange, never from an earlier one. */
+-    for(unsigned slot=0;slot<SHENG_HFI_RSP_SLOTS;++slot) {
+-        const unsigned at=slot*4;
+-        const uint32_t packet_header=rsp[at];
++    uint32_t rr=rq[10]&(SHENG_HFI_QUEUE_WORDS-1),rw=rq[11]&(SHENG_HFI_QUEUE_WORDS-1);
++    /* A ring holds at most WORDS/4 packets; each pass consumes one. */
++    for(unsigned pass=0;pass<SHENG_HFI_QUEUE_WORDS/4;++pass) {
++        if(rr==rw) {p->transport_status=AdrenoHfiEmpty;return ShengGmuProtocolError;}
++        uint32_t packet[SHENG_HFI_PACKET_WORDS];
++        const uint32_t packet_header=rsp[rr];
+         const uint32_t packet_count=(packet_header>>8)&0xffu;
+-        if(packet_count<3 || packet_count>SHENG_HFI_PACKET_WORDS)continue;
+-        if((packet_header&0xffu)!=(uint32_t)id)continue;
+-        if((rsp[at+1]>>20)!=seq)continue;
+-        if(rsp[at+2]) {
+-            p->firmware_error=rsp[at+2];p->transport_status=AdrenoHfiFirmwareError;
++        if(!packet_count || packet_count>SHENG_HFI_PACKET_WORDS) {
++            p->transport_status=AdrenoHfiCorrupt;return ShengGmuProtocolError;
++        }
++        const uint32_t packet_padded=(packet_count+3)&~UINT32_C(3);
++        if(((rw-rr)&(SHENG_HFI_QUEUE_WORDS-1))<packet_padded) {
++            p->transport_status=AdrenoHfiCorrupt;return ShengGmuProtocolError;
++        }
++        for(unsigned i=0;i<packet_count;++i)
++            packet[i]=rsp[(rr+i)&(SHENG_HFI_QUEUE_WORDS-1)];
++        rr=(rr+packet_padded)&(SHENG_HFI_QUEUE_WORDS-1);
++        rq[10]=rr;
++        if(hfi_clean(d,c->hfi.cpu,SHENG_HFI_QUEUE_BYTES))return ShengGmuIoError;
++        if((packet_header&0xffu)==100) {p->firmware_error=packet[1];continue;}
++        if(packet_count<3 || (packet[1]>>20)!=seq)continue;
++        if(packet[2]) {
++            p->firmware_error=packet[2];p->transport_status=AdrenoHfiFirmwareError;
+             return ShengGmuProtocolError;
+         }
+         const size_t back=(size_t)packet_count-3;
+         if(back>capacity) {p->transport_status=AdrenoHfiInvalid;return ShengGmuProtocolError;}
+-        for(unsigned i=0;i<back;++i)output[i]=rsp[at+3+i];
+-        *returned=back;p->transport_status=AdrenoHfiSuccess;
+-        return ShengGmuSuccess;
++        for(unsigned i=0;i<back;++i)output[i]=packet[3+i];
++        *returned=back;p->transport_status=AdrenoHfiSuccess;return ShengGmuSuccess;
+     }
+     p->transport_status=AdrenoHfiUnexpected;return ShengGmuProtocolError;
+ }
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -584,13 +584,18 @@
+                                             inverr,config.hfi.cpu[0],config.hfi.cpu[1],
+                                             config.hfi.cpu[2],config.hfi.cpu[3],
+                                             config.hfi.cpu[4],config.hfi.cpu[5],intr);
+-                                        IOLog("NativeAdreno: HFI intr q0 rd/wr %08x %08x q1 rd/wr %08x %08x rsp %08x %08x %08x %08x cmd %08x %08x %08x %08x\n",
++                                        IOLog("NativeAdreno: HFI intr q0 rd/wr %08x %08x q1 rd/wr %08x %08x cmd %08x %08x %08x %08x\n",
+                                             config.hfi.cpu[16],config.hfi.cpu[17],
+                                             config.hfi.cpu[28],config.hfi.cpu[29],
+-                                            config.hfi.cpu[2048],config.hfi.cpu[2049],
+-                                            config.hfi.cpu[2050],config.hfi.cpu[2051],
+                                             config.hfi.cpu[1024],config.hfi.cpu[1025],
+                                             config.hfi.cpu[1026],config.hfi.cpu[1027]);
++                                        IOLog("NativeAdreno: HFI intr rsp %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
++                                            config.hfi.cpu[2048],config.hfi.cpu[2049],
++                                            config.hfi.cpu[2050],config.hfi.cpu[2051],
++                                            config.hfi.cpu[2052],config.hfi.cpu[2053],
++                                            config.hfi.cpu[2054],config.hfi.cpu[2055],
++                                            config.hfi.cpu[2056],config.hfi.cpu[2057],
++                                            config.hfi.cpu[2058],config.hfi.cpu[2059]);
+                                     }
+                                     if(started==ShengGmuSuccess) {
+                                         /* GPU bank/asid 2, streams 0 and 1 (the ladder's

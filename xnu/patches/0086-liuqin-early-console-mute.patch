@@ -1,0 +1,19 @@
+--- a/iokit/Kernel/arm/LiuqinFramebuffer.cpp
++++ b/iokit/Kernel/arm/LiuqinFramebuffer.cpp
+@@ -155,6 +155,16 @@
+ 
+ 	if (!IOService::start(provider)) {
+ 		return false;
++	}
++	/*
++	 * LIUQIN: liuqinmute=1 stops the text console from drawing to the
++	 * framebuffer from early boot (the persistent log still gets every
++	 * byte, and panics still draw).  Userspace can print thousands of
++	 * lines before the GUI presents and drawing them costs minutes.
++	 */
++	int mute = 0;
++	if (PE_parse_boot_argn("liuqinmute", &mute, sizeof(mute)) && mute != 0) {
++		liuqin_console_muted = 1;
+ 	}
+ 	PE_current_console(&video);
+ 	fPhys = video.v_baseAddr;

@@ -1,0 +1,64 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -280,24 +280,32 @@
+     IOLog("NativeAdreno: CP registers written, starting the SQE\n");
+     if(gpu_write32(&window,0x0808,1))return kIOReturnIOError; /* CP_SQE_CNTL */
+     IOSleep(20);
+-    uint32_t rbbm=~0u,fault=~0u,rptr=~0u;
++    uint32_t rbbm=~0u,fault=~0u,rptr=~0u,sqe_lo=~0u,sqe_hi=~0u;
+     (void)gpu_read32(&window,0x0210,&rbbm);
+     (void)gpu_read32(&window,0x0821,&fault);
+     (void)gpu_read32(&window,0x0806,&rptr);
+-    IOLog("NativeAdreno: CP SQE alive rbbm=0x%x hw_fault=0x%x rptr=%u\n",rbbm,fault,rptr);
++    (void)gpu_read32(&window,0x0830,&sqe_lo);
++    (void)gpu_read32(&window,0x0831,&sqe_hi);
++    IOLog("NativeAdreno: CP SQE alive rbbm=0x%x hw_fault=0x%x rptr=%u sqe=0x%x%08x (want 0x%llx)\n",
++        rbbm,fault,rptr,sqe_hi,sqe_lo,(unsigned long long)GpuSqeIova);
+     size_t list_bytes=0;
+-    if(NativeAdrenoPwrupList::buildA740(gpu_read32,&window,
+-        static_cast<uint8_t *>(pwrup_cpu),0x1000,&list_bytes)) {
+-        IOLog("NativeAdreno: CP power-up list refused\n");
+-        return kIOReturnIOError;
+-    }
+-    IOReturn status=maintainPhysical(b[3].physical,0x1000,NativeAdrenoClean)?
++    const IOReturn list_status=NativeAdrenoPwrupList::buildA740(gpu_read32,&window,
++        static_cast<uint8_t *>(pwrup_cpu),0x1000,&list_bytes);
++    IOLog("NativeAdreno: CP power-up list status=0x%x bytes=%u\n",list_status,(unsigned)list_bytes);
++    if(list_status)return kIOReturnIOError;
++    const IOReturn publish_status=maintainPhysical(b[3].physical,0x1000,NativeAdrenoClean)?
+         kIOReturnIOError:kIOReturnSuccess;
++    IOLog("NativeAdreno: CP power-up list published 0x%x at 0x%llx\n",publish_status,
++        (unsigned long long)b[3].physical);
++    IOReturn status=publish_status;
+     NativeAdrenoCpInit cp;
+     NativeAdrenoCpInitConfig config{GpuSqeIova,GpuPwrupIova,1};
+     uint32_t start_fence=0;
+-    if(!status)status=cp.run(&io,&ring_,&config,&start_fence);
+     if(!status) {
++        status=cp.run(&io,&ring_,&config,&start_fence);
++        IOLog("NativeAdreno: CP ME_INIT submit 0x%x fence=%u\n",status,start_fence);
++    }
++    if(!status) {
+         uint32_t observed=0;
+         NativeAdrenoRingClock clock{nullptr,ring_now,nullptr};
+         const NativeAdrenoRingFence fence=ring_.wait(start_fence,&clock,2000,&observed);
+@@ -832,8 +840,9 @@
+                                         NativeAdrenoGpuBuffer b[5]{};
+                                         void *ring_cpu=NativeAdrenoGpuContextBufferCpu(1);
+                                         void *fence_cpu=NativeAdrenoGpuContextBufferCpu(2);
++                                        void *pwrup_cpu=NativeAdrenoGpuContextBufferCpu(3);
+                                         IOReturn ring_status=NativeAdrenoGpuContextBuffers(b);
+-                                        if(!ring_status && (!ring_cpu || !fence_cpu))ring_status=kIOReturnNotReady;
++                                        if(!ring_status && (!ring_cpu || !fence_cpu || !pwrup_cpu))ring_status=kIOReturnNotReady;
+                                         if(ring_status) {
+                                             IOLog("NativeAdreno: CP ring: buffers unavailable 0x%x\n",ring_status);
+                                         } else {
+@@ -857,7 +866,7 @@
+                                                 IOLog("NativeAdreno: CP ring attached ring 0x%llx/0x%x fence 0x%llx/0x%x\n",
+                                                     (unsigned long long)GpuRingIova,static_cast<unsigned>(b[1].bytes),
+                                                     (unsigned long long)GpuMemptrsIova,static_cast<unsigned>(b[2].bytes));
+-                                                ring_status=startCp(gpu_window,ring_io,b,fence_cpu);
++                                                ring_status=startCp(gpu_window,ring_io,b,pwrup_cpu);
+                                             }
+                                         }
+                                     }

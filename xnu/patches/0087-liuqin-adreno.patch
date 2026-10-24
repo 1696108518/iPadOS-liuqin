@@ -1,0 +1,2037 @@
+diff --git a/bsd/dev/liuqin_adreno.c b/bsd/dev/liuqin_adreno.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/liuqin_adreno.c
+@@ -0,0 +1,2021 @@
++/*
++ * LIUQIN (SM8450) Adreno 730, woken step by step (Linux msm a6xx/a7xx as the
++ * reference): an access the hypervisor does not allow can end
++ * the run without a word, so each step says what it is about to touch
++ * before touching it, reads come before writes, and a step that does not
++ * find what it needs ends the ladder.
++ *
++ * Boot arg liuqinadreno=N performs steps 1..N (default 0: nothing).
++ *   1  reads   GCC branches that feed the GPU (CFG AHB, MEMNOC GFX, SNOC DVM, DDRSS GPU AXI)
++ *   2  reads   GPUCC: CX/GX GDSC state and the CX-side clocks, only when CFG AHB runs
++ *   3  reads   GMU CX registers, only if CX and the GMU clock are already on
++ *   4  writes  the CX GDSC on (clears SW_COLLAPSE, waits for PWR_ON)
++ *   5  writes  GCC: GPLL0 GPU taps voted, MEMNOC/SNOC DVM/DDRSS GPU AXI on;
++ *              GPUCC: GMU clock 200 MHz and hub 150 MHz from the GPLL0 300 MHz tap,
++ *              then the CX clocks (AHB, CXO, hub AON, hub CX int, CX GMU, SMMU vote)
++ *   6  reads   the GMU's first words: the always-on counter must count
++ *   7  reads   the GMU's RPMh channel (RSCC, gmu "rscc" 0x3d50000): status, sequencer, TCS0
++ *   8  reads   the adreno SMMU (0x3da0000, MMU-500): ID registers, stream match table, context kinds
++ *   9  reads   SMMU translation context 0 (the GPU's): SCTLR, TTBR0, TCR, FSR
++ *  10  writes  two words into the GMU's data memory (DTCM, CM3 held in reset) and reads them back:
++ *              whether its firmware can be loaded through the register window
++ *  11  asks    TrustZone (SMC, through the hypervisor) calls that pass no memory: is-call-available,
++ *              the PAS image calls, and which images it "supports" (GPU zap = image 13)
++ *  12  asks    TrustZone to check the signature of a730_zap.mdt (from the firmware area,
++ *              liuqin_fw_get) via PAS init image: the first of Linux's three zap calls
++ *  13  writes  page tables for the GMU (A7xx layout, Linux a6xx_gmu_memory_probe: icache 0x4000
++ *              16M-16K, dummy 0x60000000 16K, log 0x60004000 16K, HFI 0x60008000 16K, debug
++ *              0x60400000 28K) and an SMMU context for the GMU's stream 5 (a free context and
++ *              stream-match entry, picked from what step 8 reads; liuqinadreno_cb / _smr force)
++ *  14  writes  gmu_gen70000.bin: ITCM/DTCM blocks through the register window (CM3 in reset),
++ *              the rest into the icache memory (a6xx_gmu_fw_load)
++ *  15  writes  RSC/PDC handshake + RSC sequencer (a6xx_gmu_rpmh_init; A730: pre-A740 offsets, TCS
++ *              data 0x80000000, PDC sequence in AOP so only PDC enable), then a6xx_gmu_fw_start:
++ *              FAL veto, TCM retention, HFI table, AHB fence range, CM3 config, chip id 0x07030100,
++ *              log, CX GBIF QoS, cache config; CM3 out of reset; wait for FW_INIT_RESULT
++ *  16  writes  the HFI queue table (command, response, debug) and starts the queues (HFI_CTRL_INIT)
++ *  17  talks   HFI (a6xx_hfi_start): perf table (GX/CX arc votes from cmd-db gfx/mx/cx.lvl and the
++ *              sm8450 GPU/GMU OPP levels), A730 bw table (SH0/MC0/ACV), CORE_FW_START, START
++ *  18  asks    the GMU to power the 3D core: OOB GPU_SET (request bit 30, ack bit 31), then GX GDSC
++ *              must read powered and the GPU's RBBM registers must answer
++ *  19  writes  the 3D core's memory: ring, SQE microcode (a730_sqe.fw), scratch; an SMMU context for
++ *              its streams 0 and 1 (BR and BV/LPAC)
++ *  20  writes  hw_init for A730 (Linux hw_init, a7xx paths; no clock gating or CP protection yet),
++ *              SQE base, ring base, starts the SQE and sends a7xx_cp_init
++ *  21  asks    TrustZone to load the zap shader (PAS mem setup at 0x8b91a000 + a730_zap.b02, auth and
++ *              reset), then CP_SET_SECURE_MODE 0 and a CP_MEM_WRITE of a word into our scratch page
++ *  22  draws   a 1080x2400 picture with the 2D engine (three bands) and checks its pixels
++ * liuqinadreno_pause=MS waits after each announcement (default 500), so the
++ * persistent log has the line before a silent reset.
++ *
++ * Addresses: sm8450.dtsi (gpu@3d00000, gmu@3d6a000, gpucc@3d90000,
++ * gcc@100000); offsets: Linux gcc-sm8450.c, gpucc-sm8450.c, gdsc.c,
++ * clk-rcg2.c, a6xx_gmu.xml. The GPU block is left powered when the ladder
++ * ends (nothing else uses it yet).
++ */
++#if defined(ARM64_BOARD_CONFIG_LIUQIN)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern const void *liuqin_fw_get(const char *name, uint32_t *size);
++extern uint64_t kvtophys(vm_offset_t va);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);     /* osfmk/arm/pmap/pmap.h (pmap_paddr_t) */
++void liuqin_adreno_init(void);
++uint32_t liuqin_probe_gpu = ~0u;
++
++#define GCC_PHYS        0x00100000UL
++#define GCC_SIZE        0x1f4200UL
++#define GPUCC_PHYS      0x03d90000UL
++#define GPUCC_SIZE      0xa000UL
++#define GMU_PHYS        0x03d69000UL
++#define GMU_SIZE        0x35000UL
++#define GPU_PHYS        0x03d00000UL
++#define GMU_REG(dw)     ((vm_offset_t)(dw) * 4 - (GMU_PHYS - GPU_PHYS))
++
++/* GCC */
++#define GCC_GPU_CFG_AHB_CBCR    0x81004
++#define GCC_GPU_MEMNOC_GFX_CBCR 0x81010
++#define GCC_GPU_SNOC_DVM_CBCR   0x81018
++#define GCC_DDRSS_GPU_AXI_CBCR  0x81154
++#define GCC_PLL_VOTE            0x62000         /* gcc_gpu_gpll0_clk_src BIT(15), _div_ BIT(16) */
++#define GCC_PLL_VOTE_GPU        ((1u << 15) | (1u << 16))
++
++/* GPUCC */
++#define GPUCC_GX_GDSCR          0x905c
++#define GPUCC_CX_GDSCR          0x9108
++#define GPUCC_AHB_CBCR          0x911c
++#define GPUCC_CX_SNOC_DVM_CBCR  0x9130
++#define GPUCC_CX_GMU_CBCR       0x913c
++#define GPUCC_CXO_CBCR          0x9144
++#define GPUCC_HUB_CX_INT_CBCR   0x9148
++#define GPUCC_MEMNOC_GFX_CBCR   0x9150
++#define GPUCC_HUB_AON_CBCR      0x93e8
++#define GPUCC_SMMU_VOTE_CBCR    0x7000
++#define GPUCC_GMU_RCGR          0x9318
++#define GPUCC_HUB_RCGR          0x93ec
++
++#define CBCR_ENABLE             (1u << 0)
++#define CBCR_OFF                (1u << 31)      /* CBCR: the clock is not running */
++#define GDSC_SW_COLLAPSE        (1u << 0)
++#define GDSC_HW_CONTROL         (1u << 1)
++#define GDSC_PWR_ON             (1u << 31)      /* GDSCR: the domain is powered */
++#define RCG_UPDATE              (1u << 0)       /* CMD_RCGR: take the new source and divider */
++#define RCG_SOURCE_MASK         0x371fu         /* CFG: [4:0] 2*div-1, [10:8] source, [13:12] mode */
++#define RCG_GPLL0_DIV(twice)    (6u << 8 | ((twice) - 1))       /* source 6: GPLL0 out main div, 300 MHz */
++
++/* GMU CX (a6xx_gmu.xml dword offsets from the GPU base) */
++#define GMU_AO_COUNTER_L        0x1f888
++#define GMU_CM3_SYSRESET        0x1f800
++#define GMU_CM3_FW_INIT_RESULT  0x1f81c
++#define GMU_RSCC_CONTROL_ACK    0x23b08
++#define GMU_CM3_DTCM_START      0x1c400
++
++/* SCM calls (qcom_scm-smc.c, qcom_scm.c) */
++#define SCM_FAST                (1ull << 31)
++#define SCM_64                  (1ull << 30)
++#define SCM_SIP                 (2ull << 24)
++#define SCM_CALL(svc, cmd)      ((uint64_t)(svc) << 8 | (cmd))
++#define SCM_IS_CALL_AVAILABLE   SCM_CALL(6, 1)
++#define SCM_PAS_INIT_IMAGE      SCM_CALL(2, 1)
++#define SCM_PAS_AUTH_AND_RESET  SCM_CALL(2, 5)
++#define SCM_PAS_IS_SUPPORTED    SCM_CALL(2, 7)
++#define SCM_ONE_VALUE           1
++#define SCM_VALUE_AND_BUFFER    (2 | 2 << 6)    /* a number, then a read-write buffer address */
++#define SCM_INTERRUPTED         1
++#define PAS_GPU                 13
++
++/* RSCC (a6xx_gmu.xml domain A6XX_RSCC, dword offsets; A730 keeps the pre-A740 layout) */
++#define RSCC_PHYS               0x03d50000UL
++#define RSCC_SIZE               0x10000UL
++#define RSCC_RSC_STATUS0_DRV0   (4 * 0x004)
++#define RSCC_PDC_SLAVE_ID_DRV0  (4 * 0x00b)
++#define RSCC_SEQ_BUSY_DRV0      (4 * 0x101)
++#define RSCC_SEQ_MEM_0_DRV0     (4 * 0x180)
++#define RSCC_TCS0_DRV0_STATUS   (4 * 0x346)
++
++/* adreno SMMU (arm-smmu.h); streams: GPU 0 and 1, GMU 5 (mask 0x400) */
++#define SMMU_PHYS               0x03da0000UL
++#define SMMU_SIZE               0x40000UL
++#define SMMU_SCR0               0x000
++#define SMMU_IDR0               0x020           /* [7:0] stream match registers */
++#define SMMU_IDR1               0x024           /* [31] 64K pages, [30:28] log2(pages)-1, [7:0] contexts */
++#define SMMU_IDR2               0x028
++#define SMMU_IDR7               0x03c
++#define SMMU_SGFSR              0x048
++#define SMMU_SMR(n)             (0x800 + 4 * (n))
++#define SMMU_S2CR(n)            (0xc00 + 4 * (n))
++#define SMMU_CBAR(n)            (4 * (n))       /* in the second page */
++#define SMMU_CB_SCTLR           0x00
++#define SMMU_CB_TTBR0           0x20
++#define SMMU_CB_TCR             0x30
++#define SMMU_CB_FSR             0x58
++
++static uint32_t pause_ms = 500;
++static uint32_t step;
++
++/*
++ * Status badge for the screen's top-right corner, drawn over every frame by
++ * NegroniFramebuffer (AppleCLCD::present): the text and its colour (xRGB).
++ */
++char liuqin_gpu_badge[24] = "GPU OFF";
++uint32_t liuqin_gpu_badge_color = 0x00606060;
++static bool gmu_counts;
++static vm_offset_t gcc, gpucc, gmu, rscc, smmu;
++static uint32_t smmu_page, smmu_pages, smmu_contexts, smmu_matches;
++
++/* Plain 32-bit loads and stores; the hypervisor's trap emulation copes with no other form. */
++static uint32_t __attribute__((noinline))
++rd(vm_offset_t address)
++{
++	uint32_t value;
++
++	__asm__ volatile ("ldr %w0, [%1]" : "=r" (value) : "r" (address) : "memory");
++	return value;
++}
++
++static void __attribute__((noinline))
++wr(vm_offset_t address, uint32_t value)
++{
++	__asm__ volatile ("str %w0, [%1]" : : "r" (value), "r" (address) : "memory");
++}
++
++static void
++announce(const char *what)
++{
++	printf("LIUQIN ADRENO: %u about to %s\n", step, what);
++	delay(pause_ms * 1000);
++}
++
++static void
++put(vm_offset_t base, const char *name, uint32_t offset, uint32_t value)
++{
++	uint32_t was = rd(base + offset);
++
++	wr(base + offset, value);
++	printf("LIUQIN ADRENO: %u %s %#x -> %#x (reads %#x)\n", step, name, was, value, rd(base + offset));
++}
++
++static uint32_t
++get(vm_offset_t base, const char *name, uint32_t offset)
++{
++	uint32_t v = rd(base + offset);
++
++	printf("LIUQIN ADRENO: %u %s [%#x] = %#x\n", step, name, offset, v);
++	return v;
++}
++
++/* Wait up to `ms` for (reg & mask) == want. */
++static bool
++wait_for(vm_offset_t address, uint32_t mask, uint32_t want, uint32_t ms)
++{
++	for (uint32_t i = 0; i < ms * 10; i++) {
++		if ((rd(address) & mask) == want) {
++			return true;
++		}
++		delay(100);
++	}
++	return (rd(address) & mask) == want;
++}
++
++static bool
++clock_on(vm_offset_t base, const char *name, uint32_t cbcr, bool must)
++{
++	put(base, name, cbcr, rd(base + cbcr) | CBCR_ENABLE);
++	if (wait_for(base + cbcr, CBCR_OFF, 0, 10)) {
++		return true;
++	}
++	/* Some branches' status bits are not reliable (halt_check in Linux): `must` says which count. */
++	printf("LIUQIN ADRENO: %u %s stays off (%#x)%s\n", step, name, rd(base + cbcr),
++	    must ? "" : ", not a reliable status bit, going on");
++	return !must;
++}
++
++static bool
++clock_source(const char *name, uint32_t rcgr, uint32_t source)
++{
++	uint32_t cfg = rd(gpucc + rcgr + 4);
++
++	if ((cfg & RCG_SOURCE_MASK) == source) {
++		printf("LIUQIN ADRENO: %u %s already at %#x\n", step, name, cfg);
++		return true;
++	}
++	put(gpucc, name, rcgr + 4, (cfg & ~RCG_SOURCE_MASK) | source);
++	put(gpucc, name, rcgr, rd(gpucc + rcgr) | RCG_UPDATE);
++	if (!wait_for(gpucc + rcgr, RCG_UPDATE, 0, 10)) {
++		printf("LIUQIN ADRENO: %u %s does not take its new source (cmd %#x)\n", step, name, rd(gpucc + rcgr));
++		return false;
++	}
++	return true;
++}
++
++static bool
++cfg_ahb_running(void)
++{
++	return !(rd(gcc + GCC_GPU_CFG_AHB_CBCR) & CBCR_OFF);
++}
++
++static bool
++cx_is_on(void)
++{
++	return (rd(gpucc + GPUCC_CX_GDSCR) & GDSC_PWR_ON) != 0;
++}
++
++/* ---- the steps ---- */
++
++static bool
++step_gcc(void)
++{
++	static const struct { const char *name; uint32_t offset; } r[] = {
++		{ "GCC_GPU_CFG_AHB_CLK", GCC_GPU_CFG_AHB_CBCR },
++		{ "GCC_GPU_MEMNOC_GFX_CLK", GCC_GPU_MEMNOC_GFX_CBCR },
++		{ "GCC_GPU_SNOC_DVM_GFX_CLK", GCC_GPU_SNOC_DVM_CBCR },
++		{ "GCC_DDRSS_GPU_AXI_CLK", GCC_DDRSS_GPU_AXI_CBCR },
++		{ "GCC_PLL_VOTE", GCC_PLL_VOTE },
++	};
++
++	announce("read GCC GPU branches");
++	for (unsigned i = 0; i < sizeof(r) / sizeof(r[0]); i++) {
++		uint32_t v = rd(gcc + r[i].offset);
++		printf("LIUQIN ADRENO: 1 %s = %#x%s\n", r[i].name, v,
++		    r[i].offset == GCC_PLL_VOTE ? "" : (v & CBCR_OFF) ? " (off)" : " (running)");
++	}
++	if (!cfg_ahb_running()) {
++		printf("LIUQIN ADRENO: 1 stop: GCC_GPU_CFG_AHB_CLK is off, GPUCC unreachable\n");
++		return false;
++	}
++	return true;
++}
++
++static bool
++step_gpucc_read(void)
++{
++	static const struct { const char *name; uint32_t offset; bool gdsc; } r[] = {
++		{ "GPU_CX_GDSC", GPUCC_CX_GDSCR, true },
++		{ "GPU_GX_GDSC", GPUCC_GX_GDSCR, true },
++		{ "GPU_CC_AHB_CLK", GPUCC_AHB_CBCR, false },
++		{ "GPU_CC_CX_GMU_CLK", GPUCC_CX_GMU_CBCR, false },
++		{ "GPU_CC_CXO_CLK", GPUCC_CXO_CBCR, false },
++		{ "GPU_CC_HUB_CX_INT_CLK", GPUCC_HUB_CX_INT_CBCR, false },
++		{ "GPU_CC_HUB_AON_CLK", GPUCC_HUB_AON_CBCR, false },
++		{ "GPU_CC_MEMNOC_GFX_CLK", GPUCC_MEMNOC_GFX_CBCR, false },
++		{ "GPU_CC_CX_SNOC_DVM_CLK", GPUCC_CX_SNOC_DVM_CBCR, false },
++		{ "GPU_CC_HLOS1_VOTE_GPU_SMMU_CLK", GPUCC_SMMU_VOTE_CBCR, false },
++	};
++
++	announce("read GPUCC (GDSCs and CX clocks)");
++	for (unsigned i = 0; i < sizeof(r) / sizeof(r[0]); i++) {
++		uint32_t v = rd(gpucc + r[i].offset);
++		printf("LIUQIN ADRENO: 2 %s = %#x (%s)\n", r[i].name, v,
++		    r[i].gdsc ? ((v & GDSC_PWR_ON) ? "powered" : "off") : ((v & CBCR_OFF) ? "off" : "running"));
++	}
++	printf("LIUQIN ADRENO: 2 GMU RCG cmd %#x cfg %#x, hub RCG cmd %#x cfg %#x\n",
++	    rd(gpucc + GPUCC_GMU_RCGR), rd(gpucc + GPUCC_GMU_RCGR + 4),
++	    rd(gpucc + GPUCC_HUB_RCGR), rd(gpucc + GPUCC_HUB_RCGR + 4));
++	return true;
++}
++
++static void
++gmu_words(void)
++{
++	uint32_t first = rd(gmu + GMU_REG(GMU_AO_COUNTER_L)), last = first;
++
++	for (int i = 0; i < 3; i++) {
++		delay(1000);
++		last = rd(gmu + GMU_REG(GMU_AO_COUNTER_L));
++		printf("LIUQIN ADRENO: %u GMU AO counter low = %#x\n", step, last);
++	}
++	gmu_counts = last != first;
++	printf("LIUQIN ADRENO: %u GMU AO counter %s; CM3_FW_INIT_RESULT = %#x, CM3_SYSRESET = %#x\n", step,
++	    last != first ? "COUNTS" : "does not count",
++	    rd(gmu + GMU_REG(GMU_CM3_FW_INIT_RESULT)), rd(gmu + GMU_REG(GMU_CM3_SYSRESET)));
++}
++
++static bool
++step_gmu_read_if_on(void)
++{
++	if (!cx_is_on() || (rd(gpucc + GPUCC_CX_GMU_CBCR) & CBCR_OFF)) {
++		printf("LIUQIN ADRENO: 3 CX or the GMU clock is off: nothing to read yet (steps 4 and 5 switch them on)\n");
++		return true;
++	}
++	announce("read GMU CX registers");
++	gmu_words();
++	return true;
++}
++
++static bool
++step_cx_power(void)
++{
++	uint32_t gdscr = rd(gpucc + GPUCC_CX_GDSCR);
++
++	if (cx_is_on()) {
++		printf("LIUQIN ADRENO: 4 CX is on already (%#x)\n", gdscr);
++		return true;
++	}
++	if (gdscr & GDSC_HW_CONTROL) {
++		printf("LIUQIN ADRENO: 4 stop: CX GDSC is under hardware control (%#x)\n", gdscr);
++		return false;
++	}
++	announce("switch the CX GDSC on (clear SW_COLLAPSE)");
++	put(gpucc, "GPU_CX_GDSCR", GPUCC_CX_GDSCR, gdscr & ~GDSC_SW_COLLAPSE);
++	if (!wait_for(gpucc + GPUCC_CX_GDSCR, GDSC_PWR_ON, GDSC_PWR_ON, 50)) {
++		printf("LIUQIN ADRENO: 4 stop: CX does not come on (%#x)\n", rd(gpucc + GPUCC_CX_GDSCR));
++		return false;
++	}
++	printf("LIUQIN ADRENO: 4 CX is on (%#x)\n", rd(gpucc + GPUCC_CX_GDSCR));
++	if (rd(gpucc + GPUCC_GX_GDSCR) & GDSC_PWR_ON) {
++		/* A GX left on by an earlier run does not take commands, and switching it off hung the phone. */
++		printf("LIUQIN ADRENO: 4 stop: GX already has power (left by an earlier run): restart the phone\n");
++		return false;
++	}
++	return true;
++}
++
++static bool
++step_clocks(void)
++{
++	if (!cx_is_on()) {
++		printf("LIUQIN ADRENO: 5 stop: CX is off (step 4)\n");
++		return false;
++	}
++	announce("vote the GPLL0 GPU taps and switch the GCC GPU clocks on");
++	put(gcc, "GCC_PLL_VOTE", GCC_PLL_VOTE, rd(gcc + GCC_PLL_VOTE) | GCC_PLL_VOTE_GPU);
++	if (!clock_on(gcc, "GCC_GPU_MEMNOC_GFX_CLK", GCC_GPU_MEMNOC_GFX_CBCR, false) ||
++	    !clock_on(gcc, "GCC_GPU_SNOC_DVM_GFX_CLK", GCC_GPU_SNOC_DVM_CBCR, true) ||
++	    !clock_on(gcc, "GCC_DDRSS_GPU_AXI_CLK", GCC_DDRSS_GPU_AXI_CBCR, false)) {
++		return false;
++	}
++	announce("set the GMU clock to 200 MHz and the hub clock to 150 MHz (GPLL0 300 MHz tap)");
++	if (!clock_source("GPU_CC_GMU_CLK_SRC", GPUCC_GMU_RCGR, RCG_GPLL0_DIV(3)) ||
++	    !clock_source("GPU_CC_HUB_CLK_SRC", GPUCC_HUB_RCGR, RCG_GPLL0_DIV(4))) {
++		return false;
++	}
++	announce("switch the GPUCC CX clocks on");
++	if (!clock_on(gpucc, "GPU_CC_AHB_CLK", GPUCC_AHB_CBCR, false) ||
++	    !clock_on(gpucc, "GPU_CC_CXO_CLK", GPUCC_CXO_CBCR, true) ||
++	    !clock_on(gpucc, "GPU_CC_HUB_AON_CLK", GPUCC_HUB_AON_CBCR, true) ||
++	    !clock_on(gpucc, "GPU_CC_HUB_CX_INT_CLK", GPUCC_HUB_CX_INT_CBCR, true) ||
++	    !clock_on(gpucc, "GPU_CC_CX_GMU_CLK", GPUCC_CX_GMU_CBCR, true) ||
++	    !clock_on(gpucc, "GPU_CC_HLOS1_VOTE_GPU_SMMU_CLK", GPUCC_SMMU_VOTE_CBCR, false)) {
++		return false;
++	}
++	return true;
++}
++
++static bool
++step_gmu_first_words(void)
++{
++	if (!cx_is_on() || (rd(gpucc + GPUCC_CX_GMU_CBCR) & CBCR_OFF)) {
++		printf("LIUQIN ADRENO: 6 stop: CX or the GMU clock is off (steps 4, 5)\n");
++		return false;
++	}
++	announce("read the GMU's first words");
++	gmu_words();
++	return true;
++}
++
++static bool
++cx_ready(void)
++{
++	if (!cx_is_on() || (rd(gpucc + GPUCC_CX_GMU_CBCR) & CBCR_OFF)) {
++		printf("LIUQIN ADRENO: %u stop: CX or the GMU clock is off (steps 4, 5)\n", step);
++		return false;
++	}
++	return true;
++}
++
++static bool
++step_rscc(void)
++{
++	if (!cx_ready()) {
++		return false;
++	}
++	announce("read the GMU's RPMh channel (RSCC 0x3d50000)");
++	get(rscc, "RSC_STATUS0_DRV0", RSCC_RSC_STATUS0_DRV0);
++	get(rscc, "PDC_SLAVE_ID_DRV0", RSCC_PDC_SLAVE_ID_DRV0);
++	get(rscc, "SEQ_BUSY_DRV0", RSCC_SEQ_BUSY_DRV0);
++	get(rscc, "SEQ_MEM_0_DRV0", RSCC_SEQ_MEM_0_DRV0);
++	get(rscc, "TCS0_DRV0_STATUS", RSCC_TCS0_DRV0_STATUS);
++	printf("LIUQIN ADRENO: 7 GMU_RSCC_CONTROL_ACK = %#x\n", rd(gmu + GMU_REG(GMU_RSCC_CONTROL_ACK)));
++	return true;
++}
++
++/* The SMMU's layout from its ID registers; false if it does not match the 0x40000 the device tree gives. */
++static bool
++smmu_layout(void)
++{
++	uint32_t idr0 = get(smmu, "SMMU_IDR0", SMMU_IDR0), idr1 = get(smmu, "SMMU_IDR1", SMMU_IDR1);
++
++	smmu_page = (idr1 >> 31) ? 0x10000 : 0x1000;
++	smmu_pages = 2u << ((idr1 >> 28) & 7);
++	smmu_contexts = idr1 & 0xff;
++	smmu_matches = idr0 & 0xff;
++	printf("LIUQIN ADRENO: %u SMMU: %u stream matches, %u contexts, %u pages of %#x\n", step,
++	    smmu_matches, smmu_contexts, smmu_pages, smmu_page);
++	if (2 * smmu_pages * smmu_page > SMMU_SIZE) {
++		printf("LIUQIN ADRENO: %u stop: layout %#x exceeds the %#lx mapped\n", step,
++		    2 * smmu_pages * smmu_page, SMMU_SIZE);
++		return false;
++	}
++	return true;
++}
++
++static bool
++step_smmu(void)
++{
++	if (!cx_ready()) {
++		return false;
++	}
++	announce("read the adreno SMMU ID registers (0x3da0000; the hypervisor emulates the global space)");
++	if (!smmu_layout()) {
++		return false;
++	}
++	get(smmu, "SMMU_IDR2", SMMU_IDR2);
++	get(smmu, "SMMU_IDR7", SMMU_IDR7);
++	get(smmu, "SMMU_SCR0", SMMU_SCR0);
++	get(smmu, "SMMU_SGFSR", SMMU_SGFSR);
++	announce("read the SMMU stream match table and context kinds");
++	for (uint32_t i = 0; i < smmu_matches && i < 16; i++) {
++		uint32_t smr = rd(smmu + SMMU_SMR(i)), s2cr = rd(smmu + SMMU_S2CR(i));
++		printf("LIUQIN ADRENO: 8 SMR%u = %#x (%s sid %#x mask %#x)  S2CR%u = %#x (type %u cb %u)\n", i, smr,
++		    (smr >> 31) ? "valid" : "-", smr & 0x7fff, (smr >> 16) & 0x7fff, i, s2cr, (s2cr >> 16) & 3, s2cr & 0xff);
++	}
++	for (uint32_t i = 0; i < smmu_contexts && i < 16; i++) {
++		printf("LIUQIN ADRENO: 8 CBAR%u = %#x\n", i, rd(smmu + smmu_page + SMMU_CBAR(i)));
++	}
++	return true;
++}
++
++/* Context 0 only: the one Linux and the vendor driver give the GPU; others may belong to TrustZone. */
++static bool
++step_smmu_context(void)
++{
++	vm_offset_t cb;
++
++	if (!cx_ready()) {
++		return false;
++	}
++	announce("read SMMU translation context 0 (hardware registers)");
++	if (!smmu_layout()) {
++		return false;
++	}
++	cb = smmu + smmu_pages * smmu_page;
++	printf("LIUQIN ADRENO: 9 CB0 SCTLR %#x TTBR0 %#x:%#x TCR %#x FSR %#x\n", rd(cb + SMMU_CB_SCTLR),
++	    rd(cb + SMMU_CB_TTBR0 + 4), rd(cb + SMMU_CB_TTBR0), rd(cb + SMMU_CB_TCR), rd(cb + SMMU_CB_FSR));
++	return true;
++}
++
++static bool
++step_gmu_memory(void)
++{
++	static const uint32_t pattern[2] = { 0x600d0001, 0x0a110002 };
++	uint32_t was[2], back[2];
++	vm_offset_t dtcm = gmu + GMU_REG(GMU_CM3_DTCM_START);
++
++	if (!cx_ready()) {
++		return false;
++	}
++	if (rd(gmu + GMU_REG(GMU_CM3_FW_INIT_RESULT)) == 0xbabeface) {
++		printf("LIUQIN ADRENO: 10 stop: GMU firmware is running, leaving its memory alone\n");
++		return false;
++	}
++	announce("hold the GMU CM3 in reset and write two words into its DTCM (0x3d71000), then read them back");
++	put(gmu, "GMU_CM3_SYSRESET", GMU_REG(GMU_CM3_SYSRESET), 1);
++	for (int i = 0; i < 2; i++) {
++		was[i] = rd(dtcm + 4 * i);
++	}
++	for (int i = 0; i < 2; i++) {
++		wr(dtcm + 4 * i, pattern[i]);
++	}
++	for (int i = 0; i < 2; i++) {
++		back[i] = rd(dtcm + 4 * i);
++		wr(dtcm + 4 * i, was[i]);
++	}
++	bool ok = back[0] == pattern[0] && back[1] == pattern[1];
++	printf("LIUQIN ADRENO: 10 DTCM was %#x %#x, wrote %#x %#x, read %#x %#x: %s\n", was[0], was[1],
++	    pattern[0], pattern[1], back[0], back[1], ok ? "GMU MEMORY TAKES WRITES" : "does not hold what was written");
++	return ok;
++}
++
++/* One SCM call (SMC #0); x6 carries the session for interrupted calls. Returns x0, answer = x1. */
++static int32_t
++scm(const char *what, uint64_t function, uint64_t args, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t *answer)
++{
++	uint64_t session = 0;
++
++	printf("LIUQIN ADRENO: %u SCM %s: smc %#llx (%#llx, %#llx, %#llx)\n", step, what, function, a0, a1, a2);
++	delay(pause_ms * 1000);
++	for (int i = 0; i < 100; i++) {
++		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
++		register uint64_t x1 __asm__("x1") = args;
++		register uint64_t x2 __asm__("x2") = a0;
++		register uint64_t x3 __asm__("x3") = a1;
++		register uint64_t x4 __asm__("x4") = a2;
++		register uint64_t x5 __asm__("x5") = 0;
++		register uint64_t x6 __asm__("x6") = session;
++		register uint64_t x7 __asm__("x7") = 0;
++
++		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4), "+r" (x5), "+r" (x6),
++		    "+r" (x7) : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++		session = x6;
++		if (x0 != SCM_INTERRUPTED) {
++			printf("LIUQIN ADRENO: %u SCM %s -> %d, answer %#llx\n", step, what, (int32_t)x0, x1);
++			*answer = x1;
++			return (int32_t)x0;
++		}
++	}
++	printf("LIUQIN ADRENO: %u SCM %s keeps returning interrupted\n", step, what);
++	return -1;
++}
++
++static bool
++step_trustzone(void)
++{
++	static const struct { const char *name; uint32_t id; } images[] = {
++		{ "adsp", 1 }, { "modem", 4 }, { "venus", 9 }, { "gpu zap", PAS_GPU },
++	};
++	uint64_t answer = 0, how = SCM_FAST | SCM_64 | SCM_SIP;
++
++	announce("ask TrustZone whether is-call-available is available (Linux's first SCM call)");
++	if (scm("is-call-available", how | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE, SCM_SIP | SCM_IS_CALL_AVAILABLE,
++	    0, 0, &answer) != 0 || answer != 1) {
++		how = SCM_FAST | SCM_SIP;
++		if (scm("is-call-available (32-bit)", how | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE,
++		    SCM_SIP | SCM_IS_CALL_AVAILABLE, 0, 0, &answer) != 0 || answer != 1) {
++			printf("LIUQIN ADRENO: 11 stop: TrustZone does not answer as it answers Linux\n");
++			return false;
++		}
++	}
++	scm("has PAS init image", how | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE, SCM_SIP | SCM_PAS_INIT_IMAGE, 0, 0, &answer);
++	scm("has PAS auth and reset", how | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE, SCM_SIP | SCM_PAS_AUTH_AND_RESET,
++	    0, 0, &answer);
++	uint32_t yes = 0;
++	for (unsigned i = 0; i < 4; i++) {
++		answer = 0;
++		if (scm(images[i].name, (how & ~SCM_FAST) | SCM_PAS_IS_SUPPORTED, SCM_ONE_VALUE, images[i].id, 0, 0,
++		    &answer) == 0 && answer) {
++			yes |= 1u << i;
++		}
++	}
++	printf("LIUQIN ADRENO: 11 PAS supported: adsp %u modem %u venus %u gpu %u\n", yes & 1, (yes >> 1) & 1,
++	    (yes >> 2) & 1, (yes >> 3) & 1);
++	return true;
++}
++
++/*
++ * Linux qcom_mdt_pas_init -> qcom_scm_pas_init_image: TrustZone gets the zap
++ * image's header (the whole .mdt: ELF header, program headers and the hash
++ * segment) in one physically contiguous buffer and checks the signature.
++ * TrustZone protects that memory while it works, so it is never freed.
++ */
++static bool
++step_zap_signature(void)
++{
++	const uint8_t *mdt;
++	uint32_t size = 0, segments, hashes;
++	vm_offset_t page = 0;
++	uint64_t answer = ~0ull;
++
++	mdt = liuqin_fw_get("a730_zap.mdt", &size);
++	if (mdt == NULL) {
++		printf("LIUQIN ADRENO: 12 stop: no a730_zap.mdt in the firmware area (mkfwarea.py + dd)\n");
++		return false;
++	}
++	segments = size >= 52 + 2 * 32 ? (uint32_t)(mdt[44] | mdt[45] << 8) : 0;
++	if (memcmp(mdt, "\177ELF\1", 5) != 0 || segments < 2 || size > PAGE_SIZE) {
++		printf("LIUQIN ADRENO: 12 stop: a730_zap.mdt is not a 32-bit ELF header (%u segments, %u bytes)\n",
++		    segments, size);
++		return false;
++	}
++	memcpy(&hashes, mdt + 52 + 32 + 16, sizeof(hashes));
++	printf("LIUQIN ADRENO: 12 zap header: %u segments, hash segment %u bytes, file %u bytes\n", segments, hashes, size);
++	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("LIUQIN ADRENO: 12 stop: no memory\n");
++		return false;
++	}
++	memcpy((void *)page, mdt, size);
++	clean_dcache((vm_offset_t)page, PAGE_SIZE, FALSE);      /* TrustZone reads memory, not our cache */
++	announce("hand the zap header to TrustZone for its signature check (PAS image 13)");
++	int32_t r = scm("PAS init image (zap)", SCM_64 | SCM_SIP | SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_GPU,
++	    kvtophys(page), 0, &answer);
++	if (r == 0 && answer == 0) {
++		printf("LIUQIN ADRENO: 12 TRUSTZONE ACCEPTS THE ZAP SHADER SIGNATURE\n");
++		return true;
++	}
++	printf("LIUQIN ADRENO: 12 stop: TrustZone returns %d, answer %#llx\n", r, answer);
++	return false;
++}
++
++
++/* ---- memory the GPU block reaches through the adreno SMMU (Linux io-pgtable-arm.c, arm-smmu.c) ---- */
++
++#define PTE_TABLE               3ull
++#define PTE_PAGE                3ull
++#define PTE_SHARED              (2ull << 8)
++#define PTE_ACCESSED            (1ull << 10)
++#define PTE_NOT_GLOBAL          (1ull << 11)
++#define PTE_ADDRESS             0x0000fffffffff000ull
++#define PTE_GMU                 (PTE_SHARED | PTE_ACCESSED | PTE_NOT_GLOBAL)
++
++#define SMMU_S2CR_FAULT         (2u << 16)
++#define SMMU_SMR_VALID          (1u << 31)
++#define SMMU_STREAM_MASK        0x400
++#define SMMU_CBAR_STAGE_1       (1u << 16 | 3u << 8 | 0xfu << 12)
++#define SMMU_CBA2R(n)           (0x800 + 4 * (n))
++#define SMMU_CB_TCR2            0x10
++#define SMMU_CB_TTBR1           0x28
++#define SMMU_CB_MAIR0           0x38
++#define SMMU_CB_MAIR1           0x3c
++#define SMMU_CB_FAR             0x60
++#define SMMU_CB_FSYNR0          0x68
++#define SMMU_CB_TLBIASID        0x610
++#define SMMU_CB_TLBSYNC         0x7f0
++#define SMMU_CB_TLBSTATUS       0x7f4
++#define SMMU_SCTLR_ON           (1u << 0 | 1u << 1 | 1u << 2 | 1u << 5 | 1u << 12)
++#define SMMU_TCR_39_BITS        (25u | 1u << 8 | 1u << 10 | 3u << 12 | 1u << 23)
++#define SMMU_TCR2               (1u | 1u << 4 | 7u << 15)
++#define SMMU_MAIR0              0xf404ff44
++#define SMMU_FSR_ALL            0xc00001fe
++
++#define SPACE_TABLES            256
++
++struct gpu_space {
++	const char *name;
++	uint32_t context, match;
++	uint32_t table_count;
++	uint64_t *root;
++	struct {
++		uint64_t phys;
++		uint64_t *table;
++	} tables[SPACE_TABLES];
++};
++
++struct gpu_block {
++	uint64_t address;               /* the GPU's */
++	uint32_t size;
++	vm_offset_t memory;             /* ours */
++};
++
++static void
++to_memory(vm_offset_t start, vm_size_t size)
++{
++	for (vm_offset_t line = start & ~(vm_offset_t)63; line < start + size; line += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (line));
++	}
++	__asm__ volatile ("dsb sy");
++}
++
++static uint64_t *
++space_new_table(struct gpu_space *space)
++{
++	static vm_offset_t spare;
++	static unsigned spare_left;
++	uint64_t *table;
++
++	if (space->table_count == SPACE_TABLES) {
++		return NULL;
++	}
++	if (spare_left == 0) {
++		if (kmem_alloc(kernel_map, &spare, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			return NULL;
++		}
++		spare_left = PAGE_SIZE / 4096;
++	}
++	table = (uint64_t *)(spare + PAGE_SIZE - 4096 * spare_left--);
++	space->tables[space->table_count].phys = kvtophys((vm_offset_t)table);
++	space->tables[space->table_count++].table = table;
++	return table;
++}
++
++static uint64_t *
++space_next(struct gpu_space *space, uint64_t *entry)
++{
++	if (*entry & 1) {
++		for (uint32_t i = 0; i < space->table_count; i++) {
++			if (space->tables[i].phys == (*entry & PTE_ADDRESS)) {
++				return space->tables[i].table;
++			}
++		}
++		return NULL;
++	}
++	uint64_t *table = space_new_table(space);
++	if (table != NULL) {
++		*entry = kvtophys((vm_offset_t)table) | PTE_TABLE;
++	}
++	return table;
++}
++
++/* One 4K page, 3 levels, 39-bit addresses. */
++static bool
++space_map(struct gpu_space *space, uint64_t address, uint64_t phys, uint64_t attributes)
++{
++	uint64_t *level2, *level3;
++
++	if ((address >> 39) || (space->root == NULL && (space->root = space_new_table(space)) == NULL)) {
++		return false;
++	}
++	level2 = space_next(space, &space->root[(address >> 30) & 0x1ff]);
++	level3 = level2 ? space_next(space, &level2[(address >> 21) & 0x1ff]) : NULL;
++	if (level3 == NULL) {
++		return false;
++	}
++	level3[(address >> 12) & 0x1ff] = phys | attributes | PTE_PAGE;
++	return true;
++}
++
++static bool
++block_new(struct gpu_space *space, struct gpu_block *block, const char *name, uint64_t address, uint32_t size)
++{
++	block->address = address;
++	block->size = (size + 4095) & ~4095u;
++	if (kmem_alloc(kernel_map, &block->memory, round_page(block->size), KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("LIUQIN ADRENO: %u no memory for %s (%#x)\n", step, name, block->size);
++		return false;
++	}
++	for (uint32_t offset = 0; offset < block->size; offset += 4096) {
++		if (!space_map(space, address + offset, kvtophys(block->memory + offset), PTE_GMU)) {
++			printf("LIUQIN ADRENO: %u cannot map %s at %#llx\n", step, name, address + offset);
++			return false;
++		}
++	}
++	to_memory(block->memory, block->size);
++	printf("LIUQIN ADRENO: %u %s: %s sees %#llx..%#llx\n", step, name, space->name, address,
++	    address + block->size - 1);
++	return true;
++}
++
++static uint32_t
++smmu_cb(const struct gpu_space *space)
++{
++	return (smmu_pages + space->context) * smmu_page;
++}
++
++static bool
++space_faulted(const struct gpu_space *space)
++{
++	uint32_t cb = smmu_cb(space), fsr = rd(smmu + cb + SMMU_CB_FSR);
++
++	if ((fsr & SMMU_FSR_ALL) == 0) {
++		return false;
++	}
++	printf("LIUQIN ADRENO: %u SMMU FAULT in %s: FSR %#x FAR %#x:%#x FSYNR0 %#x\n", step, space->name, fsr,
++	    rd(smmu + cb + SMMU_CB_FAR + 4), rd(smmu + cb + SMMU_CB_FAR), rd(smmu + cb + SMMU_CB_FSYNR0));
++	return true;
++}
++
++/*
++ * A context nobody uses: CBAR type field reads 0 with no translation configured and SCTLR off.
++ * A stream-match entry nobody uses: SMR not valid. Boot args liuqinadreno_cb / _smr force them.
++ */
++static bool
++space_pick(struct gpu_space *space, uint32_t stream)
++{
++	uint32_t cb = ~0u, smr = ~0u;
++
++	(void)PE_parse_boot_argn("liuqinadreno_cb", &cb, sizeof(cb));
++	(void)PE_parse_boot_argn("liuqinadreno_smr", &smr, sizeof(smr));
++	for (uint32_t i = 0; i < smmu_matches && i < 128; i++) {
++		uint32_t v = rd(smmu + SMMU_SMR(i));
++		if ((v >> 31) && (v & 0x7fff) == stream) {
++			printf("LIUQIN ADRENO: %u stream %u already matched by SMR%u (%#x, S2CR %#x)\n", step, stream, i,
++			    v, rd(smmu + SMMU_S2CR(i)));
++			if (smr == ~0u) {
++				smr = i;
++			}
++		}
++	}
++	for (uint32_t i = 0; smr == ~0u && i < smmu_matches && i < 128; i++) {
++		if (!(rd(smmu + SMMU_SMR(i)) >> 31)) {
++			smr = i;
++		}
++	}
++	for (uint32_t i = 1; cb == ~0u && i < smmu_contexts; i++) {
++		uint32_t sctlr = rd(smmu + (smmu_pages + i) * smmu_page + SMMU_CB_SCTLR);
++		bool used = false;
++		for (uint32_t m = 0; m < smmu_matches && m < 128; m++) {
++			if ((rd(smmu + SMMU_SMR(m)) >> 31) && ((rd(smmu + SMMU_S2CR(m)) >> 16) & 3) == 0 &&
++			    (rd(smmu + SMMU_S2CR(m)) & 0xff) == i) {
++				used = true;
++			}
++		}
++		if (!used && !(sctlr & 1)) {
++			cb = i;
++		}
++	}
++	if (cb == ~0u || smr == ~0u || cb >= smmu_contexts || smr >= smmu_matches) {
++		printf("LIUQIN ADRENO: %u stop: no free SMMU context (%d) or stream-match entry (%d)\n", step,
++		    (int)cb, (int)smr);
++		return false;
++	}
++	space->context = cb;
++	space->match = smr;
++	printf("LIUQIN ADRENO: %u %s: context %u, stream-match entry %u\n", step, space->name, cb, smr);
++	return true;
++}
++
++/* Give a context our tables and send a stream through it (Linux arm-smmu.c order). */
++static bool
++space_on(struct gpu_space *space, uint32_t stream)
++{
++	uint32_t cb = smmu_cb(space);
++	uint64_t root = space->tables[0].phys | (uint64_t)space->context << 48;
++
++	for (uint32_t i = 0; i < space->table_count; i++) {
++		to_memory((vm_offset_t)space->tables[i].table, 4096);
++	}
++	put(smmu, "CB SCTLR", cb + SMMU_CB_SCTLR, 0);
++	put(smmu, "CBA2R", smmu_page + SMMU_CBA2R(space->context), 1);
++	put(smmu, "CBAR", smmu_page + SMMU_CBAR(space->context), SMMU_CBAR_STAGE_1);
++	put(smmu, "CB TCR2", cb + SMMU_CB_TCR2, SMMU_TCR2);
++	put(smmu, "CB TCR", cb + SMMU_CB_TCR, SMMU_TCR_39_BITS);
++	put(smmu, "CB TTBR0 lo", cb + SMMU_CB_TTBR0, (uint32_t)root);
++	put(smmu, "CB TTBR0 hi", cb + SMMU_CB_TTBR0 + 4, (uint32_t)(root >> 32));
++	put(smmu, "CB TTBR1 lo", cb + SMMU_CB_TTBR1, 0);
++	put(smmu, "CB TTBR1 hi", cb + SMMU_CB_TTBR1 + 4, 0);
++	put(smmu, "CB MAIR0", cb + SMMU_CB_MAIR0, SMMU_MAIR0);
++	put(smmu, "CB MAIR1", cb + SMMU_CB_MAIR1, 0);
++	put(smmu, "CB FSR", cb + SMMU_CB_FSR, SMMU_FSR_ALL);
++	put(smmu, "CB TLBIASID", cb + SMMU_CB_TLBIASID, space->context);
++	put(smmu, "CB TLBSYNC", cb + SMMU_CB_TLBSYNC, 1);
++	if (!wait_for(smmu + cb + SMMU_CB_TLBSTATUS, 1, 0, 100)) {
++		printf("LIUQIN ADRENO: %u stop: SMMU TLB sync does not finish (%#x)\n", step,
++		    rd(smmu + cb + SMMU_CB_TLBSTATUS));
++		return false;
++	}
++	put(smmu, "CB SCTLR", cb + SMMU_CB_SCTLR, SMMU_SCTLR_ON);
++	put(smmu, "S2CR", SMMU_S2CR(space->match), space->context);
++	put(smmu, "SMR", SMMU_SMR(space->match), SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | stream);
++	if (rd(smmu + SMMU_SMR(space->match)) != (SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | stream) ||
++	    (rd(smmu + SMMU_S2CR(space->match)) & 0x300ff) != space->context ||
++	    !(rd(smmu + cb + SMMU_CB_SCTLR) & 1) ||
++	    rd(smmu + cb + SMMU_CB_TTBR0) != (uint32_t)root) {
++		printf("LIUQIN ADRENO: %u stop: the SMMU (or the hypervisor) did not take the context for stream %u\n",
++		    step, stream);
++		return false;
++	}
++	printf("LIUQIN ADRENO: %u stream %u goes through context %u, SGFSR %#x\n", step, stream, space->context,
++	    rd(smmu + SMMU_SGFSR));
++	return true;
++}
++
++/* ---- steps 13, 14: GMU memory and firmware ---- */
++
++#define GMU_STREAM              5
++#define GMU_ITCM_ADDRESS        0x00000000u
++#define GMU_DTCM_ADDRESS        0x10004000u
++#define GMU_TCM_SIZE            0x4000u
++#define GMU_ICACHE_ADDRESS      0x00004000u
++#define GMU_ICACHE_SIZE         (0x1000000u - 0x4000u)
++#define GMU_DUMMY_ADDRESS       0x60000000u
++#define GMU_LOG_ADDRESS         0x60004000u
++#define GMU_HFI_ADDRESS         0x60008000u
++#define GMU_DEBUG_ADDRESS       0x60400000u
++
++struct gmu_fw_block {
++	uint32_t address, size, type, value;
++};
++
++static struct gpu_space gmu_space = { .name = "the GMU" };
++static struct gpu_block gmu_icache, gmu_dummy, gmu_log, gmu_hfi, gmu_debug;
++static bool gmu_space_on;
++
++static bool
++step_gmu_space(void)
++{
++	if (!cx_ready()) {
++		return false;
++	}
++	announce("make the GMU's memory (A7xx layout) and its page tables");
++	if (!block_new(&gmu_space, &gmu_icache, "icache", GMU_ICACHE_ADDRESS, GMU_ICACHE_SIZE) ||
++	    !block_new(&gmu_space, &gmu_dummy, "dummy", GMU_DUMMY_ADDRESS, 0x4000) ||
++	    !block_new(&gmu_space, &gmu_log, "log", GMU_LOG_ADDRESS, 0x4000) ||
++	    !block_new(&gmu_space, &gmu_hfi, "hfi", GMU_HFI_ADDRESS, 0x4000) ||
++	    !block_new(&gmu_space, &gmu_debug, "debug", GMU_DEBUG_ADDRESS, 0x7000)) {
++		return false;
++	}
++	printf("LIUQIN ADRENO: 13 %u page tables\n", gmu_space.table_count);
++	if (!smmu_layout() || !space_pick(&gmu_space, GMU_STREAM)) {
++		return false;
++	}
++	announce("give the SMMU context our tables and route the GMU's stream 5 through it (first SMMU writes)");
++	gmu_space_on = space_on(&gmu_space, GMU_STREAM);
++	return gmu_space_on && !space_faulted(&gmu_space);
++}
++
++static bool
++step_gmu_firmware(void)
++{
++	const uint8_t *fw;
++	uint32_t size = 0, loaded = 0;
++
++	if (!cx_ready() || !gmu_space_on) {
++		printf("LIUQIN ADRENO: 14 stop: no GMU memory (step 13)\n");
++		return false;
++	}
++	fw = liuqin_fw_get("gmu_gen70000.bin", &size);
++	if (fw == NULL) {
++		printf("LIUQIN ADRENO: 14 stop: no gmu_gen70000.bin in the firmware area\n");
++		return false;
++	}
++	announce("hold the GMU CM3 in reset and load gmu_gen70000.bin");
++	put(gmu, "GMU_CM3_SYSRESET", GMU_REG(GMU_CM3_SYSRESET), 1);
++	for (uint32_t at = 0; at + sizeof(struct gmu_fw_block) <= size;) {
++		struct gmu_fw_block b;
++		const uint8_t *data = fw + at + sizeof(b);
++
++		memcpy(&b, fw + at, sizeof(b));
++		at += sizeof(b) + b.size;
++		if (at > size) {
++			printf("LIUQIN ADRENO: 14 stop: the file ends inside a block\n");
++			return false;
++		}
++		if (b.size == 0) {
++			continue;
++		}
++		if (b.address - GMU_ITCM_ADDRESS < GMU_TCM_SIZE && b.size <= GMU_TCM_SIZE - (b.address - GMU_ITCM_ADDRESS)) {
++			for (uint32_t i = 0; i + 4 <= b.size; i += 4) {
++				uint32_t w;
++				memcpy(&w, data + i, 4);
++				wr(gmu + GMU_REG(0x1b400) + (b.address - GMU_ITCM_ADDRESS) + i, w);
++			}
++		} else if (b.address - GMU_DTCM_ADDRESS < GMU_TCM_SIZE &&
++		    b.size <= GMU_TCM_SIZE - (b.address - GMU_DTCM_ADDRESS)) {
++			for (uint32_t i = 0; i + 4 <= b.size; i += 4) {
++				uint32_t w;
++				memcpy(&w, data + i, 4);
++				wr(gmu + GMU_REG(GMU_CM3_DTCM_START) + (b.address - GMU_DTCM_ADDRESS) + i, w);
++			}
++		} else if (b.address - GMU_ICACHE_ADDRESS < GMU_ICACHE_SIZE &&
++		    b.size <= GMU_ICACHE_SIZE - (b.address - GMU_ICACHE_ADDRESS)) {
++			memcpy((void *)(gmu_icache.memory + (b.address - GMU_ICACHE_ADDRESS)), data, b.size);
++			to_memory(gmu_icache.memory + (b.address - GMU_ICACHE_ADDRESS), b.size);
++		} else {
++			printf("LIUQIN ADRENO: 14 stop: block at %#x (%u bytes) fits nowhere\n", b.address, b.size);
++			return false;
++		}
++		printf("LIUQIN ADRENO: 14 block %#x, %u bytes loaded\n", b.address, b.size);
++		loaded++;
++	}
++	printf("LIUQIN ADRENO: 14 %u blocks loaded; ITCM[0] reads %#x\n", loaded, rd(gmu + GMU_REG(0x1b400)));
++	return loaded > 0;
++}
++
++
++/* ---- steps 15, 16: start the GMU (Linux a6xx_gmu_rpmh_init, a6xx_gmu_fw_start, a6xx_hfi_init) ---- */
++
++#define GMU_PDC_PHYS            0x0b290000UL
++#define GMU_PDC_SIZE            0x10000UL
++#define PDC_GPU_ENABLE_PDC      (4 * 0x1140)
++#define PDC_GPU_SEQ_START_ADDR  (4 * 0x1148)
++#define CX_MISC_PHYS            0x03d9e000UL
++#define CX_MISC_TCM_RET_CNTL    (4 * 0x39)
++
++#define RSCC_STATUS0            (4 * 0x004)
++#define RSCC_PDC_SEQ_START      (4 * 0x008)
++#define RSCC_PDC_MATCH_LO       (4 * 0x009)
++#define RSCC_PDC_MATCH_HI       (4 * 0x00a)
++#define RSCC_PDC_SLAVE_ID       (4 * 0x00b)
++#define RSCC_HIDDEN_TCS_ADDR    (4 * 0x00d)
++#define RSCC_HIDDEN_TCS_DATA    (4 * 0x00e)
++#define RSCC_OVERRIDE_START     (4 * 0x100)
++#define RSCC_SEQ_MEM_0          (4 * 0x180)
++
++#define GMU_FALNEXT_INTF        0x1f8f1
++#define GMU_FAL_INTF            0x1f8f0
++#define GMU_CM3_BOOT_CONFIG     0x1f801
++#define GMU_CM3_CFG             0x1f82d
++#define GMU_HFI_QTBL_INFO       0x1f984
++#define GMU_HFI_QTBL_ADDR       0x1f985
++#define GMU_HFI_CTRL_INIT       0x1f986
++#define GMU_HFI_CTRL_STATUS     0x1f980
++#define GMU_AHB_FENCE_RANGE_0   0x23b11
++#define GMU_AO_AHB_FENCE_CTRL   0x23b10
++#define GMU_GENERAL_8           0x1f9cd
++#define GMU_GENERAL_9           0x1f9ce
++#define GMU_GENERAL_10          0x1f9cf
++#define GMU_ICACHE_CONFIG       0x1f400
++#define GMU_DCACHE_CONFIG       0x1f401
++#define GMU_SYS_BUS_CONFIG      0x1f40f
++#define GMU_CORE_FW_VERSION     0x1d3f8
++#define GPU_GBIF_QSB_SIDE0      0x3c03          /* dword, GPU space */
++#define A730_GMU_CHIPID         0x07030100u     /* chip_id 0x07030001 in the GMU's packing */
++
++static vm_offset_t gpu_regs, cx_misc, gmu_pdc;
++static bool gmu_started;
++
++static void
++gmu_put(const char *name, uint32_t dw, uint32_t value)
++{
++	put(gmu, name, GMU_REG(dw), value);
++}
++
++struct hfi_table_header {
++	uint32_t version, size, qhdr0_offset, qhdr_size, num_queues, active_queues;
++};
++struct hfi_queue_header {
++	uint32_t status, iova, type, size, msg_size, dropped, rx_watermark, tx_watermark,
++	    rx_request, tx_request, read_index, write_index;
++};
++
++static void
++hfi_table_init(void)
++{
++	struct hfi_table_header *table = (struct hfi_table_header *)gmu_hfi.memory;
++	struct hfi_queue_header *q = (struct hfi_queue_header *)(gmu_hfi.memory + sizeof(*table));
++
++	/* a6xx_hfi_init: table header, then command (0), response (1), debug (2) queues at +4K/+8K/+12K */
++	table->version = 0;
++	table->size = sizeof(*table) + 3 * sizeof(*q);
++	table->qhdr0_offset = sizeof(*table) >> 2;
++	table->qhdr_size = sizeof(*q) >> 2;
++	table->num_queues = 3;
++	table->active_queues = 3;
++	for (uint32_t i = 0; i < 3; i++) {
++		memset(&q[i], 0, sizeof(q[i]));
++		q[i].iova = (uint32_t)gmu_hfi.address + 4096 * (i + 1);
++		q[i].type = 10u << 8 | i;
++		q[i].status = 1;
++		q[i].size = 4096 >> 2;
++		q[i].rx_watermark = 1;
++		q[i].tx_watermark = 1;
++		q[i].rx_request = 1;
++		q[i].tx_request = 0;
++	}
++	to_memory(gmu_hfi.memory, gmu_hfi.size);
++}
++
++static bool
++step_gmu_start(void)
++{
++	uint32_t ver, mask, want;
++
++	if (!cx_ready() || !gmu_space_on) {
++		printf("LIUQIN ADRENO: 15 stop: needs steps 13-14\n");
++		return false;
++	}
++	gpu_regs = ml_io_map(GPU_PHYS, 0x40000);
++	cx_misc = ml_io_map(CX_MISC_PHYS, 0x1000);
++	gmu_pdc = ml_io_map(GMU_PDC_PHYS, GMU_PDC_SIZE);
++
++	announce("set up the GPU RSC/PDC handshake and the RSC sequencer (a6xx_gmu_rpmh_init)");
++	put(rscc, "RSC_STATUS0 (SDE clock gating off)", RSCC_STATUS0, 1u << 24);
++	put(rscc, "PDC_SLAVE_ID", RSCC_PDC_SLAVE_ID, 1);
++	put(rscc, "HIDDEN_TCS_DATA0", RSCC_HIDDEN_TCS_DATA, 0);
++	put(rscc, "HIDDEN_TCS_ADDR0", RSCC_HIDDEN_TCS_ADDR, 0);
++	put(rscc, "HIDDEN_TCS_DATA1", RSCC_HIDDEN_TCS_DATA + 8, 0);
++	put(rscc, "HIDDEN_TCS_ADDR1", RSCC_HIDDEN_TCS_ADDR + 8, 0);
++	put(rscc, "HIDDEN_TCS_DATA2", RSCC_HIDDEN_TCS_DATA + 16, 0x80000000);
++	put(rscc, "HIDDEN_TCS_ADDR2", RSCC_HIDDEN_TCS_ADDR + 16, 0);
++	put(rscc, "OVERRIDE_START", RSCC_OVERRIDE_START, 0);
++	put(rscc, "PDC_SEQ_START", RSCC_PDC_SEQ_START, 0x4520);
++	put(rscc, "PDC_MATCH_LO", RSCC_PDC_MATCH_LO, 0x4510);
++	put(rscc, "PDC_MATCH_HI", RSCC_PDC_MATCH_HI, 0x4514);
++	static const uint32_t seq[5] = { 0xeaaae5a0, 0xe1a1ebab, 0xa2e0a581, 0xecac82e2, 0x0020edad };
++	for (int i = 0; i < 5; i++) {
++		put(rscc, "SEQ_MEM", RSCC_SEQ_MEM_0 + 4 * i, seq[i]);
++	}
++	put(gmu_pdc, "PDC_GPU_SEQ_START_ADDR", PDC_GPU_SEQ_START_ADDR, 0);
++	put(gmu_pdc, "PDC_GPU_ENABLE_PDC", PDC_GPU_ENABLE_PDC, 0x80000001);
++
++	announce("configure the GMU for its start (a6xx_gmu_fw_start)");
++	gmu_put("FALNEXT_INTF", GMU_FALNEXT_INTF, 1);
++	gmu_put("FAL_INTF", GMU_FAL_INTF, 1);
++	put(cx_misc, "CX_MISC_TCM_RET_CNTL", CX_MISC_TCM_RET_CNTL, 1);
++	gmu_put("CM3_FW_INIT_RESULT", GMU_CM3_FW_INIT_RESULT, 0);
++	gmu_put("CM3_BOOT_CONFIG", GMU_CM3_BOOT_CONFIG, 2);
++	gmu_put("HFI_QTBL_ADDR", GMU_HFI_QTBL_ADDR, (uint32_t)gmu_hfi.address);
++	gmu_put("HFI_QTBL_INFO", GMU_HFI_QTBL_INFO, 1);
++	gmu_put("AHB_FENCE_RANGE_0", GMU_AHB_FENCE_RANGE_0, 1u << 31 | 0x32u << 18 | 0x8a0u);
++	gmu_put("CM3_CFG", GMU_CM3_CFG, 0x4052);
++	gmu_put("GENERAL_10 (chip id)", GMU_GENERAL_10, A730_GMU_CHIPID);
++	gmu_put("GENERAL_8 (log)", GMU_GENERAL_8, ((uint32_t)gmu_log.address & 0xfffff000u) | ((gmu_log.size / 4096 - 1) & 0xff));
++	for (int i = 0; i < 4; i++) {
++		put(gpu_regs, "GBIF_QSB_SIDE", 4 * (GPU_GBIF_QSB_SIDE0 + i), 0x00071620);
++	}
++	gmu_put("SYS_BUS_CONFIG", GMU_SYS_BUS_CONFIG, 1);
++	gmu_put("ICACHE_CONFIG", GMU_ICACHE_CONFIG, 1);
++	gmu_put("DCACHE_CONFIG", GMU_DCACHE_CONFIG, 1);
++
++	/* a6xx_gmu_start */
++	ver = rd(gmu + GMU_REG(GMU_CM3_DTCM_START) + 4 * 0xff8);
++	if (ver <= 0x20010004) {
++		mask = 0xffffffff;
++		want = 0xbabeface;
++	} else {
++		mask = 0x1ff;
++		want = 0x100;
++	}
++	printf("LIUQIN ADRENO: 15 firmware version word %#x: waiting for init result %#x (mask %#x)\n", ver, want, mask);
++	hfi_table_init();
++	announce("release the GMU CM3 from reset: its firmware starts");
++	gmu_put("CM3_SYSRESET", GMU_CM3_SYSRESET, 1);
++	gmu_put("GENERAL_9 (log wptr)", GMU_GENERAL_9, 0);
++	gmu_put("CM3_SYSRESET", GMU_CM3_SYSRESET, 0);
++	if (!wait_for(gmu + GMU_REG(GMU_CM3_FW_INIT_RESULT), mask, want, 100)) {
++		printf("LIUQIN ADRENO: 15 stop: GMU firmware did not report init (FW_INIT_RESULT %#x)\n",
++		    rd(gmu + GMU_REG(GMU_CM3_FW_INIT_RESULT)));
++		space_faulted(&gmu_space);
++		return false;
++	}
++	gmu_started = true;
++	printf("LIUQIN ADRENO: 15 GMU FIRMWARE RUNS: FW_INIT_RESULT %#x, CORE_FW_VERSION %#x\n",
++	    rd(gmu + GMU_REG(GMU_CM3_FW_INIT_RESULT)), rd(gmu + GMU_REG(GMU_CORE_FW_VERSION)));
++	return !space_faulted(&gmu_space);
++}
++
++static bool
++step_hfi_start(void)
++{
++	if (!gmu_started) {
++		printf("LIUQIN ADRENO: 16 stop: the GMU does not run (step 15)\n");
++		return false;
++	}
++	announce("start the HFI queues");
++	gmu_put("HFI_CTRL_INIT", GMU_HFI_CTRL_INIT, 1);
++	if (!wait_for(gmu + GMU_REG(GMU_HFI_CTRL_STATUS), 1, 1, 100)) {
++		printf("LIUQIN ADRENO: 16 stop: HFI queues do not start (status %#x)\n",
++		    rd(gmu + GMU_REG(GMU_HFI_CTRL_STATUS)));
++		return false;
++	}
++	gmu_put("AO_AHB_FENCE_CTRL (allow)", GMU_AO_AHB_FENCE_CTRL, 0);
++	printf("LIUQIN ADRENO: 16 HFI QUEUES STARTED (status %#x)\n", rd(gmu + GMU_REG(GMU_HFI_CTRL_STATUS)));
++	return !space_faulted(&gmu_space);
++}
++
++
++/* ---- step 17: HFI messages (Linux a6xx_hfi.c, a6xx_gmu.c rpmh votes) ---- */
++
++#define GMU_HOST2GMU_INTR_SET   0x1f994
++#define GMU_GMU2HOST_INTR_CLR   0x1f991
++#define GMU_GMU2HOST_INTR_INFO  0x1f992
++#define HFI_MSG_PERF_TABLE      4
++#define HFI_MSG_BW_TABLE        3
++#define HFI_MSG_START           10
++#define HFI_MSG_CORE_FW_START   14
++#define HFI_F2H_MSG_ERROR       100
++
++#define CMD_DB_PHYS             0x80860000UL
++#define CMD_DB_SIZE             0x20000u
++#define CMD_DB_HEADER           (4 + 4 + 8 * 16 + 4 + 4)
++
++static vm_offset_t cmd_db;
++static uint32_t hfi_seq;
++
++static uint32_t
++db32(uint32_t off)
++{
++	return off + 4 <= CMD_DB_SIZE ? rd(cmd_db + off) : 0;
++}
++
++/* cmd-db entry: address, and (optionally) its aux data copied out as bytes. */
++static bool
++cmd_db_find(const char *name, uint32_t *address, uint8_t *aux, uint32_t *aux_len)
++{
++	uint32_t key[2] = { 0, 0 };
++
++	for (unsigned i = 0; i < 8 && name[i]; i++) {
++		key[i / 4] |= (uint32_t)(uint8_t)name[i] << (8 * (i % 4));
++	}
++	for (unsigned sl = 0; sl < 8; sl++) {
++		uint32_t h = 8 + 16 * sl, w0 = db32(h), w1 = db32(h + 4);
++		uint32_t entries = CMD_DB_HEADER + (w0 >> 16), data = CMD_DB_HEADER + (w1 & 0xffff), count = w1 >> 16;
++		if ((w0 & 0xffff) == 0 || count > 1024) {
++			continue;
++		}
++		for (uint32_t j = 0; j < count; j++) {
++			uint32_t e = entries + 24 * j;
++			if (db32(e) != key[0] || db32(e + 4) != key[1]) {
++				continue;
++			}
++			*address = db32(e + 16);
++			if (aux) {
++				uint32_t lo = db32(e + 20), len = lo & 0xffff, off = data + (lo >> 16);
++				len = MIN(len, *aux_len);
++				for (uint32_t b = 0; b < len; b++) {
++					aux[b] = (uint8_t)(db32((off + b) & ~3u) >> (8 * ((off + b) & 3)));
++				}
++				*aux_len = len;
++			}
++			return true;
++		}
++	}
++	return false;
++}
++
++/* a6xx_gmu_rpmh_arc_votes_init for one frequency level */
++static uint32_t
++arc_vote(const uint16_t *pri, uint32_t pn, const uint16_t *sec, uint32_t sn, uint32_t level)
++{
++	uint32_t pindex = 0, sindex = 0, j;
++
++	for (j = 0; j < pn; j++) {
++		if (pri[j] >= level) {
++			pindex = j;
++			break;
++		}
++	}
++	if (j == pn) {
++		return 0;
++	}
++	for (j = 0; j < sn; j++) {
++		if (sec[j] >= level) {
++			sindex = j;
++			break;
++		} else if (sec[j]) {
++			sindex = j;
++		}
++	}
++	return ((uint32_t)(pri[pindex] & 0xffff) << 16) | (sindex << 8) | pindex;
++}
++
++/* Write one message into the command queue, ring, and wait for its ack in the response queue. */
++static bool
++hfi_send(const char *what, uint32_t id, uint32_t *msg, uint32_t bytes)
++{
++	struct hfi_queue_header *q = (struct hfi_queue_header *)(gmu_hfi.memory + sizeof(struct hfi_table_header));
++	uint32_t *cmd = (uint32_t *)(gmu_hfi.memory + 4096), *rsp = (uint32_t *)(gmu_hfi.memory + 8192);
++	uint32_t dwords = bytes >> 2, seq = (++hfi_seq) % 0xfff, index;
++
++	msg[0] = seq << 20 | 0u << 16 | dwords << 8 | id;
++	to_memory((vm_offset_t)q, 3 * sizeof(*q));
++	index = q[0].write_index;
++	for (uint32_t i = 0; i < dwords; i++) {
++		cmd[index] = msg[i];
++		index = (index + 1) % q[0].size;
++	}
++	for (; index % 4; index = (index + 1) % q[0].size) {
++		cmd[index] = 0xfafafafa;
++	}
++	to_memory((vm_offset_t)cmd, 4096);
++	q[0].write_index = index;
++	to_memory((vm_offset_t)q, 3 * sizeof(*q));
++	printf("LIUQIN ADRENO: 17 HFI send %s (id %u, %u dwords, seq %u)\n", what, id, dwords, seq);
++	wr(gmu + GMU_REG(GMU_HOST2GMU_INTR_SET), 1);
++	for (int tries = 0; tries < 3; tries++) {
++		if (!wait_for(gmu + GMU_REG(GMU_GMU2HOST_INTR_INFO), 1, 1, 1000)) {
++			printf("LIUQIN ADRENO: 17 stop: no HFI response to %s (INTR_INFO %#x)\n", what,
++			    rd(gmu + GMU_REG(GMU_GMU2HOST_INTR_INFO)));
++			return false;
++		}
++		wr(gmu + GMU_REG(GMU_GMU2HOST_INTR_CLR), 1);
++		to_memory((vm_offset_t)q, 3 * sizeof(*q));
++		to_memory((vm_offset_t)rsp, 4096);
++		while (q[1].read_index != q[1].write_index) {
++			uint32_t r = q[1].read_index, hdr = rsp[r], n = (hdr >> 8) & 0xff, words[8] = { 0 };
++			for (uint32_t i = 0; i < n; i++) {
++				if (i < 8) {
++					words[i] = rsp[r];
++				}
++				r = (r + 1) % q[1].size;
++			}
++			r = ((r + 3) & ~3u) % q[1].size;
++			q[1].read_index = r;
++			to_memory((vm_offset_t)q, 3 * sizeof(*q));
++			if ((hdr & 0xff) == HFI_F2H_MSG_ERROR) {
++				printf("LIUQIN ADRENO: 17 GMU firmware error %u\n", words[1]);
++				continue;
++			}
++			if (((words[1] >> 20) & 0xfff) != seq) {
++				continue;
++			}
++			printf("LIUQIN ADRENO: 17 HFI %s ack, error %u\n", what, words[2]);
++			return words[2] == 0;
++		}
++	}
++	printf("LIUQIN ADRENO: 17 stop: no ack for %s\n", what);
++	return false;
++}
++
++/* sm8450.dtsi gpu_opp_table (ascending) and the GMU's OPPs; RPMh corner levels */
++static const uint32_t gpu_khz[] = { 0, 220000, 285000, 317000, 350000, 421000, 492000, 545000, 599000, 640000,
++	                            734000, 791000, 818000 };
++static const uint16_t gpu_level[] = { 0, 56, 56, 64, 64, 80, 128, 144, 192, 224, 256, 320, 384 };
++static const uint32_t gmu_khz[] = { 0, 200000, 500000 };
++static const uint16_t gmu_level[] = { 0, 64, 128 };
++
++static bool
++step_hfi_messages(void)
++{
++	static uint16_t gfx[16], mx[16], cx[16];
++	uint32_t gfx_n = sizeof(gfx), mx_n = sizeof(mx), cx_n = sizeof(cx), a;
++	static uint32_t perf[3 + 16 * 3 + 4 * 2], bw[6 + 6 + 12 + 8 + 16 * 8];
++
++	if (!gmu_started) {
++		printf("LIUQIN ADRENO: 17 stop: the GMU does not run\n");
++		return false;
++	}
++	cmd_db = ml_io_map(CMD_DB_PHYS, CMD_DB_SIZE);
++	if (!cmd_db || db32(4) != 0x0c0330db ||
++	    !cmd_db_find("gfx.lvl", &a, (uint8_t *)gfx, &gfx_n) || !cmd_db_find("mx.lvl", &a, (uint8_t *)mx, &mx_n) ||
++	    !cmd_db_find("cx.lvl", &a, (uint8_t *)cx, &cx_n)) {
++		printf("LIUQIN ADRENO: 17 stop: cmd-db arc levels not found\n");
++		return false;
++	}
++	gfx_n /= 2;
++	mx_n /= 2;
++	cx_n /= 2;
++	printf("LIUQIN ADRENO: 17 arc levels: gfx %u, mx %u, cx %u (gfx top %u)\n", gfx_n, mx_n, cx_n,
++	    gfx_n ? gfx[gfx_n - 1] : 0);
++
++	/* perf table: header, num_gpu_levels, num_gmu_levels, gx {vote, acd, freq} x16, cx {vote, freq} x4 */
++	memset(perf, 0, sizeof(perf));
++	uint32_t ng = sizeof(gpu_khz) / sizeof(gpu_khz[0]), nc = sizeof(gmu_khz) / sizeof(gmu_khz[0]);
++	perf[1] = ng;
++	perf[2] = nc;
++	for (uint32_t i = 0; i < ng; i++) {
++		perf[3 + 3 * i] = arc_vote(gfx, gfx_n, mx, mx_n, gpu_level[i]);
++		perf[3 + 3 * i + 1] = 0xffffffff;
++		perf[3 + 3 * i + 2] = gpu_khz[i] / 1000;
++	}
++	for (uint32_t i = 0; i < nc; i++) {
++		perf[3 + 48 + 2 * i] = arc_vote(cx, cx_n, mx, mx_n, gmu_level[i]);
++		perf[3 + 48 + 2 * i + 1] = gmu_khz[i] / 1000;
++	}
++	printf("LIUQIN ADRENO: 17 GX vote top %#x, CX vote 200 MHz %#x\n", perf[3 + 3 * (ng - 1)], perf[3 + 48 + 2]);
++	if (!hfi_send("PERF_TABLE", HFI_MSG_PERF_TABLE, perf, sizeof(perf))) {
++		return false;
++	}
++
++	/* a730_build_bw_table */
++	static const uint32_t ddr[12][3] = {
++		{ 0x40000000, 0x40000000, 0x40000000 }, { 0x600002e8, 0x600003d0, 0x60000008 },
++		{ 0x6000068d, 0x6000089a, 0x60000008 }, { 0x600007f2, 0x60000a6e, 0x60000008 },
++		{ 0x600009e5, 0x60000cfd, 0x60000008 }, { 0x60000b29, 0x60000ea6, 0x60000008 },
++		{ 0x60001698, 0x60001da8, 0x60000008 }, { 0x600018d2, 0x60002093, 0x60000008 },
++		{ 0x60001e66, 0x600027e6, 0x60000008 }, { 0x600027c2, 0x6000342f, 0x60000008 },
++		{ 0x60002e71, 0x60003cf5, 0x60000008 }, { 0x600030ae, 0x60003fe5, 0x60000008 },
++	};
++	memset(bw, 0, sizeof(bw));
++	bw[1] = 12;                     /* bw_level_num */
++	bw[3] = 3;                      /* ddr_cmds_num */
++	bw[5] = 0x7;                    /* ddr_wait_bitmask */
++	uint32_t *ddr_addrs = &bw[6 + 6 + 12], *ddr_data = &bw[6 + 6 + 12 + 8];
++	if (!cmd_db_find("SH0", &ddr_addrs[0], NULL, NULL) || !cmd_db_find("MC0", &ddr_addrs[1], NULL, NULL) ||
++	    !cmd_db_find("ACV", &ddr_addrs[2], NULL, NULL)) {
++		printf("LIUQIN ADRENO: 17 stop: SH0/MC0/ACV not in cmd-db\n");
++		return false;
++	}
++	for (int i = 0; i < 12; i++) {
++		for (int j = 0; j < 3; j++) {
++			ddr_data[8 * i + j] = ddr[i][j];
++		}
++	}
++	printf("LIUQIN ADRENO: 17 BCM SH0 %#x MC0 %#x ACV %#x\n", ddr_addrs[0], ddr_addrs[1], ddr_addrs[2]);
++	if (!hfi_send("BW_TABLE", HFI_MSG_BW_TABLE, bw, sizeof(bw))) {
++		return false;
++	}
++	uint32_t one[1];
++	if (!hfi_send("CORE_FW_START", HFI_MSG_CORE_FW_START, one, sizeof(one)) ||
++	    !hfi_send("START", HFI_MSG_START, one, sizeof(one))) {
++		return false;
++	}
++	/* a6xx_gmu_resume after a6xx_hfi_start: interrupts, then the initial GX perf/bw vote (HFI 30) */
++	gmu_put("GMU2HOST_INTR_CLR", GMU_GMU2HOST_INTR_CLR, ~0u);
++	gmu_put("GMU2HOST_INTR_MASK", 0x1f993, ~1u);
++	uint32_t vote[4] = { 0, 1 /* blocking ack */, 1 /* 220 MHz */, 3 /* bw level 3 */ };
++	if (!hfi_send("GX_BW_PERF_VOTE", 30, vote, sizeof(vote))) {
++		return false;
++	}
++	printf("LIUQIN ADRENO: 17 GMU TAKES ITS TABLES AND IS STARTED\n");
++	return !space_faulted(&gmu_space);
++}
++
++
++/* ---- step 18: the 3D core powered (a6xx_gmu_set_oob GMU_OOB_GPU_SET, non-legacy bits) ---- */
++
++#define OOB_GPU_SET_REQUEST     30
++#define OOB_GPU_SET_ACK         31
++#define GPU_RBBM_STATUS         0x0210          /* dword, GPU space */
++
++static bool gx_on;
++
++static bool
++step_core_power(void)
++{
++	if (!gmu_started) {
++		printf("LIUQIN ADRENO: 18 stop: the GMU does not run\n");
++		return false;
++	}
++	announce("ask the GMU to power the 3D core (OOB GPU_SET)");
++	wr(gmu + GMU_REG(GMU_HOST2GMU_INTR_SET), 1u << OOB_GPU_SET_REQUEST);
++	bool acked = wait_for(gmu + GMU_REG(GMU_GMU2HOST_INTR_INFO), 1u << OOB_GPU_SET_ACK,
++	    1u << OOB_GPU_SET_ACK, 100);
++	wr(gmu + GMU_REG(GMU_GMU2HOST_INTR_CLR), 1u << OOB_GPU_SET_ACK);
++	uint32_t gx = rd(gpucc + GPUCC_GX_GDSCR);
++	printf("LIUQIN ADRENO: 18 OOB GPU_SET %s (INTR_INFO %#x), GX GDSC %#x (%s)\n", acked ? "acked" : "NOT ACKED",
++	    rd(gmu + GMU_REG(GMU_GMU2HOST_INTR_INFO)), gx, (gx & GDSC_PWR_ON) ? "powered" : "off");
++	if (!acked || !(gx & GDSC_PWR_ON)) {
++		space_faulted(&gmu_space);
++		return false;
++	}
++	gx_on = true;
++	printf("LIUQIN ADRENO: 18 3D CORE POWERED: RBBM_STATUS %#x\n", rd(gpu_regs + 4 * GPU_RBBM_STATUS));
++	return !space_faulted(&gmu_space);
++}
++
++
++/* ---- steps 19-22: the 3D core's memory, start, zap, first work (Linux a6xx_gpu.c) ---- */
++
++#define GPU_WORD(dw)            (4 * (vm_offset_t)(dw))
++#define PTE_UNPRIVILEGED        (1ull << 6)
++#define PTE_READ_ONLY           (1ull << 7)
++#define CORE_RING_ADDRESS       0x01000000u
++#define CORE_RING_SIZE          0x8000u
++#define CORE_SQE_ADDRESS        0x01100000u
++#define CORE_SCRATCH_ADDRESS    0x01200000u
++#define CORE_TARGET_ADDRESS     0x10000000u
++#define RING_WORDS              (CORE_RING_SIZE / 4)
++
++#define REG_GBIF_HALT           0x3c45
++#define REG_RBBM_GBIF_HALT      0x0016
++#define REG_RBBM_GBIF_CLIENT_QOS 0x0011
++#define REG_RBBM_SECVID_TSB_CNTL 0xf803
++#define REG_RBBM_SECVID_TSB_BASE 0xf800
++#define REG_RBBM_SECVID_TSB_SIZE 0xf802
++#define REG_UCHE_GBIF_GX_CONFIG 0x0e3a
++#define REG_RBBM_PERFCTR_BUSY   0x050b
++#define REG_UCHE_TRAP_BASE      0x0e09
++#define REG_UCHE_WRITE_THRU     0x0e07
++#define REG_UCHE_CACHE_WAYS     0x0e17
++#define REG_CP_AHB_CNTL         0x098d
++#define REG_RBBM_PERFCTR_CNTL   0x0500
++#define REG_RBBM_HANG_INT_CNTL  0x001f
++#define REG_UCHE_CLIENT_PF      0x0e19
++#define REG_UCHE_CMDQ_CONFIG    0x0e3c
++#define REG_CP_APRIV_CNTL       0x0844
++#define REG_CP_BV_APRIV_CNTL    0x0ad0
++#define REG_CP_LPAC_APRIV_CNTL  0x0b31
++#define REG_RB_CMP_DBG_ECO_CNTL 0x8e28
++#define REG_CP_SQE_INSTR_BASE   0x0830
++#define REG_CP_RB_BASE          0x0800
++#define REG_CP_RB_CNTL          0x0802
++#define REG_CP_RB_RPTR_ADDR     0x0804
++#define REG_CP_BV_RB_RPTR_ADDR  0x0a98
++#define REG_CP_SQE_CNTL         0x0808
++#define REG_CP_RB_RPTR          0x0806
++#define REG_CP_RB_WPTR          0x0807
++#define REG_RBBM_STATUS         0x0210
++#define REG_RBBM_INT_0_STATUS   0x0201
++#define REG_CP_HW_FAULT         0x0821
++#define REG_CP_INTERRUPT_STATUS 0x0823
++#define REG_RB_NC_MODE_CNTL     0x8e08
++#define REG_TPL1_NC_MODE_CNTL   0xb604
++#define REG_SP_NC_MODE_CNTL     0xae02
++#define REG_UCHE_MODE_CNTL      0x0e01
++#define REG_RBBM_NC_MODE_CNTL   0x0534
++#define REG_GRAS_NC_MODE_CNTL   0x8602
++#define UCHE_TRAP_BASE_VALUE    0x0001fffffffff000ull
++#define CP_RB_CNTL_VALUE        (12u | 2u << 8 | 1u << 27)      /* 32K ring, 32-byte blocks, no rptr copy */
++
++#define CP_NOP                  0x10
++#define CP_THREAD_CONTROL       0x17
++#define CP_WAIT_FOR_IDLE        0x26
++#define CP_BLIT                 0x2c
++#define CP_MEM_WRITE            0x3d
++#define CP_EVENT_WRITE7         0x46
++#define CP_ME_INIT              0x48
++#define CP_SET_SECURE_MODE      0x66
++#define EVENT_CCU_FLUSH_COLOR   0x1d
++#define EVENT_CACHE_CLEAN       0x31
++
++#define SCM_PAS_MEM_SETUP       SCM_CALL(2, 2)
++#define SCM_PAS_SHUTDOWN        SCM_CALL(2, 6)
++#define SCM_THREE_VALUES        3
++#define ZAP_MEMORY              0x8b91a000ull   /* the phone's DT: gpu_micro_code_region@8b91a000, 0x2000 */
++#define ZAP_MEMORY_SIZE         0x2000u
++
++static struct gpu_space core_space = { .name = "the 3D core" };
++static struct gpu_block core_ring, core_sqe, core_scratch, core_target;
++static bool core_space_on, core_runs, core_unsecure;
++static uint32_t ring_at, ring_sent;
++
++static void
++gpu_put(const char *name, uint32_t dw, uint32_t value)
++{
++	put(gpu_regs, name, GPU_WORD(dw), value);
++}
++
++static void
++gpu_put64(const char *name, uint32_t dw, uint64_t value)
++{
++	gpu_put(name, dw, (uint32_t)value);
++	gpu_put(name, dw + 1, (uint32_t)(value >> 32));
++}
++
++static uint32_t
++odd_parity(uint32_t v)
++{
++	return (0x9669 >> (0xf & (v ^ v >> 4 ^ v >> 8 ^ v >> 12 ^ v >> 16 ^ v >> 20 ^ v >> 24 ^ v >> 28))) & 1;
++}
++
++static void
++ring(uint32_t word)
++{
++	((uint32_t *)core_ring.memory)[ring_at] = word;
++	ring_at = (ring_at + 1) % RING_WORDS;
++}
++
++/* PM4 type 7 packet header */
++static void
++ring_command(uint32_t opcode, uint32_t words)
++{
++	ring(7u << 28 | words | odd_parity(words) << 15 | opcode << 16 | odd_parity(opcode) << 23);
++}
++
++/* PM4 type 4 packet: one register */
++static void
++ring_register(uint32_t number, uint32_t value)
++{
++	ring(4u << 28 | 1 | odd_parity(1) << 7 | number << 8 | odd_parity(number) << 27);
++	ring(value);
++}
++
++static bool
++ring_run(const char *what)
++{
++	uint32_t taken = ~0u, status = ~0u;
++
++	if (ring_at >= ring_sent) {
++		to_memory(core_ring.memory + 4 * ring_sent, 4 * (ring_at - ring_sent));
++	} else {
++		to_memory(core_ring.memory + 4 * ring_sent, 4 * (RING_WORDS - ring_sent));
++		to_memory(core_ring.memory, 4 * ring_at);
++	}
++	ring_sent = ring_at;
++	printf("LIUQIN ADRENO: %u the 3D core is to %s (ring to word %u)\n", step, what, ring_at);
++	delay(pause_ms * 1000);
++	wr(gpu_regs + GPU_WORD(REG_CP_RB_WPTR), ring_at);
++	for (int i = 0; i < 20000 && (taken != ring_at || (status & ~1u)); i++) {
++		delay(100);
++		taken = rd(gpu_regs + GPU_WORD(REG_CP_RB_RPTR));
++		status = rd(gpu_regs + GPU_WORD(REG_RBBM_STATUS));
++	}
++	if (taken == ring_at && !(status & ~1u) && rd(gpu_regs + GPU_WORD(REG_CP_HW_FAULT)) == 0 &&
++	    !space_faulted(&core_space)) {
++		printf("LIUQIN ADRENO: %u done (rptr %u, RBBM_STATUS %#x)\n", step, taken, status);
++		return true;
++	}
++	printf("LIUQIN ADRENO: %u stop: the 3D core does not get through: rptr %u of %u, RBBM_STATUS %#x, INT_0 %#x, "
++	    "CP_HW_FAULT %#x, CP_INT %#x\n", step, taken, ring_at, status, rd(gpu_regs + GPU_WORD(REG_RBBM_INT_0_STATUS)),
++	    rd(gpu_regs + GPU_WORD(REG_CP_HW_FAULT)), rd(gpu_regs + GPU_WORD(REG_CP_INTERRUPT_STATUS)));
++	space_faulted(&core_space);
++	return false;
++}
++
++/* One more stream through a context that is already on. */
++static bool
++space_stream(struct gpu_space *space, uint32_t match, uint32_t stream)
++{
++	put(smmu, "S2CR", SMMU_S2CR(match), space->context);
++	put(smmu, "SMR", SMMU_SMR(match), SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | stream);
++	return rd(smmu + SMMU_SMR(match)) == (SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | stream) &&
++	       (rd(smmu + SMMU_S2CR(match)) & 0x300ff) == space->context;
++}
++
++static bool
++core_block(struct gpu_block *b, const char *name, uint64_t address, uint32_t size, uint64_t extra)
++{
++	b->address = address;
++	b->size = (size + 4095) & ~4095u;
++	if (kmem_alloc(kernel_map, &b->memory, round_page(b->size), KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("LIUQIN ADRENO: %u no memory for %s\n", step, name);
++		return false;
++	}
++	for (uint32_t off = 0; off < b->size; off += 4096) {
++		if (!space_map(&core_space, address + off, kvtophys(b->memory + off), PTE_GMU | PTE_UNPRIVILEGED | extra)) {
++			return false;
++		}
++	}
++	to_memory(b->memory, b->size);
++	printf("LIUQIN ADRENO: %u %s: the 3D core sees %#llx..%#llx\n", step, name, address, address + b->size - 1);
++	return true;
++}
++
++static bool
++step_core_space(void)
++{
++	const uint8_t *sqe;
++	uint32_t size = 0, match1 = ~0u;
++
++	if (!gx_on) {
++		printf("LIUQIN ADRENO: 19 stop: the 3D core has no power (step 18)\n");
++		return false;
++	}
++	sqe = liuqin_fw_get("a730_sqe.fw", &size);
++	if (sqe == NULL || size < 8 || size > 0x40000) {
++		printf("LIUQIN ADRENO: 19 stop: no a730_sqe.fw in the firmware area\n");
++		return false;
++	}
++	announce("make the 3D core's ring, microcode and scratch memory");
++	if (!core_block(&core_ring, "ring", CORE_RING_ADDRESS, CORE_RING_SIZE, 0) ||
++	    !core_block(&core_sqe, "sqe", CORE_SQE_ADDRESS, size - 4, PTE_READ_ONLY) ||
++	    !core_block(&core_scratch, "scratch", CORE_SCRATCH_ADDRESS, 4096, 0)) {
++		return false;
++	}
++	memcpy((void *)core_sqe.memory, sqe + 4, size - 4);     /* the file's first word is not microcode */
++	to_memory(core_sqe.memory, core_sqe.size);
++	if (!space_pick(&core_space, 0)) {
++		return false;
++	}
++	for (uint32_t i = 0; i < smmu_matches && i < 128; i++) {
++		if (i != core_space.match && i != gmu_space.match && !(rd(smmu + SMMU_SMR(i)) >> 31)) {
++			match1 = i;
++			break;
++		}
++	}
++	announce("route the 3D core's streams 0 and 1 through an SMMU context with these tables");
++	core_space_on = space_on(&core_space, 0);
++	if (!core_space_on || match1 == ~0u || !space_stream(&core_space, match1, 1)) {
++		printf("LIUQIN ADRENO: 19 stop: streams 0/1 not routed (second entry %d)\n", (int)match1);
++		return false;
++	}
++	return !space_faulted(&core_space);
++}
++
++static bool
++step_core_start(void)
++{
++	if (!core_space_on) {
++		printf("LIUQIN ADRENO: 20 stop: no 3D core memory (step 19)\n");
++		return false;
++	}
++	announce("write the 3D core's registers (Linux hw_init, A730)");
++	gpu_put("GBIF_HALT", REG_GBIF_HALT, 0);
++	gpu_put("RBBM_GBIF_HALT", REG_RBBM_GBIF_HALT, 0);
++	gpu_put("RBBM_SECVID_TSB_CNTL", REG_RBBM_SECVID_TSB_CNTL, 0);
++	gpu_put64("RBBM_SECVID_TSB_TRUSTED_BASE", REG_RBBM_SECVID_TSB_BASE, 0);
++	gpu_put("RBBM_SECVID_TSB_TRUSTED_SIZE", REG_RBBM_SECVID_TSB_SIZE, 0);
++	gpu_put("RBBM_GBIF_CLIENT_QOS_CNTL", REG_RBBM_GBIF_CLIENT_QOS, 0x2120212);
++	gpu_put("UCHE_GBIF_GX_CONFIG", REG_UCHE_GBIF_GX_CONFIG, 0x10240e0);
++	gpu_put("RBBM_PERFCTR_GPU_BUSY_MASKED", REG_RBBM_PERFCTR_BUSY, 0xffffffff);
++	gpu_put64("UCHE_TRAP_BASE", REG_UCHE_TRAP_BASE, UCHE_TRAP_BASE_VALUE);
++	gpu_put64("UCHE_WRITE_THRU_BASE", REG_UCHE_WRITE_THRU, UCHE_TRAP_BASE_VALUE);
++	gpu_put("UCHE_CACHE_WAYS", REG_UCHE_CACHE_WAYS, 1u << 23);
++	gpu_put("CP_AHB_CNTL", REG_CP_AHB_CNTL, 1);
++	gpu_put("RBBM_PERFCTR_CNTL", REG_RBBM_PERFCTR_CNTL, 1);
++	/* a6xx_set_ubwc_config for A730: highest bank bit 16 (hbb_lo 3), ubwc 4.0, macrotile mode 1 */
++	gpu_put("RB_NC_MODE_CNTL", REG_RB_NC_MODE_CNTL, 1u << 11 | 1u << 4 | 3u << 1);
++	gpu_put("TPL1_NC_MODE_CNTL", REG_TPL1_NC_MODE_CNTL, 3u << 1);
++	gpu_put("SP_NC_MODE_CNTL", REG_SP_NC_MODE_CNTL, 2u << 4 | 3u << 1);
++	gpu_put("GRAS_NC_MODE_CNTL", REG_GRAS_NC_MODE_CNTL, 3u << 5);
++	gpu_put("UCHE_MODE_CNTL", REG_UCHE_MODE_CNTL, 3u << 21);
++	gpu_put("RBBM_NC_MODE_CNTL", REG_RBBM_NC_MODE_CNTL, 1);
++	gpu_put("RBBM_INTERFACE_HANG_INT_CNTL", REG_RBBM_HANG_INT_CNTL, 1u << 30 | 0xcfffff);
++	gpu_put("UCHE_CLIENT_PF", REG_UCHE_CLIENT_PF, 1u << 7 | 1);
++	gpu_put("UCHE_CMDQ_CONFIG", REG_UCHE_CMDQ_CONFIG, 6u << 16 | 6u << 12 | 9u << 8 | 1u << 3 | 1u << 2 | 2u);
++	gpu_put("CP_APRIV_CNTL", REG_CP_APRIV_CNTL, 0x6f);
++	gpu_put("CP_BV_APRIV_CNTL", REG_CP_BV_APRIV_CNTL, 0xf);
++	gpu_put("CP_LPAC_APRIV_CNTL", REG_CP_LPAC_APRIV_CNTL, 0xf);
++	gpu_put("RB_CMP_DBG_ECO_CNTL", REG_RB_CMP_DBG_ECO_CNTL,
++	    rd(gpu_regs + GPU_WORD(REG_RB_CMP_DBG_ECO_CNTL)) | 1u << 11);
++	gpu_put64("CP_SQE_INSTR_BASE", REG_CP_SQE_INSTR_BASE, CORE_SQE_ADDRESS);
++	gpu_put64("CP_RB_BASE", REG_CP_RB_BASE, CORE_RING_ADDRESS);
++	gpu_put("CP_RB_CNTL", REG_CP_RB_CNTL, CP_RB_CNTL_VALUE);
++	gpu_put64("CP_RB_RPTR_ADDR", REG_CP_RB_RPTR_ADDR, CORE_SCRATCH_ADDRESS + 0x80);
++	gpu_put64("CP_BV_RB_RPTR_ADDR", REG_CP_BV_RB_RPTR_ADDR, CORE_SCRATCH_ADDRESS + 0x100);
++
++	announce("start the 3D core's command processor (SQE)");
++	core_runs = true;
++	gpu_put("CP_SQE_CNTL", REG_CP_SQE_CNTL, 1);
++	delay(20000);
++	printf("LIUQIN ADRENO: 20 alive after the SQE start: RBBM_STATUS %#x, CP_HW_FAULT %#x, rptr %u\n",
++	    rd(gpu_regs + GPU_WORD(REG_RBBM_STATUS)), rd(gpu_regs + GPU_WORD(REG_CP_HW_FAULT)),
++	    rd(gpu_regs + GPU_WORD(REG_CP_RB_RPTR)));
++	if (space_faulted(&core_space)) {
++		return false;
++	}
++	/* a7xx_cp_init, without the power-up register list */
++	ring_command(CP_THREAD_CONTROL, 1);
++	ring(1u << 27);
++	ring_command(CP_ME_INIT, 7);
++	ring(1u << 0 | 1u << 1 | 1u << 3 | 1u << 6);
++	ring(0x00000003);
++	ring(0x20000000);
++	ring(0x00000002);
++	ring(0);
++	ring(0);
++	ring(0);
++	if (!ring_run("initialize its command processor (CP_ME_INIT)")) {
++		return false;
++	}
++	printf("LIUQIN ADRENO: 20 THE 3D CORE TAKES COMMANDS\n");
++	return true;
++}
++
++static bool
++step_zap_and_secure(void)
++{
++	const uint8_t *mdt, *seg;
++	uint32_t mdt_size = 0, seg_size = 0;
++	uint64_t answer = ~0ull;
++	vm_offset_t page = 0;
++	volatile uint8_t *mem;
++
++	if (!core_runs) {
++		printf("LIUQIN ADRENO: 21 stop: the command processor does not run (step 20)\n");
++		return false;
++	}
++	/*
++	 * qcom_mdt_pas_init / qcom_mdt_load: the PT_LOAD segments go at (p_paddr - lowest p_paddr) in the
++	 * reserved memory, each from its own .bNN file; TrustZone is told the span from the lowest
++	 * address to the highest end rounded up to 4K. On the A730 zap that is segment 1 (.b01).
++	 */
++	uint32_t min_pa = ~0u, max_pa = 0, nseg;
++	mdt = liuqin_fw_get("a730_zap.mdt", &mdt_size);
++	if (mdt == NULL || mdt_size < 52 || mdt_size > PAGE_SIZE || memcmp(mdt, "\177ELF\1", 5) != 0) {
++		printf("LIUQIN ADRENO: 21 stop: no usable a730_zap.mdt\n");
++		return false;
++	}
++	uint32_t phoff;
++	memcpy(&phoff, mdt + 28, 4);
++	nseg = (uint32_t)(mdt[44] | mdt[45] << 8);
++	if (phoff + 32 * nseg > mdt_size || nseg > 16) {
++		printf("LIUQIN ADRENO: 21 stop: bad program header table\n");
++		return false;
++	}
++	for (uint32_t i = 0; i < nseg; i++) {
++		uint32_t ph[8];
++		memcpy(ph, mdt + phoff + 32 * i, sizeof(ph));
++		bool hash = ((ph[6] >> 24) & 7) == 2;
++		if (ph[0] != 1 || hash || ph[5] == 0) {
++			continue;
++		}
++		min_pa = MIN(min_pa, ph[3]);
++		max_pa = MAX(max_pa, (ph[3] + ph[5] + 0xfffu) & ~0xfffu);
++	}
++	if (min_pa == ~0u || max_pa - min_pa > ZAP_MEMORY_SIZE) {
++		printf("LIUQIN ADRENO: 21 stop: zap load range %#x..%#x does not fit\n", min_pa, max_pa);
++		return false;
++	}
++	printf("LIUQIN ADRENO: 21 zap: %u segments, load range %#x..%#x\n", nseg, min_pa, max_pa);
++	announce("ask TrustZone to drop a zap shader an earlier run may have left");
++	scm("PAS shutdown (zap)", SCM_64 | SCM_SIP | SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_GPU, 0, 0, &answer);
++	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return false;
++	}
++	memcpy((void *)page, mdt, mdt_size);
++	clean_dcache((vm_offset_t)page, PAGE_SIZE, FALSE);
++	answer = ~0ull;
++	if (scm("PAS init image (zap)", SCM_64 | SCM_SIP | SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_GPU,
++	    kvtophys(page), 0, &answer) != 0 || answer != 0) {
++		printf("LIUQIN ADRENO: 21 stop: TrustZone refuses the zap header (%#llx)\n", answer);
++		return false;
++	}
++	answer = ~0ull;
++	if (scm("PAS mem setup (zap)", SCM_64 | SCM_SIP | SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_GPU, ZAP_MEMORY,
++	    max_pa - min_pa, &answer) != 0 || answer != 0) {
++		printf("LIUQIN ADRENO: 21 stop: TrustZone refuses the zap memory (%#llx)\n", answer);
++		return false;
++	}
++	announce("write the zap PT_LOAD segments into 0x8b91a000 and ask TrustZone to authenticate and run it");
++	mem = (volatile uint8_t *)ml_io_map_wcomb(ZAP_MEMORY, ZAP_MEMORY_SIZE);
++	for (uint32_t i = 0; i < ZAP_MEMORY_SIZE; i++) {
++		mem[i] = 0;
++	}
++	for (uint32_t i = 0; i < nseg; i++) {
++		uint32_t ph[8];
++		char name[24];
++		memcpy(ph, mdt + phoff + 32 * i, sizeof(ph));
++		if (ph[0] != 1 || ((ph[6] >> 24) & 7) == 2 || ph[4] == 0) {
++			continue;
++		}
++		snprintf(name, sizeof(name), "a730_zap.b%02u", i);
++		seg = liuqin_fw_get(name, &seg_size);
++		if (seg == NULL || seg_size < ph[4] || ph[3] - min_pa + ph[4] > ZAP_MEMORY_SIZE) {
++			printf("LIUQIN ADRENO: 21 stop: segment %u (%s) missing or too large\n", i, name);
++			return false;
++		}
++		for (uint32_t b = 0; b < ph[4]; b++) {
++			mem[ph[3] - min_pa + b] = seg[b];
++		}
++		printf("LIUQIN ADRENO: 21 zap segment %u (%s): %#x bytes at +%#x\n", i, name, ph[4], ph[3] - min_pa);
++	}
++	__asm__ volatile ("dsb sy");
++	answer = ~0ull;
++	if (scm("PAS auth and reset (zap)", SCM_64 | SCM_SIP | SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, PAS_GPU, 0, 0,
++	    &answer) != 0 || answer != 0) {
++		printf("LIUQIN ADRENO: 21 stop: TrustZone does not authenticate the zap shader (%#llx)\n", answer);
++		return false;
++	}
++	printf("LIUQIN ADRENO: 21 TRUSTZONE RUNS THE ZAP SHADER\n");
++	ring_command(CP_SET_SECURE_MODE, 1);
++	ring(0);
++	if (!ring_run("leave secure mode")) {
++		return false;
++	}
++	core_unsecure = true;
++	ring_command(CP_MEM_WRITE, 3);
++	ring(CORE_SCRATCH_ADDRESS);
++	ring(0);
++	ring(0x600dc0de);
++	if (!ring_run("write a word into our page")) {
++		return false;
++	}
++	to_memory(core_scratch.memory, 64);
++	uint32_t word = *(volatile uint32_t *)core_scratch.memory;
++	printf("LIUQIN ADRENO: 21 scratch reads %#x: %s\n", word,
++	    word == 0x600dc0de ? "THE 3D CORE WRITES OUR MEMORY ON COMMAND" : "not what it was told");
++	return word == 0x600dc0de;
++}
++
++/* The 2D engine fills rectangles (Mesa fd6_clear_surface), sysmem, BGRA linear. */
++#define REG_GRAS_2D_BLIT_CNTL   0x8400
++#define REG_GRAS_2D_DST_TL      0x8405
++#define REG_GRAS_2D_DST_BR      0x8406
++#define REG_RB_2D_BLIT_CNTL     0x8c00
++#define REG_RB_2D_PIXEL_CNTL    0x8c01
++#define REG_RB_2D_DST_INFO      0x8c17
++#define REG_RB_2D_DST           0x8c18
++#define REG_RB_2D_DST_PITCH     0x8c1a
++#define REG_RB_2D_SRC_SOLID_C0  0x8c2c
++#define REG_SP_2D_DST_FORMAT    0xacc0
++#define FORMAT_8888             0x30
++#define BLIT_SOLID_8888         (1u << 7 | FORMAT_8888 << 8 | 0xfu << 20 | 0x10u << 24)
++#define DST_BGRA_LINEAR         (FORMAT_8888 | 1u << 10)
++#define TARGET_WIDTH            1080
++#define TARGET_HEIGHT           2400
++#define TARGET_ROW              4352
++
++static void
++ring_fill(uint32_t top, uint32_t bottom, uint32_t r, uint32_t g, uint32_t b)
++{
++	ring_register(REG_GRAS_2D_DST_TL, top << 16);
++	ring_register(REG_GRAS_2D_DST_BR, (TARGET_WIDTH - 1) | (bottom - 1) << 16);
++	ring_register(REG_RB_2D_SRC_SOLID_C0, r);
++	ring_register(REG_RB_2D_SRC_SOLID_C0 + 1, g);
++	ring_register(REG_RB_2D_SRC_SOLID_C0 + 2, b);
++	ring_register(REG_RB_2D_SRC_SOLID_C0 + 3, 255);
++	ring_register(REG_RB_2D_BLIT_CNTL, BLIT_SOLID_8888);
++	ring_register(REG_GRAS_2D_BLIT_CNTL, BLIT_SOLID_8888);
++	ring_register(REG_SP_2D_DST_FORMAT, 1 | FORMAT_8888 << 3 | 0xfu << 12);
++	ring_register(REG_RB_2D_PIXEL_CNTL, 0);
++	ring_register(REG_RB_2D_DST_INFO, DST_BGRA_LINEAR);
++	ring_register(REG_RB_2D_DST, CORE_TARGET_ADDRESS);
++	ring_register(REG_RB_2D_DST + 1, 0);
++	ring_register(REG_RB_2D_DST_PITCH, TARGET_ROW >> 6);
++	ring_command(CP_WAIT_FOR_IDLE, 0);
++	ring_command(CP_BLIT, 1);
++	ring(3);
++}
++
++static bool
++step_frame(void)
++{
++	if (!core_unsecure) {
++		printf("LIUQIN ADRENO: 22 stop: the 3D core is still secure (step 21)\n");
++		return false;
++	}
++	announce("make 10 MB for a picture and have the 2D engine fill three bands");
++	if (!core_block(&core_target, "picture", CORE_TARGET_ADDRESS, TARGET_ROW * TARGET_HEIGHT, 0)) {
++		return false;
++	}
++	for (uint32_t i = 0; i < core_space.table_count; i++) {
++		to_memory((vm_offset_t)core_space.tables[i].table, 4096);
++	}
++	ring_fill(0, 800, 255, 128, 0);
++	ring_fill(800, 1600, 255, 255, 255);
++	ring_fill(1600, TARGET_HEIGHT, 0, 128, 255);
++	ring_command(CP_EVENT_WRITE7, 1);
++	ring(EVENT_CCU_FLUSH_COLOR);
++	ring_command(CP_EVENT_WRITE7, 1);
++	ring(EVENT_CACHE_CLEAN);
++	ring_command(CP_WAIT_FOR_IDLE, 0);
++	if (!ring_run("fill a picture")) {
++		return false;
++	}
++	to_memory(core_target.memory, core_target.size);
++	const volatile uint8_t *px = (const volatile uint8_t *)core_target.memory;
++	uint32_t mid = 1200 * TARGET_ROW + 2160, last = 2399 * TARGET_ROW + 4316;
++	printf("LIUQIN ADRENO: 22 pixels (B G R A): top %02x %02x %02x %02x (want 00 80 ff ff), middle %02x %02x %02x %02x "
++	    "(want ff ff ff ff), bottom %02x %02x %02x %02x (want ff 80 00 ff)\n", px[0], px[1], px[2], px[3], px[mid],
++	    px[mid + 1], px[mid + 2], px[mid + 3], px[last], px[last + 1], px[last + 2], px[last + 3]);
++	bool ok = px[1] == 0x80 && px[2] == 0xff && px[mid] == 0xff && px[last] == 0xff && px[last + 2] == 0;
++	printf("LIUQIN ADRENO: 22 %s\n", ok ? "THE GPU DREW A PICTURE" : "the picture is not what was drawn");
++
++	/*
++	 * Show it: copy the top of the GPU picture into the boot framebuffer so
++	 * the panel itself proves the GPU -> memory -> scanout path.
++	 */
++	PE_Video video;
++	PE_current_console(&video);
++	if (ok && video.v_baseAddr && video.v_rowBytes >= 4 * TARGET_WIDTH && video.v_height) {
++		uint32_t rows = MIN(TARGET_HEIGHT, (uint32_t)video.v_height);
++		vm_offset_t fb = ml_io_map(video.v_baseAddr, (vm_size_t)rows * video.v_rowBytes);
++		if (fb) {
++			for (uint32_t y = 0; y < rows; y++) {
++				const uint8_t *src = (const uint8_t *)core_target.memory + (uint64_t)y * TARGET_ROW;
++				uint8_t *dst = (uint8_t *)fb + (uint64_t)y * video.v_rowBytes;
++				for (uint32_t x = 0; x < TARGET_WIDTH; x++) {
++					uint32_t v;
++					memcpy(&v, src + 4 * x, 4);
++					*(volatile uint32_t *)(dst + 4 * x) = v;
++				}
++			}
++			printf("LIUQIN ADRENO: 22 picture copied to the framebuffer (0x%llx, %u rows)\n",
++			    (uint64_t)video.v_baseAddr, rows);
++		}
++	}
++	return ok;
++}
++
++static bool (*const steps[])(void) = {
++	step_gcc, step_gpucc_read, step_gmu_read_if_on, step_cx_power, step_clocks, step_gmu_first_words,
++	step_rscc, step_smmu, step_smmu_context, step_gmu_memory, step_trustzone,
++	step_zap_signature, step_gmu_space, step_gmu_firmware, step_gmu_start, step_hfi_start,
++	step_hfi_messages, step_core_power, step_core_space, step_core_start, step_zap_and_secure, step_frame,
++};
++
++void
++liuqin_adreno_init(void)
++{
++	uint32_t last = 0;
++
++	(void)PE_parse_boot_argn("liuqinadreno", &last, sizeof(last));
++	if (liuqin_probe_gpu != ~0u) {
++		last = liuqin_probe_gpu;       /* probe menu (liuqin_keys.c) */
++	}
++	(void)PE_parse_boot_argn("liuqinadreno_pause", &pause_ms, sizeof(pause_ms));
++	if (last == 0) {
++		return;
++	}
++	last = MIN(last, (uint32_t)(sizeof(steps) / sizeof(steps[0])));
++	printf("LIUQIN ADRENO: steps 1..%u\n", last);
++	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
++	gpucc = ml_io_map(GPUCC_PHYS, GPUCC_SIZE);
++	gmu = ml_io_map(GMU_PHYS, GMU_SIZE);
++	rscc = ml_io_map(RSCC_PHYS, RSCC_SIZE);
++	smmu = ml_io_map(SMMU_PHYS, SMMU_SIZE);
++	bool failed = false;
++	for (step = 1; step <= last; step++) {
++		snprintf(liuqin_gpu_badge, sizeof(liuqin_gpu_badge), "GPU %u", step);
++		liuqin_gpu_badge_color = 0x00d0a000;
++		if (step >= 2 && !cfg_ahb_running()) {
++			printf("LIUQIN ADRENO: %u stop: GCC_GPU_CFG_AHB_CLK is off\n", step);
++			failed = true;
++			break;
++		}
++		if (!steps[step - 1]()) {
++			failed = true;
++			break;
++		}
++	}
++	if (failed) {
++		snprintf(liuqin_gpu_badge, sizeof(liuqin_gpu_badge), "GPU STOP %u", step);
++		liuqin_gpu_badge_color = 0x00c00000;
++	} else if (gmu_counts) {
++		snprintf(liuqin_gpu_badge, sizeof(liuqin_gpu_badge), last >= 22 ? "GPU DRAWS %u" : "GPU ON %u", last);
++		liuqin_gpu_badge_color = 0x0000a000;
++	} else {
++		snprintf(liuqin_gpu_badge, sizeof(liuqin_gpu_badge), "GPU %u OK", last);
++		liuqin_gpu_badge_color = 0x00d0a000;
++	}
++	printf("LIUQIN ADRENO: done (asked %u, reached %u)\n", last, MIN(step, last));
++}
++#endif /* ARM64_BOARD_CONFIG_LIUQIN */
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,7 @@
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/liuqin_ufs.c			standard
++bsd/dev/liuqin_adreno.c			standard
+ bsd/dev/liuqin_sample.c			standard
+ bsd/dev/liuqin_usb.c			standard
+ bsd/dev/mem.c				standard

@@ -1,0 +1,22 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index f41b75b..2e4c27b 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -2048,6 +2048,8 @@ badtoolate:
+ 	if (!spawn) {
+ 		{
+ 			assert(exec_failure_reason != OS_REASON_NULL);
++			printf("LIUQIN exec failed: reason 0x%llx pid %d\n",
++			    exec_failure_reason->osr_code, proc_getpid(p));
+ 			if (bootarg_execfailurereports) {
+ 				set_proc_name(imgp, current_proc());
+ 			}
+@@ -4590,6 +4592,8 @@ bad:
+ 	}
+ 
+ 	if (exec_failure_reason && !spawn_no_exec) {
++		printf("LIUQIN exec failed (end): reason 0x%llx pid %d\n",
++		    exec_failure_reason->osr_code, proc_getpid(p));
+ 		psignal_with_reason(p, SIGKILL, exec_failure_reason);
+ 		exec_failure_reason = NULL;
+ 	}

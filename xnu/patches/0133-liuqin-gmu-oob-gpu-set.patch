@@ -1,0 +1,53 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -92,6 +92,9 @@
+     static int gpu_ring_publish(void *,const volatile uint32_t *,size_t);
+     IOReturn startCp(NativeAdrenoGpuWindow &,const NativeAdrenoRingIo &,
+         const NativeAdrenoGpuBuffer *,void *);
++    /* a6xx_gmu_set_oob(GMU_OOB_GPU_SET): the GMU powers the GPU's GX domain
++     * and acknowledges on GMU2HOST_INTR_INFO bit 31. */
++    IOReturn powerGx();
+     static int gpu_fence_acquire(void *,volatile uint32_t *,size_t);
+     static int gpu_read32(void *,uint32_t,uint32_t *);
+     static int gpu_write32(void *,uint32_t,uint32_t);
+@@ -241,6 +244,25 @@
+  * started with CP_SQE_CNTL before a7xx_cp_init (CP_THREAD_CONTROL plus
+  * CP_ME_INIT with the power-up register list) is submitted through the ring.
+  * The ring itself already programmed CP_RB_BASE/CNTL/RPTR_ADDR. */
++IOReturn NativeAdrenoGpuService::powerGx()
++{
++    if(!gmu_io_bound_)return kIOReturnNotReady;
++    if(gmu_io_.write32(gmu_io_.cookie,ShengGmuCore,
++        size_t(REG_GMU_HOST2GMU_INTR_SET)*4u,1u<<30))return kIOReturnIOError;
++    __atomic_thread_fence(__ATOMIC_SEQ_CST);
++    IOReturn status=kIOReturnTimeout;
++    uint32_t info=0;
++    for(unsigned i=0;i<200;++i) {
++        if(gmu_io_.read32(gmu_io_.cookie,ShengGmuCore,
++            size_t(REG_GMU_GMU2HOST_INTR_INFO)*4u,&info))return kIOReturnIOError;
++        if(info&(1u<<31)) {status=kIOReturnSuccess;break;}
++        IOSleep(1);
++    }
++    (void)gmu_io_.write32(gmu_io_.cookie,ShengGmuCore,
++        size_t(REG_GMU_GMU2HOST_INTR_CLR)*4u,1u<<31);
++    IOLog("NativeAdreno: OOB GPU_SET %s (intr=0x%x)\n",status?"NOT ACKED":"acked",info);
++    return status;
++}
+ IOReturn NativeAdrenoGpuService::startCp(NativeAdrenoGpuWindow &window,
+     const NativeAdrenoRingIo &io,const NativeAdrenoGpuBuffer *b,void *pwrup_cpu)
+ {
+@@ -702,6 +724,14 @@
+                                                     core(REG_GMU_GMU2HOST_INTR_INFO),core(REG_GMU_AO_HOST_INTERRUPT_STATUS));
+                                             }
+                                         }
++                                    if(started==ShengGmuSuccess) {
++                                        /* The GMU raises the GPU's GX domain only after an
++                                         * OOB GPU_SET; until then every GPU register reads
++                                         * zero (the ladder's step 18). */
++                                        const IOReturn gx=powerGx();
++                                        IOLog("NativeAdreno: GX power %s (0x%x)\n",
++                                            gx?"failed":"up",gx);
++                                    }
+                                     if(hfi_mode) {
+                                         /* One-shot check that the interrupt transport saw
+                                          * the queue as modelled: table header, both index

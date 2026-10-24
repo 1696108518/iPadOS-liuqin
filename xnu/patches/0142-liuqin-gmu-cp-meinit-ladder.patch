@@ -1,0 +1,51 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -20,6 +20,7 @@
+ #include "NativeAdrenoGmuContext.h"
+ #include "NativeAdrenoGmuPlatform.h"
+ #include "NativeAdrenoGpuContext.h"
++#include "AdrenoPM4.h"
+ #include "NativeAdrenoGmuService.h"
+ #include "NativeAdrenoSmmuContext.h"
+ #include "NativeAdrenoIrq.h"
+@@ -372,10 +373,24 @@
+     (void)gpu_read32(&window,0x0831,&sqe_hi);
+     IOLog("NativeAdreno: CP SQE alive rbbm=0x%x hw_fault=0x%x rptr=%u sqe=0x%x%08x (want 0x%llx) rb=0x%x%08x\n",
+         rbbm,fault,rptr,sqe_hi,sqe_lo,(unsigned long long)GpuSqeIova,rb_hi,rb_lo);
+-    NativeAdrenoCpInit cp;
+-    NativeAdrenoCpInitConfig config{GpuSqeIova,GpuPwrupIova,1};
++    /* The ladder's a7xx_cp_init payload exactly: CP_THREAD_CONTROL with
++     * concurrent binning disabled, then CP_ME_INIT with **no** power-up
++     * register list (the kit's form points the CP at the list, and the CP stops
++     * after the first packet - rptr reaches wptr but the timestamp write that
++     * follows never executes). */
++    uint32_t pm4[10]={0};
++    IOReturn status=kIOReturnError;
+     uint32_t start_fence=0;
+-    IOReturn status=cp.run(&io,&ring_,&config,&start_fence);
++    if(AdrenoPM4Type7(0x17,1,&pm4[0])==AdrenoPM4Success &&
++        AdrenoPM4Type7(0x48,7,&pm4[2])==AdrenoPM4Success) {
++        pm4[1]=1u<<27;                       /* CP_THREAD_CONTROL: no concurrent binning */
++        pm4[3]=(1u<<0)|(1u<<1)|(1u<<3)|(1u<<6);
++        pm4[4]=0x00000003;                   /* hardware contexts */
++        pm4[5]=0x20000000;                   /* error detection */
++        pm4[6]=0x00000002;                   /* operation mode */
++        pm4[7]=0;pm4[8]=0;pm4[9]=0;          /* no power-up list, no list flag */
++        status=ring_.submit(pm4,10,&start_fence);
++    }
+     uint32_t rptr_after=~0u,wptr_after=~0u;
+     (void)gpu_read32(&window,0x0806,&rptr_after);
+     (void)gpu_read32(&window,0x0807,&wptr_after);
+@@ -388,6 +403,12 @@
+         if(fence!=NativeAdrenoRingFenceComplete) {
+             (void)gpu_read32(&window,0x0806,&rptr_after);
+             (void)gpu_read32(&window,0x0807,&wptr_after);
++            uint32_t fault_after=~0u,cpint=~0u,rbbmint=~0u;
++            (void)gpu_read32(&window,0x0821,&fault_after);
++            (void)gpu_read32(&window,0x0823,&cpint);
++            (void)gpu_read32(&window,0x0201,&rbbmint);
++            IOLog("NativeAdreno: CP after timeout hw_fault=0x%x cp_int=0x%x rbbm_int0=0x%x\n",
++                fault_after,cpint,rbbmint);
+             const volatile uint32_t *mem=static_cast<const volatile uint32_t *>(fence_cpu_);
+             IOLog("NativeAdreno: CP start fence %u not observed (%u, observed %u) rptr=%u wptr=%u mem %08x %08x %08x %08x\n",
+                 start_fence,unsigned(fence),observed,rptr_after,wptr_after,

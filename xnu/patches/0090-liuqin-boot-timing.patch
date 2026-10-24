@@ -1,0 +1,468 @@
+diff --git a/bsd/dev/liuqin_ufs.c b/bsd/dev/liuqin_ufs.c
+index ee2df96..518e13b 100644
+--- a/bsd/dev/liuqin_ufs.c
++++ b/bsd/dev/liuqin_ufs.c
+@@ -49,6 +49,43 @@ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern int hz;
+ static void liuqin_log_start(void);
++
++/* Boot-phase timestamps: "LIUQIN BOOT: <what> at N.nnn s" where N counts from
++ * reset (mach_absolute_time).  Printing costs nothing next to what it measures,
++ * and it is the only way to tell which phase a slow boot spends its time in
++ * without pulling the persistent log.  bootarg liuqinboot marks=0 hides them. */
++static int liuqin_boot_marks = 1;
++
++void
++liuqin_boot_mark(const char *what)
++{
++	static int parsed;
++	uint64_t ns = 0;
++	extern int liuqin_console_force;
++
++	if (!parsed) {
++		parsed = 1;
++		PE_parse_boot_argn("liuqinboot", &liuqin_boot_marks,
++		    sizeof(liuqin_boot_marks));
++	}
++	if (!liuqin_boot_marks) {
++		return;
++	}
++	static uint64_t last_ns;
++	uint64_t delta_ms = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	if (last_ns && ns > last_ns) {
++		delta_ms = (ns - last_ns) / 1000000ULL;
++	}
++	last_ns = ns;
++	/* Drawn even when liuqinmute=1: this is the boot's time axis.  The delta
++	 * makes a slow phase visible without subtracting screenfuls of numbers. */
++	liuqin_console_force = 1;
++	printf("LIUQIN BOOT: %s at %llu.%03llu s (+%llu ms)\n", what,
++	    ns / 1000000000ULL, (ns / 1000000ULL) % 1000ULL, delta_ms);
++	liuqin_console_force = 0;
++}
+ static void liuqin_wdt_start(void);
+ static void liuqin_log_dump(void);
+ static void liuqin_fw_load(void);
+@@ -226,6 +263,7 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	}
+ 	__builtin_arm_dsb(0xf);
+ 
++	uint64_t cmd_start = mach_absolute_time();
+ 	ufs_wr(REG_UTRLDBR, 1);
+ 	uint64_t deadline;
+ 	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
+@@ -241,8 +279,12 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	while (ufs_rd(REG_UTRLDBR) & 1) {
+ 		uint64_t now = mach_absolute_time();
+ 		if (now > deadline) {
++			extern int liuqin_console_force;
+ 			ufs_wr(REG_UTRLCLR, ~1u);
+-			printf("LIUQIN UFS: command 0x%02x timed out\n", cdb[0]);
++			liuqin_console_force = 1;      /* visible even with liuqinmute=1 */
++			printf("LIUQIN UFS: command 0x%02x timed out after %llu ms\n",
++			    cdb[0], CMD_TIMEOUT_NS / 1000000ull);
++			liuqin_console_force = 0;
+ 			return ETIMEDOUT;
+ 		}
+ 		if (sleepable && now >= spin_until) {
+@@ -271,10 +313,30 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 
+ 	/* Throughput instrumentation: every 1024 commands, report ops, MiB and
+ 	 * average latency so a slow boot can be classified as I/O vs waiting. */
++	uint64_t cmd_latency_ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - cmd_start, &cmd_latency_ns);
+ 	{
+ 		static uint64_t st_ops, st_bytes, st_ns;
++		static uint64_t lat_min = ~0ull, lat_max, lat_sum;
++		static uint32_t lat_over_1ms, lat_over_10ms, lat_over_50ms;
+ 		st_ops++;
+ 		st_bytes += len;
++		if (cmd_latency_ns < lat_min) {
++			lat_min = cmd_latency_ns;
++		}
++		if (cmd_latency_ns > lat_max) {
++			lat_max = cmd_latency_ns;
++		}
++		lat_sum += cmd_latency_ns;
++		if (cmd_latency_ns > 1000000ull) {
++			lat_over_1ms++;
++		}
++		if (cmd_latency_ns > 10000000ull) {
++			lat_over_10ms++;
++		}
++		if (cmd_latency_ns > 50000000ull) {
++			lat_over_50ms++;
++		}
+ 		uint64_t now = mach_absolute_time();
+ 		uint64_t t0 = st_ns ? st_ns : now;
+ 		if (st_ns == 0) {
+@@ -285,10 +347,18 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 		absolutetime_to_nanoseconds(now - t0, &elapsed);
+ 		if ((st_ops & 0x3ff) == 0 && elapsed > 0) {
+ 			uint64_t us = elapsed / 1000;
++			extern int liuqin_console_force;
++			liuqin_console_force = 1;      /* visible even with liuqinmute=1 */
+ 			printf("LIUQIN UFS: %llu ops, %llu MiB, %llu ms, %llu KiB/s, %llu us/op\n",
+ 			    st_ops, st_bytes >> 20, elapsed / 1000000,
+ 			    (st_bytes / 1024) * 1000000 / elapsed,
+ 			    us / st_ops);
++			printf("LIUQIN UFS: lat min/avg/max %llu/%llu/%llu us, over 1/10/50 ms: %u/%u/%u of %llu\n",
++			    lat_min / 1000, (lat_sum / st_ops) / 1000, lat_max / 1000,
++			    lat_over_1ms, lat_over_10ms, lat_over_50ms, st_ops);
++			lat_min = ~0ull; lat_max = 0; lat_sum = 0;
++			lat_over_1ms = lat_over_10ms = lat_over_50ms = 0;
++			liuqin_console_force = 0;
+ 		}
+ 	}
+ 
+@@ -914,6 +984,8 @@ liuqin_ufs_init(void)
+ 	char want[64] = "userdata";
+ 	int error;
+ 
++	liuqin_boot_mark("ufs init start");
++
+ 	if (SecureDTLookupEntry(NULL, "/liuqin-ufs", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
+ 	    size < 2 * sizeof(uintptr_t)) {
+@@ -945,14 +1017,32 @@ liuqin_ufs_init(void)
+ 	su.lun = 0;
+ 	su.secsize = DEV_BSIZE;
+ 
++	/* What the bootloader left behind, before we touch anything. */
++	printf("LIUQIN UFS: hw hce 0x%x hcs 0x%x is 0x%x cap 0x%x\n",
++	    ufs_rd(REG_HCE), ufs_rd(REG_HCS), ufs_rd(REG_IS), ufs_rd(0x00));
++
++	/*
++	 * If ABL already left a working link, the PHY wake + UIC re-init below is
++	 * what drops it back to PWM.  ufsskipinit=1 takes the controller as found
++	 * and only issues SCSI, so the inherited state can be tested without
++	 * writing the PHY.
++	 */
++	uint32_t skipinit = 0, softwake = 0;
++	PE_parse_boot_argn("ufsskipinit", &skipinit, sizeof(skipinit));
++	PE_parse_boot_argn("ufssoftwake", &softwake, sizeof(softwake));
++
+ 	lck_mtx_lock(&liuqin_ufs_lock);
+ 	error = ufs_take_over_host();
+-	if (!error) {
++	if (!error && !skipinit) {
+ 		/* Do NOT touch HCE: stopping it kills the Qualcomm PHY and the
+ 		 * controller never comes back without the vendor init sequence.
+ 		 * Try to bring the link back up instead. */
+ 		ufs_gcc_clocks_on();
+-		ufs_gcc_phy_reset();
++		/* softwake: keep whatever the bootloader programmed (its HS gear
++		 * survives a power-down; DME_RESET is what throws it away). */
++		if (!softwake) {
++			ufs_gcc_phy_reset();
++		}
+ 		{
+ 			volatile uint32_t *a = (volatile uint32_t *)(su.phy + 0x1000);
+ 			volatile uint32_t *b = (volatile uint32_t *)(su.phy + 0x1800);
+@@ -962,12 +1052,23 @@ liuqin_ufs_init(void)
+ 			    b[0x000 / 4], b[0x004 / 4], b[0x008 / 4], b[0x180 / 4]);
+ 		}
+ 		int pw = ufs_phy_wake();
+-		int rr = ufs_uic(0x14, 0, 0, 0, NULL);  /* DME_RESET */
+-		int re = ufs_uic(0x12, 0, 0, 0, NULL);  /* DME_ENABLE */
++		int rr = softwake ? 0 : ufs_uic(0x14, 0, 0, 0, NULL);  /* DME_RESET */
++		int re = softwake ? 0 : ufs_uic(0x12, 0, 0, 0, NULL);  /* DME_ENABLE */
+ 		int rp = ufs_uic(0x10, 0, 0, 0, NULL);  /* DME_POWERON */
+ 		int rl = ufs_uic(0x16, 0, 0, 0, NULL);  /* DME_LINKSTARTUP */
+-		printf("LIUQIN UFS: uic reset %d enable %d poweron %d link %d\n",
+-		    rr, re, rp, rl);
++		printf("LIUQIN UFS: uic reset %d enable %d poweron %d link %d (softwake %u)\n",
++		    rr, re, rp, rl, softwake);
++		if (softwake) {
++			extern int liuqin_console_force;
++			uint32_t stx = 0, srx = 0, spm = 0;
++			int q1 = ufs_uic(0x01, 0x1568u << 16, 0, 0, &stx);
++			int q2 = ufs_uic(0x01, 0x1583u << 16, 0, 0, &srx);
++			int q3 = ufs_uic(0x01, 0x1571u << 16, 0, 0, &spm);
++			liuqin_console_force = 1;
++			printf("LIUQIN UFS: softwake state tx %u(%d) rx %u(%d) pm %u(%d)\n",
++			    stx, q1, srx, q2, spm, q3);
++			liuqin_console_force = 0;
++		}
+ 		uint32_t pm = 0;
+ 		int pq = ufs_query(0x03, 0x02, 0, 0, 0, &pm);
+ 		if (pq || pm != 0x11) {
+@@ -975,6 +1076,9 @@ liuqin_ufs_init(void)
+ 			    pw, rr, re, rp, rl, pm, pq);
+ 		}
+ 	}
++	if (!error && skipinit) {
++		printf("LIUQIN UFS: skipinit - using the link as the bootloader left it\n");
++	}
+ 	if (!error) {
+ 		uint32_t v = 0;
+ 		int qe;
+@@ -990,6 +1094,99 @@ liuqin_ufs_init(void)
+ 			delay(100000);      /* 100 ms; delay() is microseconds */
+ 		}
+ 		printf("LIUQIN UFS: power mode 0x%x (query %d)\n", v, qe);
++		/*
++		 * Bandwidth: the link comes up in PWM-G1 (a few Mbit/s) because
++		 * nothing ever asks for a high-speed gear.  PA attribute ids are
++		 * from include/ufs/unipro.h: PA_TXGEAR 0x1568, PA_RXGEAR 0x1583,
++		 * PA_PWRMODE 0x1571 (1 = FAST), PA_MAXRXHSGEAR 0x1587,
++		 * PA_MAXRXPWMGEAR 0x1586, PA_ACTIVETXDATALANES 0x1560,
++		 * PA_ACTIVERXDATALANES 0x1580, T_CONNECTIONSTATE 0x4020.
++		 * Opt-in boot-arg ufsgear=1 until it is proven on hardware.
++		 */
++		uint32_t gear = 0;
++		if (PE_parse_boot_argn("ufsgear", &gear, sizeof(gear)) && gear) {
++			extern int liuqin_console_force;
++			uint32_t maxhs = 0, maxpwm = 0, tx = 0, rx = 0, pmode = 0;
++			uint32_t txl = 0, rxl = 0;
++			int e1 = ufs_uic(0x01, 0x1587u << 16, 0, 0, &maxhs);
++			int e2 = ufs_uic(0x01, 0x1586u << 16, 0, 0, &maxpwm);
++			int e3 = ufs_uic(0x01, 0x1568u << 16, 0, 0, &tx);
++			int e4 = ufs_uic(0x01, 0x1583u << 16, 0, 0, &rx);
++			int e5 = ufs_uic(0x01, 0x1571u << 16, 0, 0, &pmode);
++			int e6 = ufs_uic(0x01, 0x1560u << 16, 0, 0, &txl);
++			int e7 = ufs_uic(0x01, 0x1580u << 16, 0, 0, &rxl);
++			liuqin_console_force = 1;
++			printf("LIUQIN UFS: gear before maxhs %u(%d) maxpwm %u(%d) tx %u(%d) rx %u(%d) pm %u(%d) lanes %u(%d)/%u(%d)\n",
++			    maxhs, e1, maxpwm, e2, tx, e3, rx, e4, pmode, e5, txl, e6, rxl, e7);
++			liuqin_console_force = 0;
++
++			if (!e1 && maxhs >= 1) {
++				uint32_t want = maxhs > 4 ? 4 : maxhs;
++				/*
++				 * Probe what this controller accepts before trusting it:
++				 * a write of the *current* power mode is the control (it
++				 * must succeed for the channel to be usable), then FAST and
++				 * FASTAUTO.  r_same != 0 means DME_SET itself is refused
++				 * for this attribute, not that the mode was rejected.
++				 */
++				int r_same = ufs_uic(0x02, 0x1571u << 16, 0, pmode, NULL);
++				int r_fast = ufs_uic(0x02, 0x1571u << 16, 0, 1, NULL);
++				int r_auto = ufs_uic(0x02, 0x1571u << 16, 0, 4, NULL);
++				{
++					extern int liuqin_console_force;
++					liuqin_console_force = 1;
++					printf("LIUQIN UFS: pm probe same=%d fast=%d fastauto=%d\n",
++					    r_same, r_fast, r_auto);
++					liuqin_console_force = 0;
++				}
++				int s1 = ufs_uic(0x02, 0x1568u << 16, 0, want, NULL);
++				int s2 = ufs_uic(0x02, 0x1583u << 16, 0, want, NULL);
++				int s3 = (r_fast == 0 || r_auto == 0) ? 0 : r_fast;
++				uint32_t cs = 0xff;
++				for (int i = 0; i < 100; i++) {
++					if (!ufs_uic(0x01, 0x4020u << 16, 0, 0, &cs) && cs == 1) {
++						break;
++					}
++					delay(1000);
++				}
++				uint32_t ntx = 0, nrx = 0, npm = 0, ntxl = 0, nrxl = 0;
++				int n1 = ufs_uic(0x01, 0x1568u << 16, 0, 0, &ntx);
++				int n2 = ufs_uic(0x01, 0x1583u << 16, 0, 0, &nrx);
++				int n3 = ufs_uic(0x01, 0x1571u << 16, 0, 0, &npm);
++				int n4 = ufs_uic(0x01, 0x1560u << 16, 0, 0, &ntxl);
++				int n5 = ufs_uic(0x01, 0x1580u << 16, 0, 0, &nrxl);
++				liuqin_console_force = 1;
++				printf("LIUQIN UFS: gear set %u (%d/%d/%d), conn 0x%x, after tx %u(%d) rx %u(%d) pm %u(%d) lanes %u(%d)/%u(%d)\n",
++				    want, s1, s2, s3, cs, ntx, n1, nrx, n2, npm, n3, ntxl, n4, nrxl, n5);
++				liuqin_console_force = 0;
++			}
++		}
++		/*
++		 * The link is started but no gear is ever negotiated, so it runs at
++		 * whatever the device defaults to.  Dump the PHY-adapter MIB
++		 * attributes (DME_GET, opcode 0x01, attribute in arg1 bits 16..23)
++		 * so the gear/lane attributes can be identified from their values
++		 * instead of guessed.  Boot-arg ufsmibscan=1; read-only.
++		 */
++		uint32_t scan = 0;
++		if (PE_parse_boot_argn("ufsmibscan", &scan, sizeof(scan)) && scan) {
++			extern int liuqin_console_force;
++			liuqin_console_force = 1;      /* visible even with liuqinmute=1 */
++			for (uint32_t base = 0; base < 0x40; base += 8) {
++				printf("LIUQIN UFS: mib %02x:", base);
++				for (uint32_t i = 0; i < 8; i++) {
++					uint32_t mv = 0;
++					int mr = ufs_uic(0x01, (base + i) << 16, 0, 0, &mv);
++					if (mr) {
++						printf(" -----");
++					} else {
++						printf(" %05x", mv & 0xfffff);
++					}
++				}
++				printf("\n");
++			}
++			liuqin_console_force = 0;
++		}
+ 		qe = ufs_query(0x05, 0x01, 0, 0, 0, &v);        /* READ_FLAG fDeviceInit */
+ 		printf("LIUQIN UFS: READ_FLAG fDeviceInit -> %d val 0x%x\n", qe, v);
+ 		qe = ufs_query(0x03, 0x02, 0, 0, 0, &v);        /* READ_ATTR power mode */
+@@ -1031,6 +1228,47 @@ liuqin_ufs_init(void)
+ 			}
+ 			printf("LIUQIN UFS: fDeviceInit flag 0x%x\n", flag);
+ 		}
++		/*
++		 * The power-mode change has to come AFTER the device finishes its own
++		 * initialization (fDeviceInit cleared); before that the peer refuses
++		 * every FAST/FASTAUTO write with UIC result 10 while accepting a
++		 * write of the current value.  PA_TXHSADAPTTYPE (0x15D4) = 1
++		 * (PA_INITIAL_ADAPT) is part of the standard gear-change sequence.
++		 */
++		uint32_t gear2 = 0;
++		if (PE_parse_boot_argn("ufsgear", &gear2, sizeof(gear2)) && gear2) {
++			extern int liuqin_console_force;
++			uint32_t maxhs2 = 0, tx2 = 0, rx2 = 0, pm2 = 0, cs = 0xff;
++			int g1 = ufs_uic(0x01, 0x1587u << 16, 0, 0, &maxhs2);
++			int g2 = ufs_uic(0x01, 0x1568u << 16, 0, 0, &tx2);
++			int g3 = ufs_uic(0x01, 0x1583u << 16, 0, 0, &rx2);
++			int g4 = ufs_uic(0x01, 0x1571u << 16, 0, 0, &pm2);
++			uint32_t want2 = (maxhs2 >= 1 && maxhs2 <= 4) ? maxhs2 : 4;
++			int s1 = ufs_uic(0x02, 0x1568u << 16, 0, want2, NULL);
++			int s2 = ufs_uic(0x02, 0x1583u << 16, 0, want2, NULL);
++			int s3 = ufs_uic(0x02, 0x1571u << 16, 0, 1, NULL);
++			int s4 = ufs_uic(0x02, 0x15D4u << 16, 0, 1, NULL);
++			for (int i = 0; i < 100; i++) {
++				if (!ufs_uic(0x01, 0x4020u << 16, 0, 0, &cs) && cs == 1) {
++					break;
++				}
++				delay(1000);
++			}
++			uint32_t ntx = 0, nrx = 0, npm = 0, ntxl = 0, nrxl = 0;
++			int n1 = ufs_uic(0x01, 0x1568u << 16, 0, 0, &ntx);
++			int n2 = ufs_uic(0x01, 0x1583u << 16, 0, 0, &nrx);
++			int n3 = ufs_uic(0x01, 0x1571u << 16, 0, 0, &npm);
++			int n4 = ufs_uic(0x01, 0x1560u << 16, 0, 0, &ntxl);
++			int n5 = ufs_uic(0x01, 0x1580u << 16, 0, 0, &nrxl);
++			liuqin_console_force = 1;
++			printf("LIUQIN UFS: gear2 pre maxhs %u(%d) tx %u(%d) rx %u(%d) pm %u(%d)\n",
++			    maxhs2, g1, tx2, g2, rx2, g3, pm2, g4);
++			printf("LIUQIN UFS: gear2 set %u tx=%d rx=%d pm=%d adapt=%d conn 0x%x\n",
++			    want2, s1, s2, s3, s4, cs);
++			printf("LIUQIN UFS: gear2 after tx %u(%d) rx %u(%d) pm %u(%d) lanes %u(%d)/%u(%d)\n",
++			    ntx, n1, nrx, n2, npm, n3, ntxl, n4, nrxl, n5);
++			liuqin_console_force = 0;
++		}
+ 	}
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
+@@ -1094,12 +1332,17 @@ liuqin_ufs_init(void)
+ 	printf("LIUQIN UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
++	liuqin_boot_mark("ufs partition ready");
+ 	liuqin_fw_load();
++	liuqin_boot_mark("firmware area loaded");
+ 	liuqin_adreno_init();
++	liuqin_boot_mark("gpu ladder done");
+ 	if (liuqin_adreno_services_start) {
+ 		liuqin_adreno_services_start();
++		liuqin_boot_mark("adreno services started");
+ 	}
+ 	liuqin_log_start();
++	liuqin_boot_mark("log thread started");
+ 	liuqin_sample_start();
+ 	/* liuqin_usb_probe(); -- faults on this unit (data abort); USB is not needed for bring-up */
+ 	return 0;
+@@ -1461,6 +1704,7 @@ liuqin_ufs_rootdev(dev_t *dev)
+ 			return error;
+ 		}
+ 	}
++	liuqin_boot_mark("root device ready");
+ 	*dev = su.bdev;
+ 	return 0;
+ }
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 4fe12e6..2068d18 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -896,7 +896,14 @@ bsd_init(void)
+ 			/*NOTREACHED*/
+ 		}
+ #endif
+-		printf("cannot mount root, errno = %d\n", err);
++		{
++			/* LIUQIN: drawn even with liuqinmute=1 - a failing root mount
++			 * retries here, and its errno is the only clue why. */
++			extern int liuqin_console_force;
++			liuqin_console_force = 1;
++			printf("cannot mount root, errno = %d\n", err);
++			liuqin_console_force = 0;
++		}
+ 	}
+ 
+ 	IOSecureBSDRoot(rootdevice);
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 2e4c27b..1c49421 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7416,8 +7416,16 @@ process_signature(proc_t p, struct image_params *imgp)
+ 				goto done;
+ 			}
+ #if defined(ARM64_BOARD_CONFIG_LIUQIN)
+-			/* LIUQIN runs every iOS binary this way: one short line per exec. */
++			/* LIUQIN runs every iOS binary this way: one short line per exec,
++			 * plus a timestamped line that is drawn even when the console is
++			 * muted, so a boot without a serial port still has a time axis. */
+ 			printf("exec %s\n", p->p_name);
++			{
++				extern void liuqin_boot_mark(const char *);
++				char mark[64];
++				snprintf(mark, sizeof(mark), "exec %s", p->p_name);
++				liuqin_boot_mark(mark);
++			}
+ #else
+ 			printf("Allowing spawn of iOS binary %s since it has "
+ 			    "com.apple.private.security.no-sandbox entitlement or unentitled_ios_sim_launch "
+diff --git a/iokit/Kernel/arm/LiuqinPlatformExpert.cpp b/iokit/Kernel/arm/LiuqinPlatformExpert.cpp
+index 8034fd0..d3292a9 100644
+--- a/iokit/Kernel/arm/LiuqinPlatformExpert.cpp
++++ b/iokit/Kernel/arm/LiuqinPlatformExpert.cpp
+@@ -22,9 +22,21 @@ public:
+ 
+ OSDefineMetaClassAndStructors(LiuqinPlatformExpert, IODTPlatformExpert);
+ 
++extern "C" int liuqin_console_muted;
++
+ bool
+ LiuqinPlatformExpert::start(IOService *provider)
+ {
++	int mute = 0;
++	/*
++	 * liuqinmute=1 must stop the text console before the platform expert's own
++	 * IOLog lines and everything after it: parsing it in the display driver
++	 * (AppleCLCD::start) was too late, the console had drawn for the whole
++	 * early boot and every userspace line still scrolled the framebuffer.
++	 */
++	if (PE_parse_boot_argn("liuqinmute", &mute, sizeof(mute)) && mute != 0) {
++		liuqin_console_muted = 1;
++	}
+ 	IOLog("LIUQIN: starting device-tree platform expert\n");
+ 	if (!IODTPlatformExpert::start(provider)) {
+ 		return false;
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index e5904ab..c459bfe 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -274,6 +274,10 @@ extern void liuqin_log_append(const char *c, int size);  /* bsd/dev/liuqin_ufs.c
+  * the GUI. A panic draws again.
+  */
+ int liuqin_console_muted;
++/* Set around the few lines that must stay visible while the console is muted
++ * (boot-phase marks, per-exec timestamps): they are the only time axis a boot
++ * without a serial port has. */
++int liuqin_console_force;
+ #endif
+ 
+ static inline void
+@@ -283,7 +287,7 @@ _cnputs(char *c, int size, bool poll)
+ 
+ #if defined(ARM64_BOARD_CONFIG_LIUQIN)
+ 	liuqin_log_append(c, size);
+-	if (liuqin_console_muted && !panic_active()) {
++	if (liuqin_console_muted && !liuqin_console_force && !panic_active()) {
+ 		return;
+ 	}
+ #endif

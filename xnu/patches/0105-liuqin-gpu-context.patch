@@ -1,0 +1,55 @@
+diff --git a/iokit/NativeAdreno/NativeAdrenoService.cpp b/iokit/NativeAdreno/NativeAdrenoService.cpp
+index 7cd0553..8adb4ea 100644
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -19,6 +19,7 @@
+ #include "NativeAdrenoGmuConfig.h"
+ #include "NativeAdrenoGmuContext.h"
+ #include "NativeAdrenoGmuPlatform.h"
++#include "NativeAdrenoGpuContext.h"
+ #include "NativeAdrenoGmuService.h"
+ #include "NativeAdrenoSmmuContext.h"
+ #include "NativeAdrenoIrq.h"
+@@ -527,6 +528,42 @@ bool NativeAdrenoGpuService::start(IOService *provider)
+                                             gmu_startup_.load.firmware_init_result,gmu_startup_.load.hfi_status,
+                                             gmu_startup_.load.poll_reads);
+                                         }
++                                    if(started==ShengGmuSuccess) {
++                                        /* GPU bank/asid 2, streams 0 and 1 (the ladder's
++                                         * choice); the two SMR slots default to the first
++                                         * free ones after the GMU's. */
++                                        unsigned gpubank=2,gpuasid=2,gslot0=0xffffffffu,gslot1=0xffffffffu;
++                                        PE_parse_boot_argn("sheng-gpu-gpubank",&gpubank,sizeof(gpubank));
++                                        PE_parse_boot_argn("sheng-gpu-gpuasid",&gpuasid,sizeof(gpuasid));
++                                        PE_parse_boot_argn("sheng-gpu-gpuslot0",&gslot0,sizeof(gslot0));
++                                        PE_parse_boot_argn("sheng-gpu-gpuslot1",&gslot1,sizeof(gslot1));
++                                        volatile uint32_t *smmu=reinterpret_cast<volatile uint32_t *>(smmu_base);
++                                        for(unsigned i=0;i<32;++i) {
++                                            if(i==slot)continue;
++                                            const bool free=!(smmu[0x800/4+i]&0x80000000u) &&
++                                                ((smmu[0xc00/4+i]>>16)&3)==2;
++                                            if(!free || i==gslot0 || i==gslot1)continue;
++                                            if(gslot0==0xffffffffu)gslot0=i;
++                                            else if(gslot1==0xffffffffu)gslot1=i;
++                                        }
++                                        if(gslot0==0xffffffffu || gslot1==0xffffffffu) {
++                                            IOLog("NativeAdreno: GPU context: no free stream slots\n");
++                                        } else {
++                                            NativeAdrenoGmuContextReport gpu_report{};
++                                            const IOReturn gpu_status=NativeAdrenoGpuContextBringup(smmu_base,smmu_bytes,
++                                                gpubank,gpuasid,gslot0,0,gslot1,1,nullptr,&gpu_report);
++                                            IOLog("NativeAdreno: GPU context status 0x%x step %u (bank %u asid %u slots %u/%u sids 0/1)\n",
++                                                gpu_status,gpu_report.step,gpubank,gpuasid,gslot0,gslot1);
++                                            if(!gpu_status) {
++                                                NativeAdrenoGpuBuffer b[5]{};
++                                                if(!NativeAdrenoGpuContextBuffers(b))
++                                                    IOLog("NativeAdreno: GPU buffers sqe 0x%llx ring 0x%llx memptrs 0x%llx pwrup 0x%llx scratch 0x%llx\n",
++                                                        (unsigned long long)b[0].iova,(unsigned long long)b[1].iova,
++                                                        (unsigned long long)b[2].iova,(unsigned long long)b[3].iova,
++                                                        (unsigned long long)b[4].iova);
++                                            }
++                                        }
++                                    }
+                                     if(started==ShengGmuSuccess && !gpu_context_ready_) {
+                                         IOLog("NativeAdreno: ring/SQE refused: the GPU context (iommus 0/1) is not built\n");
+                                     } else if(started==ShengGmuSuccess) {

@@ -1,0 +1,62 @@
+diff --git a/iokit/NativeAdreno/NativeAdrenoGmuPlatform.cpp b/iokit/NativeAdreno/NativeAdrenoGmuPlatform.cpp
+index 7a26c85..ae2f4c0 100644
+--- a/iokit/NativeAdreno/NativeAdrenoGmuPlatform.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoGmuPlatform.cpp
+@@ -1,5 +1,6 @@
+ /* SPDX-License-Identifier: MIT */
+ #include "NativeAdrenoGmuPlatform.h"
++#include "NativeAdrenoMemory.h"
+ #include <IOKit/IOLib.h>
+ 
+ int NativeAdrenoGmuPlatform::read32(void *cookie,unsigned window,size_t at,uint32_t *out)
+@@ -49,6 +50,10 @@ static int sha256(void *,const void *bytes,size_t length,uint8_t digest[32])
+     NativeAdrenoSha256::hash(static_cast<const uint8_t *>(bytes),length,digest);
+     return 0;
+ }
++static int clean(void *,void *mapping,size_t bytes)
++{
++    return NativeAdrenoMaintainOwnedPages(mapping,bytes,NativeAdrenoClean)?1:0;
++}
+ IOReturn NativeAdrenoGmuPlatform::services(const NativeAdrenoGmuTime *time,
+     ShengGmuServices *services)
+ {
+@@ -59,5 +64,6 @@ IOReturn NativeAdrenoGmuPlatform::services(const NativeAdrenoGmuTime *time,
+     services->sha256=sha256;
+     services->now_us=time->now_us;
+     services->wait_us=time->wait_us;
++    services->clean=clean;
+     return kIOReturnSuccess;
+ }
+diff --git a/iokit/NativeAdreno/ShengGmu.c b/iokit/NativeAdreno/ShengGmu.c
+index 1c6e63d..4000508 100644
+--- a/iokit/NativeAdreno/ShengGmu.c
++++ b/iokit/NativeAdreno/ShengGmu.c
+@@ -154,6 +154,15 @@ ShengGmuStatus ShengGmuLoadAndStartHfi(ShengGmuDevice *d,const ShengGmuConfig *c
+         }
+     }
+     if(d->io.barrier(d->io.cookie)) {status=ShengGmuIoError;goto failed;}
++    /* The ICACHE and HFI queue are written with cacheable CPU stores; the GMU
++     * reads them through the SMMU, so push them to DRAM before the release. */
++    if(d->services.clean) {
++        const ShengGmuMemory *dirty[]={&c->icache,&c->dummy,&c->debug,&c->log,&c->hfi};
++        for(unsigned m=0;m<5;++m)
++            if(d->services.clean(d->services.cookie,dirty[m]->cpu,dirty[m]->bytes)) {
++                status=ShengGmuIoError;goto failed;
++            }
++    }
+     /* Read every TCM payload word before releasing reset. CPU cache readback
+      * checks copied bytes only; actual GMU coherency is still a prerequisite. */
+     for(size_t i=0;i<count;++i) {
+diff --git a/iokit/NativeAdreno/ShengGmu.h b/iokit/NativeAdreno/ShengGmu.h
+index 278c575..8f531e9 100644
+--- a/iokit/NativeAdreno/ShengGmu.h
++++ b/iokit/NativeAdreno/ShengGmu.h
+@@ -23,6 +23,8 @@ typedef struct {
+     int (*sha256)(void *,const void *,size_t,uint8_t digest[32]);
+     int (*now_us)(void *,uint64_t *);
+     int (*wait_us)(void *,unsigned);
++    /* Clean the CPU caches over memory the GMU will read (ICACHE/HFI). */
++    int (*clean)(void *,void *,size_t);
+ } ShengGmuServices;
+ typedef struct {volatile uint32_t *cpu;size_t bytes;uint64_t iova;} ShengGmuMemory;
+ typedef struct {

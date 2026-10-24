@@ -1,0 +1,89 @@
+diff --git a/iokit/NativeAdreno/NativeAdrenoService.cpp b/iokit/NativeAdreno/NativeAdrenoService.cpp
+index af8117a..065ddc8 100644
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -448,8 +448,13 @@ bool NativeAdrenoGpuService::start(IOService *provider)
+                                         NativeAdrenoKernelTime::now_us,
+                                         NativeAdrenoKernelTime::wait_us};
+                                     ShengGmuServices services{};
+-                                    if(ShengGmuBuildStartup(&inputs,&startup)!=AdrenoHfiStartupSuccess)
+-                                        IOLog("NativeAdreno: startup config refused\n");
++                                    if(ShengGmuBuildStartup(&inputs,&startup)!=AdrenoHfiStartupSuccess) {
++                                        extern volatile uint32_t sheng_gmu_vote_stage,sheng_gmu_vote_info[8];
++                                        IOLog("NativeAdreno: startup config refused stage %u (gfx %u mx %u cx %u sh0 %u mc0 %u acv %u cn0 0x%x chip 0x%x)\n",
++                                            sheng_gmu_vote_stage,sheng_gmu_vote_info[0],sheng_gmu_vote_info[1],
++                                            sheng_gmu_vote_info[2],sheng_gmu_vote_info[3],sheng_gmu_vote_info[4],
++                                            sheng_gmu_vote_info[5],sheng_gmu_vote_info[6],sheng_gmu_vote_info[7]);
++                                    }
+                                     else if(NativeAdrenoAssembleGmuConfig(&firmware_,&gmu_,
+                                         SHENG_GMU_VOTES_CHIP_ID,1000,&config)!=kIOReturnSuccess)
+                                         IOLog("NativeAdreno: GMU config assembly refused\n");
+diff --git a/iokit/NativeAdreno/ShengGmuVotes.c b/iokit/NativeAdreno/ShengGmuVotes.c
+index 7c502b2..b2854c8 100644
+--- a/iokit/NativeAdreno/ShengGmuVotes.c
++++ b/iokit/NativeAdreno/ShengGmuVotes.c
+@@ -1,14 +1,24 @@
+ /* SPDX-License-Identifier: BSD-2-Clause-Patent */
+ #include "ShengGmuVotes.h"
+ #include "ShengGmuVotesSource.h"
++/* Diagnostics for the liuqin port: which validation refused the startup
++ * config, and the sizes/addresses that went into it. */
++volatile uint32_t sheng_gmu_vote_stage;
++volatile uint32_t sheng_gmu_vote_info[8];
+ AdrenoHfiStartupStatus ShengGmuBuildStartup(const ShengGmuVoteInputs *in,AdrenoHfiStartupConfig *out)
+ {
++    sheng_gmu_vote_info[0]=in?in->gfx.bytes:0;sheng_gmu_vote_info[1]=in?in->mx.bytes:0;
++    sheng_gmu_vote_info[2]=in?in->cx.bytes:0;sheng_gmu_vote_info[3]=in?in->sh0.aux.bytes:0;
++    sheng_gmu_vote_info[4]=in?in->mc0.aux.bytes:0;sheng_gmu_vote_info[5]=in?in->acv.aux.bytes:0;
++    sheng_gmu_vote_info[6]=in?in->cn0_address:0;sheng_gmu_vote_info[7]=in?in->chip_id:0;
++    sheng_gmu_vote_stage=1;
+     if(!in || !out || in->chip_id!=SHENG_GMU_VOTES_CHIP_ID || in->gmxc_present>1 ||
+         in->enable_acd>1 || in->enable_ifpc>1 ||
+         (!in->gmxc_present && (in->gmxc.data || in->gmxc.bytes)))return AdrenoHfiStartupInvalid;
+     AdrenoHfiStartupConfig c={0};uint32_t votes[16],levels[16];
+     const ShengGmuAux *gpu_secondary=in->gmxc_present?&in->gmxc:&in->mx;
+     for(unsigned i=0;i<SHENG_GPU_OPPS;++i)levels[i]=sheng_gpu_opps[i].level;
++    sheng_gmu_vote_stage=2;
+     if(AdrenoHfiArcVotes(levels,SHENG_GPU_OPPS,in->gfx.data,in->gfx.bytes,
+         gpu_secondary->data,gpu_secondary->bytes,votes,16))return AdrenoHfiStartupInvalid;
+     c.gpu_count=SHENG_GPU_OPPS;
+@@ -20,19 +30,24 @@ AdrenoHfiStartupStatus ShengGmuBuildStartup(const ShengGmuVoteInputs *in,AdrenoH
+     }
+     if(c.acd_count)c.acd_version=c.acd_stride=1;
+     for(unsigned i=0;i<SHENG_GMU_OPPS;++i)levels[i]=sheng_gmu_opps[i].level;
++    sheng_gmu_vote_stage=3;
+     if(AdrenoHfiArcVotes(levels,SHENG_GMU_OPPS,in->cx.data,in->cx.bytes,
+         in->mx.data,in->mx.bytes,votes,16))return AdrenoHfiStartupInvalid;
+     c.gmu_count=SHENG_GMU_OPPS;
+     for(unsigned i=0;i<c.gmu_count;++i)c.gmu[i]=(AdrenoHfiPerformanceLevel){sheng_gmu_opps[i].hz,votes[i]};
+     const ShengGmuBcmInput *inputs[]={&in->sh0,&in->mc0,&in->acv};AdrenoHfiBcm bcms[3];
++    sheng_gmu_vote_stage=4;
+     for(unsigned i=0;i<3;++i) {
+         bcms[i]=sheng_bcm_policy[i];bcms[i].address=inputs[i]->address;
+         if(AdrenoHfiBcmAux(bcms+i,inputs[i]->aux.data,inputs[i]->aux.bytes))return AdrenoHfiStartupInvalid;
+     }
++    sheng_gmu_vote_stage=5;
+     if(AdrenoHfiBuildBandwidth(sheng_gpu_bandwidths,SHENG_GPU_BANDWIDTHS,bcms,3,in->cn0_address,&c))
+         return AdrenoHfiStartupInvalid;
++    sheng_gmu_vote_stage=6;
+     c.enable_ifpc=in->enable_ifpc;
+     if(AdrenoHfiStartupValidate(&c))return AdrenoHfiStartupInvalid;
++    sheng_gmu_vote_stage=0;
+     *out=c;return AdrenoHfiStartupSuccess;
+ }
+ unsigned ShengGmuPerfVote(unsigned perf,unsigned *bandwidth)
+diff --git a/iokit/NativeAdreno/ShengGmuVotesSource.h b/iokit/NativeAdreno/ShengGmuVotesSource.h
+index b0fc050..5059ff6 100644
+--- a/iokit/NativeAdreno/ShengGmuVotesSource.h
++++ b/iokit/NativeAdreno/ShengGmuVotesSource.h
+@@ -31,8 +31,8 @@ static const ShengGmuOpp sheng_gmu_opps[]={
+     {200000000ull,64u,0u,0u,0u},
+     {500000000ull,128u,0u,0u,0u},
+ };
+-#define SHENG_GPU_BANDWIDTHS 6u
+-static const uint32_t sheng_gpu_bandwidths[]={1720,2086,5931,7980,12191,12779};
++#define SHENG_GPU_BANDWIDTHS 7u
++static const uint32_t sheng_gpu_bandwidths[]={0,1720,2086,5931,7980,12191,12779};
+ static const AdrenoHfiBcm sheng_bcm_policy[3]={
+     /* SH0 */ {.buswidth=16,.fixed=0,.perfmode=0,.perfmode_kbps=0},
+     /* MC0 */ {.buswidth=4,.fixed=0,.perfmode=0,.perfmode_kbps=0},

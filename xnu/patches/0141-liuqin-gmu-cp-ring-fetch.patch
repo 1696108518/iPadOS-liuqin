@@ -1,0 +1,46 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -66,6 +66,8 @@
+     OSSharedPtr<IOMemoryMap> alt_gpu_map_;
+     /* The GPU SMMU window, for the read-only CP-fetch preflight. */
+     volatile uint8_t *smmu_base_=nullptr;
++    /* The memptrs page's CPU view, to see what the CP wrote back. */
++    void *fence_cpu_=nullptr;
+     NativeAdrenoGmuContext gmu_ctx_;
+     NativeAdrenoGmuPlatform gmu_platform_;
+     ShengGmuIo gmu_io_{};
+@@ -374,14 +376,23 @@
+     NativeAdrenoCpInitConfig config{GpuSqeIova,GpuPwrupIova,1};
+     uint32_t start_fence=0;
+     IOReturn status=cp.run(&io,&ring_,&config,&start_fence);
+-    IOLog("NativeAdreno: CP ME_INIT submit 0x%x fence=%u\n",status,start_fence);
++    uint32_t rptr_after=~0u,wptr_after=~0u;
++    (void)gpu_read32(&window,0x0806,&rptr_after);
++    (void)gpu_read32(&window,0x0807,&wptr_after);
++    IOLog("NativeAdreno: CP ME_INIT submit 0x%x fence=%u rptr=%u wptr=%u\n",
++        status,start_fence,rptr_after,wptr_after);
+     if(!status) {
+         uint32_t observed=0;
+         NativeAdrenoRingClock clock{nullptr,ring_now,nullptr};
+         const NativeAdrenoRingFence fence=ring_.wait(start_fence,&clock,2000,&observed);
+         if(fence!=NativeAdrenoRingFenceComplete) {
+-            IOLog("NativeAdreno: CP start fence %u not observed (%u, observed %u)\n",
+-                start_fence,unsigned(fence),observed);
++            (void)gpu_read32(&window,0x0806,&rptr_after);
++            (void)gpu_read32(&window,0x0807,&wptr_after);
++            const volatile uint32_t *mem=static_cast<const volatile uint32_t *>(fence_cpu_);
++            IOLog("NativeAdreno: CP start fence %u not observed (%u, observed %u) rptr=%u wptr=%u mem %08x %08x %08x %08x\n",
++                start_fence,unsigned(fence),observed,rptr_after,wptr_after,
++                mem?mem[0]:0xdeadbeefu,mem?mem[1]:0xdeadbeefu,
++                mem?mem[2]:0xdeadbeefu,mem?mem[3]:0xdeadbeefu);
+             status=kIOReturnTimeout;
+         }
+     }
+@@ -938,6 +949,7 @@
+                                         void *ring_cpu=NativeAdrenoGpuContextBufferCpu(1);
+                                         void *fence_cpu=NativeAdrenoGpuContextBufferCpu(2);
+                                         void *pwrup_cpu=NativeAdrenoGpuContextBufferCpu(3);
++                                        fence_cpu_=fence_cpu;
+                                         IOReturn ring_status=NativeAdrenoGpuContextBuffers(b);
+                                         if(!ring_status && (!ring_cpu || !fence_cpu || !pwrup_cpu))ring_status=kIOReturnNotReady;
+                                         if(ring_status) {

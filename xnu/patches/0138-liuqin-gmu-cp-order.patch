@@ -1,0 +1,156 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -91,7 +91,7 @@
+     GpuCtxCache gpu_ctx_cache_{};
+     static int gpu_ring_publish(void *,const volatile uint32_t *,size_t);
+     IOReturn startCp(NativeAdrenoGpuWindow &,const NativeAdrenoRingIo &,
+-        const NativeAdrenoGpuBuffer *,void *);
++        const NativeAdrenoGpuBuffer *,void *,unsigned phase);
+     /* a6xx_gmu_set_oob(GMU_OOB_GPU_SET): the GMU powers the GPU's GX domain
+      * and acknowledges on GMU2HOST_INTR_INFO bit 31. */
+     IOReturn powerGx();
+@@ -263,10 +263,16 @@
+     IOLog("NativeAdreno: OOB GPU_SET %s (intr=0x%x)\n",status?"NOT ACKED":"acked",info);
+     return status;
+ }
++/* Two phases, in the ladder's order: phase 0 writes the CP's AHB control and
++ * the RBBM/UCHE/CP configuration and publishes the power-up register list;
++ * the caller then attaches the ring (CP_RB_*), and phase 1 starts the SQE and
++ * submits a7xx_cp_init through that ring.  Writing CP_RB_* before the CP's
++ * AHB is on leaves the CP wedged, which is what stalled CP_SQE_CNTL before. */
+ IOReturn NativeAdrenoGpuService::startCp(NativeAdrenoGpuWindow &window,
+-    const NativeAdrenoRingIo &io,const NativeAdrenoGpuBuffer *b,void *pwrup_cpu)
++    const NativeAdrenoRingIo &io,const NativeAdrenoGpuBuffer *b,void *pwrup_cpu,unsigned phase)
+ {
+     if(!b || !pwrup_cpu)return kIOReturnBadArgument;
++    if(phase==0) {
+     struct {uint32_t reg,value;} const regs[]={
+         /* The ladder writes GBIF_HALT before anything else; with the GBIF
+          * halted the SQE's first instruction fetch never completes and the
+@@ -305,23 +311,28 @@
+         {0x0a98,(uint32_t)(GpuMemptrsIova+0x100)},{0x0a99,0}, /* CP_BV_RB_RPTR_ADDR */
+         {0x0802,0x0800020c},                         /* CP_RB_CNTL */
+     };
+-    for(unsigned i=0;i<sizeof(regs)/sizeof(regs[0]);++i)
+-        if(gpu_write32(&window,regs[i].reg,regs[i].value)) {
+-            IOLog("NativeAdreno: CP init write 0x%x failed\n",regs[i].reg);
+-            return kIOReturnIOError;
+-        }
+-    uint32_t eco=0;
+-    if(!gpu_read32(&window,0x8e28,&eco))
+-        (void)gpu_write32(&window,0x8e28,eco|(1u<<11)); /* RB_CMP_DBG_ECO_CNTL */
+-    IOLog("NativeAdreno: CP registers written\n");
+-    /* Starting the SQE by writing CP_SQE_CNTL has hung the bus twice: the store
+-     * never completes, so the SQE's fetch path is not usable at that moment.
+-     * Read it first (safe), then start only on request so a boot survives and
+-     * the rest of the CP path can be observed. */
++        for(unsigned i=0;i<sizeof(regs)/sizeof(regs[0]);++i)
++            if(gpu_write32(&window,regs[i].reg,regs[i].value)) {
++                IOLog("NativeAdreno: CP init write 0x%x failed\n",regs[i].reg);
++                return kIOReturnIOError;
++            }
++        uint32_t eco=0;
++        if(!gpu_read32(&window,0x8e28,&eco))
++            (void)gpu_write32(&window,0x8e28,eco|(1u<<11)); /* RB_CMP_DBG_ECO_CNTL */
++        IOLog("NativeAdreno: CP registers written (AHB on, SQE base set)\n");
++        size_t list_bytes=0;
++        const IOReturn list_status=NativeAdrenoPwrupList::buildA740(gpu_read32,&window,
++            static_cast<uint8_t *>(pwrup_cpu),0x1000,&list_bytes);
++        IOLog("NativeAdreno: CP power-up list status=0x%x bytes=%u\n",list_status,(unsigned)list_bytes);
++        if(list_status)return kIOReturnIOError;
++        const IOReturn published=maintainPhysical(b[3].physical,0x1000,NativeAdrenoClean)?
++            kIOReturnIOError:kIOReturnSuccess;
++        IOLog("NativeAdreno: CP power-up list published 0x%x at 0x%llx\n",published,
++            (unsigned long long)b[3].physical);
++        return published;
++    }
+     uint32_t sqe_cntl=~0u;
+     (void)gpu_read32(&window,0x0808,&sqe_cntl);
+-    /* Enabled by default now that the two missing writes are in; pass 0 to
+-     * keep the SQE stopped and still get the readbacks. */
+     uint32_t sqe_start=1;
+     PE_parse_boot_argn("sheng-gpu-sqe-start",&sqe_start,sizeof(sqe_start));
+     IOLog("NativeAdreno: CP_SQE_CNTL reads 0x%x, start=%s\n",sqe_cntl,
+@@ -334,7 +345,6 @@
+     IOSleep(20);
+     IOLog("NativeAdreno: CP settle done\n");
+     uint32_t rbbm=~0u,fault=~0u,rptr=~0u,sqe_lo=~0u,sqe_hi=~0u,rb_lo=~0u,rb_hi=~0u;
+-    IOLog("NativeAdreno: CP readback start\n");
+     (void)gpu_read32(&window,0x0210,&rbbm);
+     (void)gpu_read32(&window,0x0821,&fault);
+     (void)gpu_read32(&window,0x0806,&rptr);
+@@ -344,23 +354,11 @@
+     (void)gpu_read32(&window,0x0831,&sqe_hi);
+     IOLog("NativeAdreno: CP SQE alive rbbm=0x%x hw_fault=0x%x rptr=%u sqe=0x%x%08x (want 0x%llx) rb=0x%x%08x\n",
+         rbbm,fault,rptr,sqe_hi,sqe_lo,(unsigned long long)GpuSqeIova,rb_hi,rb_lo);
+-    size_t list_bytes=0;
+-    const IOReturn list_status=NativeAdrenoPwrupList::buildA740(gpu_read32,&window,
+-        static_cast<uint8_t *>(pwrup_cpu),0x1000,&list_bytes);
+-    IOLog("NativeAdreno: CP power-up list status=0x%x bytes=%u\n",list_status,(unsigned)list_bytes);
+-    if(list_status)return kIOReturnIOError;
+-    const IOReturn publish_status=maintainPhysical(b[3].physical,0x1000,NativeAdrenoClean)?
+-        kIOReturnIOError:kIOReturnSuccess;
+-    IOLog("NativeAdreno: CP power-up list published 0x%x at 0x%llx\n",publish_status,
+-        (unsigned long long)b[3].physical);
+-    IOReturn status=publish_status;
+     NativeAdrenoCpInit cp;
+     NativeAdrenoCpInitConfig config{GpuSqeIova,GpuPwrupIova,1};
+     uint32_t start_fence=0;
+-    if(!status) {
+-        status=cp.run(&io,&ring_,&config,&start_fence);
+-        IOLog("NativeAdreno: CP ME_INIT submit 0x%x fence=%u\n",status,start_fence);
+-    }
++    IOReturn status=cp.run(&io,&ring_,&config,&start_fence);
++    IOLog("NativeAdreno: CP ME_INIT submit 0x%x fence=%u\n",status,start_fence);
+     if(!status) {
+         uint32_t observed=0;
+         NativeAdrenoRingClock clock{nullptr,ring_now,nullptr};
+@@ -376,10 +374,9 @@
+             status,rbbm,fault);
+         return status;
+     }
+-    IOLog("NativeAdreno: CP started fence=%u list=%u bytes\n",start_fence,unsigned(list_bytes));
++    IOLog("NativeAdreno: CP started fence=%u\n",start_fence);
+     return kIOReturnSuccess;
+ }
+-
+ uint64_t NativeAdrenoGpuService::ring_now(void *)
+ {
+     uint64_t microseconds=0;
+@@ -949,6 +946,14 @@
+                                                 }
+                                             }
+                                             NativeAdrenoRingIo ring_io{&gpu_window,gpu_write32,gpu_read32,gpu_barrier};
++                                            /* The ladder's order: the CP's AHB and the
++                                             * RBBM/UCHE setup first, then the ring
++                                             * registers, then the SQE start.  Writing
++                                             * CP_RB_* while the CP's AHB is still off
++                                             * leaves it wedged, which is what stalled the
++                                             * SQE write in every earlier attempt. */
++                                            ring_status=startCp(gpu_window,ring_io,b,pwrup_cpu,0);
++                                            if(ring_status) IOLog("NativeAdreno: CP register set stopped at 0x%x\n",ring_status);
+                                             gpu_ctx_cache_={b[1].physical,b[2].physical,
+                                                 reinterpret_cast<uintptr_t>(ring_cpu),
+                                                 reinterpret_cast<uintptr_t>(fence_cpu),
+@@ -956,16 +961,17 @@
+                                                 static_cast<size_t>(b[2].bytes)};
+                                             NativeAdrenoRingCache cache{&gpu_ctx_cache_,gpu_ring_publish,gpu_fence_acquire};
+                                             native_adreno_fence_phys=b[2].physical;
+-                                            ring_status=ring_.attach(&ring_io,&cache,ring_cpu,
+-                                                static_cast<size_t>(b[1].bytes),GpuRingIova,
+-                                                fence_cpu,static_cast<size_t>(b[2].bytes),GpuMemptrsIova);
++                                            if(!ring_status)
++                                                ring_status=ring_.attach(&ring_io,&cache,ring_cpu,
++                                                    static_cast<size_t>(b[1].bytes),GpuRingIova,
++                                                    fence_cpu,static_cast<size_t>(b[2].bytes),GpuMemptrsIova);
+                                             if(ring_status)
+                                                 IOLog("NativeAdreno: CP ring attach stopped at 0x%x\n",ring_status);
+                                             else {
+                                                 IOLog("NativeAdreno: CP ring attached ring 0x%llx/0x%x fence 0x%llx/0x%x\n",
+                                                     (unsigned long long)GpuRingIova,static_cast<unsigned>(b[1].bytes),
+                                                     (unsigned long long)GpuMemptrsIova,static_cast<unsigned>(b[2].bytes));
+-                                                ring_status=startCp(gpu_window,ring_io,b,pwrup_cpu);
++                                                ring_status=startCp(gpu_window,ring_io,b,pwrup_cpu,1);
+                                             }
+                                         }
+                                     }
