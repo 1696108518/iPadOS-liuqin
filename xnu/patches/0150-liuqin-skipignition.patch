@@ -1,0 +1,29 @@
+Add skipIgnition to the commpage dyld_flags before launchd is exec'd.
+
+The stock iOS 16.6 dyld-1066 probes libignition first; without kernel-side
+ignition support it comes back with a cache fd that does not resolve to our
+on-disk cache, and launchd dies on the missing libSystem.  Setting
+dyld_flags=0x8 (skipIgnition) makes dyld fall through to the plain system
+cache directory instead.
+---
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -6879,6 +6879,18 @@
+ 	mach_vm_offset_t scratch_addr = 0;
+ 	mach_vm_size_t map_page_size = vm_map_page_size(map);
+ 
++#if defined(ARM64_BOARD_CONFIG_LIUQIN)
++	{
++		/* LIUQIN: there is no kernel-side ignition support, and the
++		 * stock dyld probes it first, fails with a NULL cache dir and
++		 * dies on the missing libSystem.  Skip it and let dyld fall
++		 * through to the on-disk cache in /System/Library/Caches. */
++		extern void commpage_update_dyld_flags(uint64_t);
++		commpage_update_dyld_flags(0x8); /* skipIgnition */
++		printf("LIUQIN: commpage dyld_flags=skipIgnition\n");
++	}
++#endif
++
+ 	(void) mach_vm_allocate_kernel(map, &scratch_addr, map_page_size, VM_FLAGS_ANYWHERE, VM_KERN_MEMORY_NONE);
+ #if CONFIG_MEMORYSTATUS
+ 	(void) memorystatus_init_at_boot_snapshot();
