@@ -26,5 +26,5 @@ tools/verify-patches.sh
 Fetch the CI artifact:
 
 ```sh
-gh run download -R YOU/iPadOS-liuqin -n xnu-kernel -D xnu/out
+gh run download -R QPRS-6/iPadOS-liuqin -n xnu-kernel -D xnu/out
 ```

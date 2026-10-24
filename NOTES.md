@@ -299,6 +299,11 @@ backtrace 和 stackshot —— 身份、boot_args、符号化都对了。
 
 ## 8. 交接
 
+- **2026-10-24 仓库公开**：完整历史已推到 https://github.com/QPRS-6/iPadOS-liuqin
+  （`main`，初始提交 `fd94d82`）。`.gitignore` 仍排除 `backup/` `dtb/` `recovery/`
+  `research/`，仓库里没有设备转储、序列号或 Apple 二进制。这次 push 命中了
+  `xnu.yml` 的 `xnu/patches/**` 路径过滤，内核 CI 已自动触发。
+
 - **2026-10-24 USB 上电（0147）**：`liuqinusb=2` 那张没被主机识别。原因大概率是
   `fastboot boot` 交接后 ABL 把 USB30_PRIM 的 GDSC 折叠、分支时钟关掉，而 probe 只
   读不写，读到 off 就直接返回（`controller unpowered or unclocked; DWC3 not read`），

@@ -59,8 +59,8 @@ tools/build-local.sh
 驱动（固定 commit `6639065`）。GitHub runner 上是：
 
 ```sh
-gh workflow run xnu.yml -R YOU/iPadOS-liuqin
-gh run download RUN_ID -R YOU/iPadOS-liuqin -n xnu-kernel -D xnu/out
+gh workflow run xnu.yml -R QPRS-6/iPadOS-liuqin
+gh run download RUN_ID -R QPRS-6/iPadOS-liuqin -n xnu-kernel -D xnu/out
 ```
 
 产物是 `kernel.development.liuqin`（`MACHINE_CONFIG=LIUQIN`）。本地验证补丁能否应用：

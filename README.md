@@ -57,8 +57,8 @@ Derived from [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet) (
 
 ```sh
 # 1. kernel: needs a macOS runner with Xcode 15
-gh workflow run xnu.yml -R YOU/iPadOS-liuqin
-gh run download RUN_ID -R YOU/iPadOS-liuqin -n xnu-kernel -D xnu/out
+gh workflow run xnu.yml -R QPRS-6/iPadOS-liuqin
+gh run download RUN_ID -R QPRS-6/iPadOS-liuqin -n xnu-kernel -D xnu/out
 
 # 2. ADT + payload + boot image
 python3 tools/mkadt.py shim/out/liuqin.adt --dtb dtb/boot_unpacked/dtb
