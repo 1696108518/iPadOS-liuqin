@@ -1,0 +1,63 @@
+Add shared-region diagnostics for the LIUQIN bring-up.
+
+Unconditional printf at every failure exit of the shared cache mapping path
+(shared_region_map_and_slide_setup, _shared_region_map_and_slide,
+vm_shared_region_map_file_setup, vm_shared_region_map_file) so the first
+launchd exec reports exactly which check fails and with which errno.
+---
+--- a/bsd/vm/vm_unix.c
++++ b/bsd/vm/vm_unix.c
+@@ -2247,6 +2247,7 @@
+ 		(void *)VM_KERNEL_ADDRPERM(current_thread()),
+ 		proc_getpid(p), p->p_comm));
+ 
++	printf("LIUQIN SR: map_and_slide_setup files=%u mappings=%u\n", files_count, mappings_count);
+ 	if (files_count > _SR_FILE_MAPPINGS_MAX_FILES) {
+ 		error = E2BIG;
+ 		goto done;
+@@ -2678,6 +2679,7 @@
+ 	}
+ done:
+ 	if (error != 0) {
++		printf("LIUQIN SR: map_and_slide failed error=%d files=%u\n", error, files_count);
+ 		shared_region_map_and_slide_cleanup(p, files_count, *sr_file_mappings, shared_region);
+ 		*sr_file_mappings = NULL;
+ 		*shared_region_ptr = NULL;
+@@ -2887,6 +2889,7 @@
+ 
+ 	files_count = uap->files_count;
+ 	mappings_count = uap->mappings_count;
++	printf("LIUQIN SR: map_and_slide_2_np files=%u mappings=%u\n", files_count, mappings_count);
+ 
+ 	if (files_count == 0) {
+ 		SHARED_REGION_TRACE_INFO(
+@@ -2992,6 +2995,9 @@
+ 
+ 	kr = _shared_region_map_and_slide(p, files_count, shared_files, mappings_count, mappings);
+ done:
++	if (kr != KERN_SUCCESS) {
++		printf("LIUQIN SR: map_and_slide_2_np failed kr=%d\n", kr);
++	}
+ 	kfree_data(shared_files, files_count * sizeof(shared_files[0]));
+ 	kfree_data(mappings, mappings_count * sizeof(mappings[0]));
+ 	return kr;
+--- a/osfmk/vm/vm_shared_region.c
++++ b/osfmk/vm/vm_shared_region.c
+@@ -1977,6 +1977,7 @@
+ 	    &mappings_to_slide_cnt, mappings_to_slide, slid_mappings, slid_file_controls,
+ 	    &sfm_min_address, &sfm_max_address, &sr_map, &lowest_unnestable_addr, vmsr_num_slides);
+ 	if (kr != KERN_SUCCESS) {
++		printf("LIUQIN SR: map_file_setup failed kr=%d\n", kr);
+ 		vm_shared_region_lock();
+ 		goto done;
+ 	}
+@@ -2085,6 +2086,9 @@
+ 		kfree_type(memory_object_control_t, vmsr_num_slides, slid_file_controls);
+ 		kfree_type(struct shared_file_mapping_slide_np *, vmsr_num_slides,
+ 		    mappings_to_slide);
++	}
++	if (kr != KERN_SUCCESS) {
++		printf("LIUQIN SR: map_file failed kr=%d\n", kr);
+ 	}
+ 	return kr;
+ }
