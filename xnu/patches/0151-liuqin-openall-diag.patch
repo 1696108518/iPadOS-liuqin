@@ -1,24 +1,20 @@
-Log every open() by pid 1 (launchd/dyld), success or failure.
-
-Full visibility of the dyld file access sequence during the shared cache
-bring-up.
+Replace the 0149 ENOENT-only diagnostic with a log of every open() done by
+pid 1 (launchd/dyld), success or failure, for full visibility of the dyld
+file access sequence during shared cache bring-up.
 ---
 --- a/bsd/vfs/vfs_syscalls.c
 +++ b/bsd/vfs/vfs_syscalls.c
-@@ -5058,6 +5058,16 @@
- 
+@@ -5059,11 +5059,11 @@
  	error = open1at(ctx, ndp, flags, vap, NULL, NULL, retval, fd, AUTH_OPEN_NOAUTHFD);
  
-+#if defined(ARM64_BOARD_CONFIG_LIUQIN)
+ #if defined(ARM64_BOARD_CONFIG_LIUQIN)
+-	if (error == ENOENT && vfs_context_proc(ctx)->p_pid == 1) {
 +	if (vfs_context_proc(ctx)->p_pid == 1) {
-+		char kpath[256];
-+		size_t done = 0;
-+		if (copyinstr(path, kpath, sizeof(kpath), &done) == 0) {
+ 		char kpath[256];
+ 		size_t done = 0;
+ 		if (copyinstr(path, kpath, sizeof(kpath), &done) == 0) {
+-			printf("LIUQIN OPENFAIL pid 1: '%s' flags=%d\n", kpath, flags);
 +			printf("LIUQIN OPEN pid 1: '%s' flags=%d err=%d\n", kpath, flags, error);
-+		}
-+	}
-+#endif
-+
- 	kfree_type(typeof(*__open_data), __open_data);
- 
- 	return error;
+ 		}
+ 	}
+ #endif
