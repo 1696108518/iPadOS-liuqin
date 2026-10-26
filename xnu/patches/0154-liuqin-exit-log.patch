@@ -1,0 +1,28 @@
+Log the wait status of processes that exit on their own.  Patch 0043/0044 only
+report fatal signals, so an exit loop (biomed restarting every few seconds with no
+crash line) is invisible on the console.
+---
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1578,6 +1578,21 @@
+ 
+ 	p->p_lflag |= P_LEXIT;
+ 	p->p_xstat = rv;
++#if defined(ARM64_BOARD_CONFIG_LIUQIN)
++	{
++		/*
++		 * LIUQIN: a daemon that exits on its own leaves no trace in the
++		 * console log (0043/0044 only report fatal signals), which makes an
++		 * exit loop like biomed's invisible.  Print the wait status of the
++		 * first few hundred exits; W_EXITCODE puts the code in bits 8..15.
++		 */
++		static int liuqin_exit_logs;
++		if (liuqin_exit_logs < 400) {
++			liuqin_exit_logs++;
++			printf("LIUQIN EXIT %s[%d] status 0x%x\n", p->p_comm, p->p_pid, rv);
++		}
++	}
++#endif
+ 	p->p_lflag |= jetsam_flags;
+ 
+ 	proc_transend(p, 1);
