@@ -38,6 +38,8 @@ jobs:
     # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
     runs-on: macos-14
     timeout-minutes: 120
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -122,3 +124,20 @@ jobs:
           name: xnu-kernel
           path: out/
           if-no-files-found: warn
+
+      # Artifacts are served from Azure blob storage, which some networks
+      # reset; release assets come from objects.githubusercontent.com, so
+      # publish the same kernel there for a second download path.
+      - name: Publish kernel as a release asset
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -f out/kernel.development.liuqin ]; then
+            gh release delete kernel-latest -y --cleanup-tag 2>/dev/null || true
+            gh release create kernel-latest \
+              --title "kernel-latest" \
+              --notes "xnu ${{ github.sha }}" \
+              --prerelease \
+              out/kernel.development.liuqin
+          fi
