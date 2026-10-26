@@ -1,0 +1,45 @@
+Accept PM user-client assertion calls without going through
+gIOPMWorkLoop, whose gate is held for the whole boot on this port: profiled
+blocked in -[MCPowerAssertion initWithReason:] before its run loop, so
+SpringBoard's synchronous -[MCProfileConnection checkIn] never returned.
+---
+--- a/iokit/Kernel/RootDomainUserClient.cpp
++++ b/iokit/Kernel/RootDomainUserClient.cpp
+@@ -394,6 +394,8 @@
+ 
+ 	return dispatchExternalMethod(selector, args, dispatchArray, sizeof(dispatchArray) / sizeof(dispatchArray[0]), this, NULL);
+ }
++static int liuqin_pm_uc_logged;
++
+ IOReturn
+ RootDomainUserClient::externalMethodDispatched(OSObject * target, void * reference, IOExternalMethodArguments * arguments)
+ {
+@@ -452,15 +454,22 @@
+ 		break;
+ 
+ 	case kPMSetUserAssertionLevels:
+-		ret = me->secureSetUserAssertionLevels(
+-			(uint32_t)arguments->scalarInput[0]);
++		/* LIUQIN: on this port gIOPMWorkLoop's gate is held for the whole
++		 * boot, so PMAssertionsTracker::setUserAssertionLevels() blocks in
++		 * IOWorkLoop::runAction()/closeGate() and the caller never returns:
++		 * profiled wedges in -[MCPowerAssertion initWithReason:] before its
++		 * event loop starts, so SpringBoard's synchronous
++		 * -[MCProfileConnection checkIn] never gets a reply and the shell
++		 * never presents.  User assertions only gate idle sleep, which this
++		 * port does not implement; accept them without touching the loop. */
++		if (liuqin_pm_uc_logged++ == 0) {
++			printf("LIUQIN PM: user assertion levels accepted without the work-loop gate\n");
++		}
++		ret = kIOReturnSuccess;
+ 		break;
+ 
+ 	case kPMActivityTickle:
+-		if (me->fOwner->checkSystemCanSustainFullWake()) {
+-			me->fOwner->reportUserInput();
+-			me->fOwner->setProperty(kIOPMRootDomainWakeTypeKey, "UserActivity Assertion");
+-		}
++		/* LIUQIN: same gate as above; reportUserInput() would take it. */
+ 		ret = kIOReturnSuccess;
+ 		break;
+ 
