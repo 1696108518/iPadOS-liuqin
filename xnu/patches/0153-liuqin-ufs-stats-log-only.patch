@@ -1,0 +1,18 @@
+Keep the periodic UFS I/O statistics out of the panel: they were forced
+through liuqinmute, so every 1024 MiB they scrolled over the Apple logo and the
+userspace boot progress bar.  They still reach the persistent console log.
+---
+--- a/bsd/dev/liuqin_ufs.c
++++ b/bsd/dev/liuqin_ufs.c
+@@ -358,7 +358,10 @@
+ 		if ((st_ops & 0x3ff) == 0 && elapsed > 0) {
+ 			uint64_t us = elapsed / 1000;
+ 			extern int liuqin_console_force;
+-			liuqin_console_force = 1;      /* visible even with liuqinmute=1 */
++			/* LIUQIN: keep these periodic statistics in the persistent
++			 * console log only.  Forcing them onto the panel paints over
++			 * the Apple logo and the second-boot progress bar.
++			 */
+ 			/* Bytes/ns * 1e9 / 2^20 is MiB/s; the old label said
+ 			 * KiB/s but the printed number was already MiB/s. */
+ 			printf("LIUQIN UFS: %llu ops, %llu MiB, %llu ms, %llu MiB/s, %llu us/op\n",
