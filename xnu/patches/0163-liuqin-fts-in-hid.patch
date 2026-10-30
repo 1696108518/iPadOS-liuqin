@@ -1,0 +1,359 @@
+LIUQIN: FocalTech fts_ts touch over GENI SPI, polled every 8 ms from inside
+LiuqinHID.cpp (avoids a second translation unit whose files.arm64 hunk kept
+missing its context): SE0 (0x00980000) reset 17/irq 51 probed first, then SE1
+(0x00990000) 20/21; coords 1080x2340 rescaled to 1800x2880; liuqinfts=0 disables.
+---
+--- a/iokit/Kernel/arm/hid/LiuqinHID.cpp
++++ b/iokit/Kernel/arm/hid/LiuqinHID.cpp
+@@ -30,6 +30,7 @@
+ #include "IOHIDUsageTables.h"
+ 
+ extern "C" uint64_t mach_absolute_time(void);
++extern "C" void liuqin_fts_start(void);
+ 
+ /* One open client: the user client and its event callback. */
+ class IOHIDEventServiceClient : public OSObject {
+@@ -429,6 +430,9 @@
+ 	gLiuqinTouch = this;
+ 	registerService();
+ 	IOLog("LIUQIN HID: touch registered\n");
++	/* The FocalTech controller on GENI SPI feeds liuqin_hid_touch from an
++	 * 8 ms timer; start it once this event service exists. */
++	liuqin_fts_start();
+ 	return true;
+ }
+ 
+@@ -537,3 +541,333 @@
+ 		gLiuqinTouch->touch(finger, down != 0, x, y);
+ 	}
+ }
++
++/*
++ * LIUQIN: FocalTech fts_ts touch over a GENI SPI engine, polled.  The dtbo
++ * overlay for this board puts the controller on SE0 (0x00980000, 6 MHz) with
++ * reset GPIO 17 and interrupt GPIO 51 (level low); the alternate panel is
++ * SE1 (0x00990000) with 20/21.  Every 8 ms the driver reads the firmware
++ * touch FIFO (register 0x00, 20 bytes: [0] must be 0x00, [1] the point
++ * count, then up to 5 * {xh, xl, yh, yl}) and reports through
++ * liuqin_hid_touch.  Coordinates are hardware pixels 0..1079 / 0..2339 and
++ * are rescaled to the digitizer's 1800x2880 here.  liuqinfts=0 disables.
++ */
++#define FTS_GENI_BASE        0x00980000ull
++#define FTS_GENI_ALT_BASE    0x00990000ull
++#define FTS_GENI_SIZE        0x4000ull
++#define FTS_GENI_STATUS      0x040u
++#define FTS_GENI_FW_REVISION 0x068u
++#define FTS_GENI_M_IRQ_STATUS 0x610u
++#define FTS_GENI_M_IRQ_CLEAR 0x618u
++#define FTS_GENI_TX_LEN      0x26cu
++#define FTS_GENI_RX_LEN      0x270u
++#define FTS_GENI_TX_FIFO     0x700u
++#define FTS_GENI_RX_FIFO     0x780u
++#define FTS_M_CMD_DONE       (1u << 0)
++#define FTS_M_ERRORS         ((1u<<1)|(1u<<2)|(1u<<3)|(0x3fu<<9))
++
++#define FTS_TLMM_BASE   0x0f100000ull
++#define FTS_RESET_GPIO  17
++#define FTS_IRQ_GPIO    51
++#define FTS_RESET_GPIO_B 20
++#define FTS_IRQ_GPIO_B    21
++#define FTS_TLMM_CFG(g) ((g) * 0x1000u)
++#define FTS_TLMM_INOUT(g) (FTS_TLMM_CFG(g) + 0x4u)
++#define FTS_TLMM_OE(g)    (FTS_TLMM_CFG(g) + 0x8u)
++
++#define FTS_POLL_MS  8
++#define FTS_X_MAX    1080
++#define FTS_Y_MAX    2340
++
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++class LiuqinFTS : public OSObject {
++	OSDeclareDefaultStructors(LiuqinFTS);
++public:
++	bool init(vm_offset_t geni, vm_offset_t tlmm, uint32_t reset_gpio,
++	    uint32_t irq_gpio);
++	void free(void) APPLE_KEXT_OVERRIDE;
++	bool startPolling(void);
++private:
++	static void pollFired(OSObject *owner, IOTimerEventSource *sender);
++	void poll(void);
++	int xfer(const uint8_t *tx, uint8_t *rx, uint32_t len);
++	int readRegs(uint8_t addr, uint8_t *out, uint32_t n);
++	void resetChip(void);
++	inline uint32_t gr(uint32_t off) {
++		return OSReadLittleInt32((const void *)fGeni, off);
++	}
++	inline void gw(uint32_t off, uint32_t v) {
++		OSWriteLittleInt32((void *)fGeni, off, v);
++	}
++	inline uint32_t tr(uint32_t off) {
++		return OSReadLittleInt32((const void *)fTlmm, off);
++	}
++	inline void tw(uint32_t off, uint32_t v) {
++		OSWriteLittleInt32((void *)fTlmm, off, v);
++	}
++	vm_offset_t fGeni, fTlmm;
++	uint32_t fResetGpio, fIrqGpio;
++	IOTimerEventSource *fTimer;
++	IOWorkLoop *fWorkLoop;
++	IOLock *fLock;
++	uint32_t fPolls, fEvents, fErrors;
++	uint8_t fDown[5];
++	int16_t fX[5], fY[5];
++	uint8_t fCount, fFailed;
++};
++
++static LiuqinFTS *gLiuqinFTS;
++
++OSDefineMetaClassAndStructors(LiuqinFTS, OSObject);
++
++bool
++LiuqinFTS::init(vm_offset_t geni, vm_offset_t tlmm, uint32_t reset_gpio,
++    uint32_t irq_gpio)
++{
++	if (!OSObject::init()) {
++		return false;
++	}
++	fGeni = geni;
++	fTlmm = tlmm;
++	fResetGpio = reset_gpio;
++	fIrqGpio = irq_gpio;
++	fTimer = 0;
++	fWorkLoop = 0;
++	fLock = 0;
++	fPolls = fEvents = fErrors = 0;
++	fCount = 0;
++	for (int i = 0; i < 5; i++) {
++		fDown[i] = 0;
++		fX[i] = fY[i] = -1;
++	}
++	return true;
++}
++
++void
++LiuqinFTS::free(void)
++{
++	if (fTimer) {
++		fTimer->release();
++		fTimer = 0;
++	}
++	if (fLock) {
++		IOLockFree(fLock);
++		fLock = 0;
++	}
++	OSObject::free();
++}
++
++int
++LiuqinFTS::xfer(const uint8_t *tx, uint8_t *rx, uint32_t len)
++{
++	if (len == 0 || len > 64) {
++		return -1;
++	}
++	gw(FTS_GENI_M_IRQ_CLEAR, 0xffffffffu);
++	gw(FTS_GENI_TX_LEN, len);
++	gw(FTS_GENI_RX_LEN, len);
++	for (uint32_t i = 0; i < len; i += 4) {
++		uint32_t w = 0;
++		if (tx) {
++			w = (uint32_t)tx[i];
++			if (i + 1 < len) w |= (uint32_t)tx[i + 1] << 8;
++			if (i + 2 < len) w |= (uint32_t)tx[i + 2] << 16;
++			if (i + 3 < len) w |= (uint32_t)tx[i + 3] << 24;
++		}
++		gw(FTS_GENI_TX_FIFO, w);
++	}
++	gw(0x600u, (1u << 28) | len);       /* SPI protocol transfer */
++	for (int spin = 0; spin < 20000; spin++) {
++		uint32_t st = gr(FTS_GENI_M_IRQ_STATUS);
++		if (st & FTS_M_ERRORS) {
++			gw(FTS_GENI_M_IRQ_CLEAR, st & FTS_M_ERRORS);
++			fErrors++;
++			return -1;
++		}
++		if (st & FTS_M_CMD_DONE) {
++			gw(FTS_GENI_M_IRQ_CLEAR, FTS_M_CMD_DONE);
++			if (rx) {
++				for (uint32_t i = 0; i < len; i += 4) {
++					uint32_t w = gr(FTS_GENI_RX_FIFO);
++					for (uint32_t j = 0; j < 4 && i + j < len; j++) {
++						rx[i + j] = (uint8_t)(w >> (j * 8));
++					}
++				}
++			}
++			return 0;
++		}
++	}
++	fErrors++;
++	return -1;
++}
++
++int
++LiuqinFTS::readRegs(uint8_t addr, uint8_t *out, uint32_t n)
++{
++	uint8_t buf[80];
++	if (n + 2 > sizeof(buf)) {
++		return -1;
++	}
++	buf[0] = 0xff;                      /* dummy byte on the wire */
++	buf[1] = addr | 0x80;               /* bit7 = read */
++	for (uint32_t i = 2; i < n + 2; i++) {
++		buf[i] = 0xff;
++	}
++	int rc = xfer(buf, buf, n + 2);
++	if (rc == 0) {
++		for (uint32_t i = 0; i < n; i++) {
++			out[i] = buf[2 + i];
++		}
++	}
++	return rc;
++}
++
++void
++LiuqinFTS::resetChip(void)
++{
++	tw(FTS_TLMM_OE(fResetGpio), 1);
++	tw(FTS_TLMM_INOUT(fResetGpio), 0);
++	for (volatile uint32_t i = 0; i < 200000; i++) {
++		/* ~10 ms */
++	}
++	tw(FTS_TLMM_INOUT(fResetGpio), 1);
++	for (volatile uint32_t i = 0; i < 4000000; i++) {
++		/* ~200 ms firmware boot */
++	}
++	tw(FTS_TLMM_OE(fIrqGpio), 0);       /* irq line = input */
++}
++
++void
++LiuqinFTS::poll(void)
++{
++	uint8_t buf[32];
++
++	fPolls++;
++	if (readRegs(0x00, buf, 20) != 0) {
++		fFailed++;
++		return;
++	}
++	if (buf[0] != 0x00) {
++		return;
++	}
++	uint8_t count = buf[1] & 0x0f;
++	if (count > 5) {
++		return;
++	}
++	bool changed = false;
++	for (uint8_t i = 0; i < 5; i++) {
++		bool down = i < count;
++		int16_t x = -1, y = -1;
++		if (down) {
++			const uint8_t *t = buf + 2 + i * 4;
++			int32_t hx = (int32_t)(((t[0] & 0x0f) << 8) | t[1]);
++			int32_t hy = (int32_t)(((t[2] & 0x0f) << 8) | t[3]);
++			if (hx >= FTS_X_MAX) hx = FTS_X_MAX - 1;
++			if (hy >= FTS_Y_MAX) hy = FTS_Y_MAX - 1;
++			/* digitizer space is 1800x2880 */
++			x = (int16_t)((hx * 1800) / FTS_X_MAX);
++			y = (int16_t)((hy * 2880) / FTS_Y_MAX);
++		}
++		if (down != (bool)fDown[i] || x != fX[i] || y != fY[i]) {
++			changed = true;
++		}
++		fDown[i] = down;
++		fX[i] = x;
++		fY[i] = y;
++		if (down || changed) {
++			liuqin_hid_touch(i, down, x, y);
++		}
++	}
++	if (changed) {
++		fEvents++;
++	}
++}
++
++void
++LiuqinFTS::pollFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	LiuqinFTS *self = (LiuqinFTS *)owner;
++	self->poll();
++	if (self->fFailed < 64) {
++		sender->setTimeoutMS(FTS_POLL_MS);
++	} else {
++		IOLog("LIUQIN FTS: too many bus errors, polling stopped "
++		    "(polls %u events %u errors %u)\n",
++		    self->fPolls, self->fEvents, self->fErrors);
++	}
++}
++
++bool
++LiuqinFTS::startPolling(void)
++{
++	fWorkLoop = IOWorkLoop::workLoop();
++	fLock = IOLockAlloc();
++	if (!fWorkLoop || !fLock) {
++		return false;
++	}
++	fTimer = IOTimerEventSource::timerEventSource(this, &LiuqinFTS::pollFired);
++	if (!fTimer || fWorkLoop->addEventSource(fTimer) != kIOReturnSuccess) {
++		return false;
++	}
++	fTimer->setTimeoutMS(FTS_POLL_MS);
++	return true;
++}
++
++/* Started from LiuqinHIDTouch::start so backboardd's event service exists
++ * before events flow.  Panel A (SE0, 17/51) is probed first, then panel B
++ * (SE1, 20/21); the engine firmware revision gate must show SPI. */
++extern "C" void
++liuqin_fts_start(void)
++{
++	uint32_t on = 1;
++	vm_offset_t geni, tlmm;
++
++	if (gLiuqinFTS) {
++		return;
++	}
++	PE_parse_boot_argn("liuqinfts", &on, sizeof(on));
++	if (!on) {
++		IOLog("LIUQIN FTS: disabled by boot-arg\n");
++		return;
++	}
++	geni = ml_io_map((vm_offset_t)FTS_GENI_BASE, FTS_GENI_SIZE);
++	tlmm = ml_io_map((vm_offset_t)FTS_TLMM_BASE, 0x400000);
++	if (!geni || !tlmm) {
++		IOLog("LIUQIN FTS: io map failed\n");
++		return;
++	}
++	for (int which = 0; which < 2; which++) {
++		vm_offset_t g = which == 0 ? geni :
++		    ml_io_map((vm_offset_t)FTS_GENI_ALT_BASE, FTS_GENI_SIZE);
++		uint32_t fw = OSReadLittleInt32((const void *)g, FTS_GENI_FW_REVISION);
++		if ((fw & 0x00ff0000u) == 0) {
++			IOLog("LIUQIN FTS: engine %d firmware missing (0x%x)\n",
++			    which, fw);
++			continue;
++		}
++		uint32_t rg = which == 0 ? FTS_RESET_GPIO : FTS_RESET_GPIO_B;
++		uint32_t ig = which == 0 ? FTS_IRQ_GPIO : FTS_IRQ_GPIO_B;
++		LiuqinFTS *fts = new LiuqinFTS;
++		if (!fts || !fts->init(g, tlmm, rg, ig)) {
++			IOLog("LIUQIN FTS: init failed\n");
++			return;
++		}
++		fts->resetChip();
++		uint8_t buf[20];
++		if (fts->readRegs(0x00, buf, 20) != 0 || buf[0] != 0x00) {
++			IOLog("LIUQIN FTS: panel %d no answer (hdr %02x)\n",
++			    which, buf[0]);
++			continue;
++		}
++		if (!fts->startPolling()) {
++			IOLog("LIUQIN FTS: timer failed\n");
++			return;
++		}
++		gLiuqinFTS = fts;
++		IOLog("LIUQIN FTS: panel %d started, header %02x %02x %02x\n",
++		    which, buf[0], buf[1], buf[2]);
++		return;
++	}
++	IOLog("LIUQIN FTS: no panel answered\n");
++}
