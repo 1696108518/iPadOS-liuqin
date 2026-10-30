@@ -1,5 +1,7 @@
 LIUQIN: FocalTech fts_ts touch over GENI SPI, polled every 8 ms from inside
-LiuqinHID.cpp: resetChip/readRegs are public (liuqin_fts_start uses them).
+LiuqinHID.cpp (resetChip/readRegs public).  Before probing, the QUP wrapper
+AHB and per-SE branch clocks are enabled in GCC (a gated SE read XPU-aborted
+the first boot).  Off by default: liuqinfts=1 enables.
 ---
 --- a/iokit/Kernel/arm/hid/LiuqinHID.cpp
 +++ b/iokit/Kernel/arm/hid/LiuqinHID.cpp
@@ -21,7 +23,7 @@ LiuqinHID.cpp: resetChip/readRegs are public (liuqin_fts_start uses them).
  	return true;
  }
  
-@@ -537,3 +541,334 @@
+@@ -537,3 +541,374 @@
  		gLiuqinTouch->touch(finger, down != 0, x, y);
  	}
  }
@@ -34,8 +36,26 @@ LiuqinHID.cpp: resetChip/readRegs are public (liuqin_fts_start uses them).
 + * touch FIFO (register 0x00, 20 bytes: [0] must be 0x00, [1] the point
 + * count, then up to 5 * {xh, xl, yh, yl}) and reports through
 + * liuqin_hid_touch.  Coordinates are hardware pixels 0..1079 / 0..2339 and
-+ * are rescaled to the digitizer's 1800x2880 here.  liuqinfts=0 disables.
++ * are rescaled to the digitizer's 1800x2880 here.
++ *
++ * The SE registers are unreachable until the QUP wrapper clocks run (a read
++ * of a gated engine hangs the bus and fires an XPU abort).  Before probing,
++ * the wrap AHB and the per-SE branch clocks are enabled in GCC (base
++ * 0x00100000): wrap0 m_ahb 0x7500, s_ahb 0x7508, s0 0x7514; wrap1 0x7600,
++ * 0x7608, 0x7614 - the layout shared by the sm8450/kalama GCC family.
++ * Disabled by default: liuqinfts=1 opts in (a wrong guess cost a boot once).
 + */
++#define FTS_GCC_BASE        0x00100000ull
++#define FTS_GCC_SIZE        0x80000ull
++#define FTS_GCC_WRAP0_M_AHB 0x7500u
++#define FTS_GCC_WRAP0_S_AHB 0x7508u
++#define FTS_GCC_WRAP0_S0    0x7514u
++#define FTS_GCC_WRAP1_M_AHB 0x7600u
++#define FTS_GCC_WRAP1_S_AHB 0x7608u
++#define FTS_GCC_WRAP1_S0    0x7614u
++#define FTS_CBCR_ENABLE     (1u << 0)
++#define FTS_CBCR_OFF        (1u << 31)
++
 +#define FTS_GENI_BASE        0x00980000ull
 +#define FTS_GENI_ALT_BASE    0x00990000ull
 +#define FTS_GENI_SIZE        0x4000ull
@@ -68,11 +88,10 @@ LiuqinHID.cpp: resetChip/readRegs are public (liuqin_fts_start uses them).
 +class LiuqinFTS : public OSObject {
 +	OSDeclareDefaultStructors(LiuqinFTS);
 +public:
-+	bool init(vm_offset_t geni, vm_offset_t tlmm, uint32_t reset_gpio,
-+	    uint32_t irq_gpio);
++	bool init(vm_offset_t geni, vm_offset_t tlmm, vm_offset_t gcc,
++	    uint32_t reset_gpio, uint32_t irq_gpio);
 +	void free(void) APPLE_KEXT_OVERRIDE;
 +	bool startPolling(void);
-+	/* resetChip/readRegs are used from liuqin_fts_start below. */
 +	void resetChip(void);
 +	int readRegs(uint8_t addr, uint8_t *out, uint32_t n);
 +private:
@@ -91,7 +110,7 @@ LiuqinHID.cpp: resetChip/readRegs are public (liuqin_fts_start uses them).
 +	inline void tw(uint32_t off, uint32_t v) {
 +		OSWriteLittleInt32((void *)fTlmm, off, v);
 +	}
-+	vm_offset_t fGeni, fTlmm;
++	vm_offset_t fGeni, fTlmm, fGcc;
 +	uint32_t fResetGpio, fIrqGpio;
 +	IOTimerEventSource *fTimer;
 +	IOWorkLoop *fWorkLoop;
@@ -107,14 +126,15 @@ LiuqinHID.cpp: resetChip/readRegs are public (liuqin_fts_start uses them).
 +OSDefineMetaClassAndStructors(LiuqinFTS, OSObject);
 +
 +bool
-+LiuqinFTS::init(vm_offset_t geni, vm_offset_t tlmm, uint32_t reset_gpio,
-+    uint32_t irq_gpio)
++LiuqinFTS::init(vm_offset_t geni, vm_offset_t tlmm, vm_offset_t gcc,
++    uint32_t reset_gpio, uint32_t irq_gpio)
 +{
 +	if (!OSObject::init()) {
 +		return false;
 +	}
 +	fGeni = geni;
 +	fTlmm = tlmm;
++	fGcc = gcc;
 +	fResetGpio = reset_gpio;
 +	fIrqGpio = irq_gpio;
 +	fTimer = 0;
@@ -301,27 +321,36 @@ LiuqinHID.cpp: resetChip/readRegs are public (liuqin_fts_start uses them).
 +
 +/* Started from LiuqinHIDTouch::start so backboardd's event service exists
 + * before events flow.  Panel A (SE0, 17/51) is probed first, then panel B
-+ * (SE1, 20/21); the engine firmware revision gate must show SPI. */
++ * (SE1, 20/21).  The wrap AHB and SE branch clocks are enabled first: the
++ * first revision of this driver read a gated SE0 and XPU-aborted the boot. */
 +extern "C" void
 +liuqin_fts_start(void)
 +{
-+	uint32_t on = 1;
-+	vm_offset_t geni, tlmm;
++	uint32_t on = 0;
++	vm_offset_t geni, tlmm, gcc;
 +
-+	if (gLiuqinFTS) {
-+		return;
-+	}
 +	PE_parse_boot_argn("liuqinfts", &on, sizeof(on));
 +	if (!on) {
-+		IOLog("LIUQIN FTS: disabled by boot-arg\n");
++		IOLog("LIUQIN FTS: off (no liuqinfts=1)\n");
++		return;
++	}
++	if (gLiuqinFTS) {
 +		return;
 +	}
 +	geni = ml_io_map((vm_offset_t)FTS_GENI_BASE, FTS_GENI_SIZE);
 +	tlmm = ml_io_map((vm_offset_t)FTS_TLMM_BASE, 0x400000);
-+	if (!geni || !tlmm) {
++	gcc = ml_io_map((vm_offset_t)FTS_GCC_BASE, FTS_GCC_SIZE);
++	if (!geni || !tlmm || !gcc) {
 +		IOLog("LIUQIN FTS: io map failed\n");
 +		return;
 +	}
++	/* wrap0 AHB + SE0 functional clock for panel A. */
++	OSWriteLittleInt32((void *)(gcc + FTS_GCC_WRAP0_M_AHB), 0, FTS_CBCR_ENABLE);
++	OSWriteLittleInt32((void *)(gcc + FTS_GCC_WRAP0_S_AHB), 0, FTS_CBCR_ENABLE);
++	OSWriteLittleInt32((void *)(gcc + FTS_GCC_WRAP0_S0), 0, FTS_CBCR_ENABLE);
++	for (volatile uint32_t i = 0; i < 10000; i++) {
++	}
++
 +	for (int which = 0; which < 2; which++) {
 +		vm_offset_t g = which == 0 ? geni :
 +		    ml_io_map((vm_offset_t)FTS_GENI_ALT_BASE, FTS_GENI_SIZE);
@@ -329,12 +358,25 @@ LiuqinHID.cpp: resetChip/readRegs are public (liuqin_fts_start uses them).
 +		if ((fw & 0x00ff0000u) == 0) {
 +			IOLog("LIUQIN FTS: engine %d firmware missing (0x%x)\n",
 +			    which, fw);
-+			continue;
++			if (which == 0) {
++				/* panel B: wrap1 AHB + SE1 functional clock */
++				OSWriteLittleInt32((void *)(gcc + FTS_GCC_WRAP1_M_AHB), 0, FTS_CBCR_ENABLE);
++				OSWriteLittleInt32((void *)(gcc + FTS_GCC_WRAP1_S_AHB), 0, FTS_CBCR_ENABLE);
++				OSWriteLittleInt32((void *)(gcc + FTS_GCC_WRAP1_S0), 0, FTS_CBCR_ENABLE);
++				for (volatile uint32_t i = 0; i < 10000; i++) {
++				}
++				fw = OSReadLittleInt32((const void *)g, FTS_GENI_FW_REVISION);
++				if ((fw & 0x00ff0000u) == 0) {
++					IOLog("LIUQIN FTS: engine %d still gated (0x%x)\n",
++					    which, fw);
++					continue;
++				}
++			}
 +		}
 +		uint32_t rg = which == 0 ? FTS_RESET_GPIO : FTS_RESET_GPIO_B;
 +		uint32_t ig = which == 0 ? FTS_IRQ_GPIO : FTS_IRQ_GPIO_B;
 +		LiuqinFTS *fts = new LiuqinFTS;
-+		if (!fts || !fts->init(g, tlmm, rg, ig)) {
++		if (!fts || !fts->init(g, tlmm, gcc, rg, ig)) {
 +			IOLog("LIUQIN FTS: init failed\n");
 +			return;
 +		}
