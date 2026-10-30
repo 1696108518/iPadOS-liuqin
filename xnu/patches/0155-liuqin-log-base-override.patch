@@ -1,0 +1,61 @@
+Let the persistent console ring be pinned to a chosen device block
+(liuqinlogblk=N) and print the computed base plus any write error through the
+mute gate: the default "last 4 MiB of the partition" computed from the GPT can
+point past the device on this port, in which case every flush fails silently and
+the area TWRP reads stays zero.
+---
+--- a/bsd/dev/liuqin_ufs.c
++++ b/bsd/dev/liuqin_ufs.c
+@@ -1988,16 +1988,27 @@
+ 	}
+ }
+ 
++/* liuqinlogblk=N pins the ring at device block N instead of the last 4 MiB of
++ * the partition: on this port the partition end computed from the GPT can land
++ * outside the device, so the flush thread's writes fail and the area stays
++ * zero.  A block inside the unused tail of the partition, which TWRP can read
++ * with dd, always works. */
++static uint64_t liuqin_log_base_override;
++
+ static void
+ liuqin_log_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	liuqin_log_dump();
+-	uint64_t base = su.first_block + su.nblocks - LIUQIN_LOG_BLOCKS;
++	uint64_t base = liuqin_log_base_override ? liuqin_log_base_override :
++	    su.first_block + su.nblocks - LIUQIN_LOG_BLOCKS;
+ 	uint64_t flushed = 0, seq = 0;
+ 	void *bounce = (void *)(su.dma + DMA_BOUNCE);
+ 
+-	printf("LIUQIN LOG: console log to the last %u KiB of the partition (block 0x%llx)\n",
+-	    LIUQIN_LOG_BLOCKS * UFS_BLOCK >> 10, base);
++	extern int liuqin_console_force;
++	liuqin_console_force = 1;       /* visible even with liuqinmute=1 */
++	printf("LIUQIN LOG: ring at block 0x%llx (first 0x%llx nblocks 0x%llx ovr 0x%llx)\n",
++	    base, su.first_block, su.nblocks, liuqin_log_base_override);
++	liuqin_console_force = 0;
+ 	for (;;) {
+ 		(void)tsleep(&liuqin_log_chan, PZERO, "liuqinlog", hz * (int)liuqin_log_secs);
+ 		uint64_t total = os_atomic_load(&liuqin_log_total, relaxed);
+@@ -2035,7 +2046,11 @@
+ 		}
+ 		lck_mtx_unlock(&liuqin_ufs_lock);
+ 		if (error) {
+-			printf("LIUQIN LOG: write failed (%d), stopping\n", error);
++			extern int liuqin_console_force;
++			liuqin_console_force = 1;
++			printf("LIUQIN LOG: write failed (%d) at block 0x%llx, stopping\n",
++			    error, base);
++			liuqin_console_force = 0;
+ 			return;
+ 		}
+ 		flushed = total;
+@@ -2147,6 +2162,8 @@
+ 		return;
+ 	}
+ 	PE_parse_boot_argn("ufslogsecs", &liuqin_log_secs, sizeof(liuqin_log_secs));
++	PE_parse_boot_argn("liuqinlogblk", &liuqin_log_base_override,
++	    sizeof(liuqin_log_base_override));
+ 	PE_parse_boot_argn("liuqinra", &ra_enable, sizeof(ra_enable));
+ 	if (liuqin_log_secs == 0 || liuqin_log_secs > 60) {
+ 		liuqin_log_secs = LIUQIN_LOG_SECS;
