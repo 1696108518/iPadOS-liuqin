@@ -1,0 +1,23 @@
+Keep the ring pin independent of numeric boot-arg parsing: if the boot args
+contain the word "liuqinring", pin the ring (and the probe block) at
+first_block + 5,000,000.  The 4- and 8-byte PE_parse_boot_argn paths did not
+produce the requested block, and the default end-of-partition base is only
+reachable through absolute LBAs.
+---
+--- a/bsd/dev/liuqin_ufs.c
++++ b/bsd/dev/liuqin_ufs.c
+@@ -2147,6 +2147,14 @@
+ 	PE_parse_boot_argn("ufslogsecs", &liuqin_log_secs, sizeof(liuqin_log_secs));
+ 	PE_parse_boot_argn("liuqinlogblk", &liuqin_log_base_override,
+ 	    sizeof(liuqin_log_base_override));
++	{
++		/* LIUQIN: numeric parse of the block does not land, so a bare
++		 * word in the boot args pins the ring instead. */
++		const char *ba = PE_boot_args();
++		if (ba != NULL && strnstr(ba, "liuqinring", strlen(ba)) != NULL) {
++			liuqin_log_base_override = (uint32_t)(su.first_block + 5000000);
++		}
++	}
+ 	PE_parse_boot_argn("liuqinra", &ra_enable, sizeof(ra_enable));
+ 	if (liuqin_log_secs == 0 || liuqin_log_secs > 60) {
+ 		liuqin_log_secs = LIUQIN_LOG_SECS;
