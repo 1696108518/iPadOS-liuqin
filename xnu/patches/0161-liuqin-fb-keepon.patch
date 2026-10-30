@@ -1,32 +1,24 @@
 Ignore display-off requests when liuqinfbkeepon=1 is in the boot args: the panel
-sleeps on the idle timer before userspace finishes booting, which hides the
+sleeps on the idle timer before userspace finishes booting, hiding the boot
 progress bar behind a black screen.
 ---
 --- a/iokit/Kernel/arm/LiuqinFramebuffer.cpp
 +++ b/iokit/Kernel/arm/LiuqinFramebuffer.cpp
-@@ -532,6 +532,19 @@
+@@ -544,6 +544,17 @@
  	case kLiuqinFBRequestPowerChange:
  		if (args->scalarInputCount >= 1) {
--			bool off = args->scalarInput[0] == 0;
-+			bool off = args->scalarInput[0] == 0;
-+			/* LIUQIN: liuqinfbkeepon=1 ignores display-off requests so the
-+			 * userspace boot progress bar stays visible while the shell comes
-+			 * up; the panel otherwise sleeps on the idle timer. */
-+			{
-+				extern boolean_t PE_parse_boot_argn(const char *, void *, int);
-+				uint32_t keep_on = 0;
-+				if (PE_parse_boot_argn("liuqinfbkeepon", &keep_on,
-+				    sizeof(keep_on)) && keep_on) {
-+					off = false;
-+				}
+ 			bool off = args->scalarInput[0] == 0;
++			/*
++			 * LIUQIN: liuqinfbkeepon=1 ignores display-off requests.  The
++			 * panel otherwise sleeps on the idle timer while userspace is
++			 * still booting, which hides the boot progress bar behind a
++			 * black screen.
++			 */
++			uint32_t keep_on = 0;
++			if (PE_parse_boot_argn("liuqinfbkeepon", &keep_on,
++			    sizeof(keep_on)) && keep_on) {
++				off = false;
 +			}
  			IOLockLock(fFB->fLock);
  			if (off != fFB->fPowerOff) {
  				fFB->fPowerOff = off;
- 				fFB->fFadeStep = 0;
- 				fFB->fDirty = true;     /* on: redraw the latest frame */
- 			}
- 			IOLockUnlock(fFB->fLock);
- 			IOLog("LIUQIN FB: display %s\n", off ? "off" : "on");
- 		}
- 		break;
