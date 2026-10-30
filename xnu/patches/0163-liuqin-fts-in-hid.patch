@@ -1,7 +1,5 @@
 LIUQIN: FocalTech fts_ts touch over GENI SPI, polled every 8 ms from inside
-LiuqinHID.cpp (avoids a second translation unit whose files.arm64 hunk kept
-missing its context): SE0 (0x00980000) reset 17/irq 51 probed first, then SE1
-(0x00990000) 20/21; coords 1080x2340 rescaled to 1800x2880; liuqinfts=0 disables.
+LiuqinHID.cpp: resetChip/readRegs are public (liuqin_fts_start uses them).
 ---
 --- a/iokit/Kernel/arm/hid/LiuqinHID.cpp
 +++ b/iokit/Kernel/arm/hid/LiuqinHID.cpp
@@ -23,7 +21,7 @@ missing its context): SE0 (0x00980000) reset 17/irq 51 probed first, then SE1
  	return true;
  }
  
-@@ -537,3 +541,333 @@
+@@ -537,3 +541,334 @@
  		gLiuqinTouch->touch(finger, down != 0, x, y);
  	}
  }
@@ -74,12 +72,13 @@ missing its context): SE0 (0x00980000) reset 17/irq 51 probed first, then SE1
 +	    uint32_t irq_gpio);
 +	void free(void) APPLE_KEXT_OVERRIDE;
 +	bool startPolling(void);
++	/* resetChip/readRegs are used from liuqin_fts_start below. */
++	void resetChip(void);
++	int readRegs(uint8_t addr, uint8_t *out, uint32_t n);
 +private:
 +	static void pollFired(OSObject *owner, IOTimerEventSource *sender);
 +	void poll(void);
 +	int xfer(const uint8_t *tx, uint8_t *rx, uint32_t len);
-+	int readRegs(uint8_t addr, uint8_t *out, uint32_t n);
-+	void resetChip(void);
 +	inline uint32_t gr(uint32_t off) {
 +		return OSReadLittleInt32((const void *)fGeni, off);
 +	}
