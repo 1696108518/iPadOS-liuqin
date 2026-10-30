@@ -1,26 +1,24 @@
-Let the persistent console ring be pinned to a chosen device block
-(liuqinlogblk=N).  The previous-boot tail dump and the flush thread share the base:
-the default "last 4 MiB of the partition" is unreadable on this port, and the
-dump's hung read kept the flush thread from ever writing a header, which is why
-TWRP always found the area zero.  The base and any write error are drawn through
-the mute gate.
+32-bit liuqinlogblk plus a raw probe block.  The 8-byte PE_parse_boot_argn
+path stored garbage (observed ovr=0x8), and the default ring base is
+first_block + nblocks - 1025 where nblocks comes out ~8x the partition, so the
+base lands past the end of the device and every flush fails.  With a 32-bit
+override the caller pins the ring inside userdata, and the probe block records
+the start inputs where recovery can read them.
 ---
 --- a/bsd/dev/liuqin_ufs.c
 +++ b/bsd/dev/liuqin_ufs.c
-@@ -1829,6 +1829,12 @@
+@@ -1829,6 +1829,10 @@
  #define LIUQIN_LOG_SIZE          (4u << 20)
  #define LIUQIN_LOG_BLOCKS        (1 + LIUQIN_LOG_SIZE / UFS_BLOCK)
  
-+/* liuqinlogblk=N pins the ring at device block N instead of the last 4 MiB
-+ * of the partition.  Both the previous-boot tail dump and the flush thread
-+ * use it: the default end-of-partition block is unreadable on this port and
-+ * the dump's hung read kept the flush thread from ever writing a header. */
-+uint64_t liuqin_log_base_override;
++/* liuqinlogblk=N (32-bit device block) pins the ring; the 8-byte
++ * PE_parse_boot_argn path stored garbage on this kernel. */
++uint32_t liuqin_log_base_override;
 +
  #include <libkern/crypto/sha2.h>
  
  /*
-@@ -1992,12 +1998,16 @@
+@@ -1992,7 +1996,8 @@
  liuqin_log_thread(__unused void *arg, __unused wait_result_t wr)
  {
  	liuqin_log_dump();
@@ -30,30 +28,7 @@ the mute gate.
  	uint64_t flushed = 0, seq = 0;
  	void *bounce = (void *)(su.dma + DMA_BOUNCE);
  
--	printf("LIUQIN LOG: console log to the last %u KiB of the partition (block 0x%llx)\n",
--	    LIUQIN_LOG_BLOCKS * UFS_BLOCK >> 10, base);
-+	extern int liuqin_console_force;
-+	liuqin_console_force = 1;       /* visible even with liuqinmute=1 */
-+	printf("LIUQIN LOG: ring at block 0x%llx (first 0x%llx nblocks 0x%llx ovr 0x%llx)\n",
-+	    base, su.first_block, su.nblocks, liuqin_log_base_override);
-+	liuqin_console_force = 0;
- 	for (;;) {
- 		(void)tsleep(&liuqin_log_chan, PZERO, "liuqinlog", hz * (int)liuqin_log_secs);
- 		uint64_t total = os_atomic_load(&liuqin_log_total, relaxed);
-@@ -2035,7 +2045,11 @@
- 		}
- 		lck_mtx_unlock(&liuqin_ufs_lock);
- 		if (error) {
--			printf("LIUQIN LOG: write failed (%d), stopping\n", error);
-+			extern int liuqin_console_force;
-+			liuqin_console_force = 1;
-+			printf("LIUQIN LOG: write failed (%d) at block 0x%llx, stopping\n",
-+			    error, base);
-+			liuqin_console_force = 0;
- 			return;
- 		}
- 		flushed = total;
-@@ -2049,7 +2063,8 @@
+@@ -2049,7 +2054,8 @@
  static void
  liuqin_log_dump(void)
  {
@@ -63,7 +38,7 @@ the mute gate.
  	void *bounce = (void *)(su.dma + DMA_BOUNCE);
  	struct liuqin_log_header *h = (struct liuqin_log_header *)bounce;
  	uint32_t want = 4000;
-@@ -2147,6 +2162,8 @@
+@@ -2147,12 +2153,39 @@
  		return;
  	}
  	PE_parse_boot_argn("ufslogsecs", &liuqin_log_secs, sizeof(liuqin_log_secs));
@@ -72,3 +47,36 @@ the mute gate.
  	PE_parse_boot_argn("liuqinra", &ra_enable, sizeof(ra_enable));
  	if (liuqin_log_secs == 0 || liuqin_log_secs > 60) {
  		liuqin_log_secs = LIUQIN_LOG_SECS;
+ 	}
+-	if (kernel_thread_start(liuqin_log_thread, NULL, &thread) == KERN_SUCCESS) {
+-		thread_deallocate(thread);
++	{
++		/*
++		 * LIUQIN probe: store the start inputs as one raw block at
++		 * liuqinlogblk+64 so recovery can dd them back; the panel prints
++		 * happen before the framebuffer console exists.
++		 */
++		kern_return_t kr = KERN_FAILURE;
++		void *bounce = (void *)(su.dma + DMA_BOUNCE);
++		if (liuqin_log_base_override) {
++			int pe;
++			bzero(bounce, UFS_BLOCK);
++			snprintf((char *)bounce, UFS_BLOCK,
++			    "LIUQINPROBE on=1 rw=%d first=0x%llx nblocks=0x%llx ovr=0x%x\n",
++			    su.writable, su.first_block, su.nblocks,
++			    liuqin_log_base_override);
++			pe = ufs_write_blocks((uint64_t)liuqin_log_base_override + 64, 1);
++			if (pe == 0) {
++				pe = ufs_sync_cache();
++			}
++			kr = (kern_return_t)pe;
++		}
++		if (kernel_thread_start(liuqin_log_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++			if (liuqin_log_base_override) {
++				kr = KERN_SUCCESS;
++			}
++		}
+ 	}
+ 	liuqin_wdt_start();
+ }
