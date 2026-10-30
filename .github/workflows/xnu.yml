@@ -34,9 +34,11 @@ env:
 
 jobs:
   build:
-    # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
-    # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
-    runs-on: macos-14
+    # macos-14 was retired (brownout 2026-11-02).  macOS 15 ships Xcode 16.x,
+    # whose iig emits IORPC.kernelContent that xnu-8796 lacks, so the Deps
+    # step picks the newest Xcode 15.x the image still carries (15.4) and
+    # fails loudly if only 16.x remains.
+    runs-on: macos-15
     timeout-minutes: 120
     permissions:
       contents: write
@@ -58,12 +60,17 @@ jobs:
       - name: Deps
         run: |
           brew install jq gum bash cmake ninja
-          # build.sh only checks that xcodes exists (Xcode is preinstalled); no bottle on macOS 14
+          # build.sh only checks that xcodes exists (Xcode is preinstalled); no bottle on macOS 15
           printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
           sudo chmod +x /usr/local/bin/xcodes
           sw_vers
           ls -d /Applications/Xcode*.app
-          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          # newest Xcode 15.x first: Xcode 16's iig breaks xnu-8796
+          XC=$(ls -d /Applications/Xcode_15*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$XC" ]; then
+            echo "No Xcode 15.x on this runner; trying 16.x (iig may fail)"
+            XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          fi
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
           sudo xcode-select -s "$XC"
           xcodebuild -version
