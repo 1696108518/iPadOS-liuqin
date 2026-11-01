@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/LiuqinBattery.cpp
 +++ b/iokit/Kernel/arm/LiuqinBattery.cpp
-@@ -0,0 +1,640 @@
+@@ -0,0 +1,665 @@
 +/*
 + * LIUQIN: the battery the iOS UI reads.
 + *
@@ -225,16 +225,23 @@
 +/*
 + * One ADC7 conversion of `chan` on target PMIC `sid`, scaled with the
 + * channel's internal divider `div`: mV = code * 1875 * div / 0x70e4.
-+ * Writes ADC_APP_SID first - without it the root measures SID 0's own
-+ * (for our channels: unconnected) mux and returns constant junk.
++ * Sequence is the vendor's adc7_configure() verbatim: masked APP_SID
++ * write, 4-byte DIG_PARAM..DELAY update, then a SEPARATE 1-byte
++ * CONV_REQ - the 6-byte burst with EN_CTL1 that ADC5 uses does not work
++ * on ADC7 (nts6 measured a constant regardless of channel or SID).
++ * The request is verified through the STATUS1 handshake: REQ_STS set
++ * (or EOC clearing) proves the arbiter accepted it, and the DIG_PARAM
++ * readback proves the channel byte landed.
 + */
 +static int
 +batt_read_mv(unsigned sid, uint8_t chan, unsigned div, uint32_t *code_out)
 +{
-+	uint8_t r[6];
++	uint8_t r[4];
 +	uint8_t stb;
 +	uint8_t d0, d1;
 +	uint32_t code;
++	uint8_t conv = ADC_USR_CONV_REQ_REQ;
++	unsigned saw_busy = 0;
 +
 +	if (batt_adc_apid == (uint32_t)-1) {
 +		return -1;
@@ -247,28 +254,46 @@
 +	if (batt_spmi_write(batt_adc_apid, ADC_APP_SID, r, 1) != 0) {
 +		return -1;
 +	}
-+	if (batt_spmi_read(batt_adc_apid, ADC_USR_DIG_PARAM, r, 6) != 0) {
++	if (batt_spmi_read(batt_adc_apid, ADC_USR_DIG_PARAM, r, 4) != 0) {
 +		return -1;
 +	}
 +	r[1] = (uint8_t)((r[1] & ~0x7u) & 0xffu);  /* fast avg: 1 sample  */
 +	r[2] = chan;                               /* channel select      */
 +	r[3] = (uint8_t)(r[3] & ~0xfu);            /* no hw settle delay  */
-+	r[4] = (uint8_t)(r[4] | ADC_USR_EN_CTL1_EN);
-+	r[5] = (uint8_t)ADC_USR_CONV_REQ_REQ;
-+	if (batt_spmi_write(batt_adc_apid, ADC_USR_DIG_PARAM, r, 6) != 0) {
++	if (batt_spmi_write(batt_adc_apid, ADC_USR_DIG_PARAM, r, 4) != 0) {
++		return -1;
++	}
++	if (batt_spmi_write(batt_adc_apid, ADC_USR_CONV_REQ, &conv, 1) != 0) {
++		return -1;
++	}
++	/* the request must show up in STATUS1: REQ_STS set while converting
++	 * (EOC clears with it); a stale idle state is EOC=1 REQ_STS=0 */
++	for (unsigned i = 0; i < 2000; i++) {
++		if (batt_spmi_read(batt_adc_apid, ADC_USR_STATUS1, &stb, 1) != 0) {
++			return -1;
++		}
++		if ((stb & 0x3u) != ADC_USR_STATUS1_EOC) {
++			saw_busy = 1;
++			break;
++		}
++		delay(1);
++	}
++	if (!saw_busy) {
++		printf("LIUQIN BATT: ch 0x%02x request not accepted "
++		    "(status 0x%02x stuck idle)\n", chan, stb);
 +		return -1;
 +	}
 +	for (unsigned i = 0; i < 2000; i++) {
 +		if (batt_spmi_read(batt_adc_apid, ADC_USR_STATUS1, &stb, 1) != 0) {
 +			return -1;
 +		}
-+		if ((stb & ADC_USR_STATUS1_EOC) != 0) {
++		if ((stb & 0x3u) == ADC_USR_STATUS1_EOC) {
 +			break;
 +		}
 +		delay(1);
 +		if (i == 1999) {
-+			printf("LIUQIN BATT: ADC7 EOC timeout ch 0x%02x (status 0x%02x)\n",
-+			    chan, stb);
++			printf("LIUQIN BATT: ADC7 EOC timeout ch 0x%02x "
++			    "(status 0x%02x)\n", chan, stb);
 +			return -1;
 +		}
 +	}
