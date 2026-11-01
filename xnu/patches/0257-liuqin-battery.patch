@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/LiuqinBattery.cpp
 +++ b/iokit/Kernel/arm/LiuqinBattery.cpp
-@@ -0,0 +1,565 @@
+@@ -0,0 +1,568 @@
 +/*
 + * LIUQIN: the battery the iOS UI reads.
 + *
@@ -37,6 +37,9 @@
 +#include <IOKit/IOTimerEventSource.h>
 +#include <IOKit/pwr_mgt/IOPMPowerSource.h>
 +#include <pexpert/pexpert.h>
++#include <libkern/c++/OSBoolean.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSSymbol.h>
 +#include <libkern/c++/OSString.h>
 +
 +extern "C" {
@@ -566,77 +569,14 @@
 +		thread_deallocate(thread);
 +	}
 +}
+
 diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
-index f731d43..82397b8 100644
 --- a/iokit/conf/files.arm64
 +++ b/iokit/conf/files.arm64
-@@ -5,3 +5,66 @@ iokit/Kernel/IOPMrootDomain.cpp    					optional iokitcpp
- 
- # SMP
+@@ -7,2 +7,3 @@
  iokit/Kernel/arm/AppleARMSMP.cpp    					optional iokitcpp
 +iokit/Kernel/arm/LiuqinBattery.cpp                               optional iokitcpp
-+iokit/Kernel/arm/LiuqinCPU.cpp                                    optional iokitcpp
-+iokit/Kernel/arm/LiuqinEntitlements.cpp                           optional iokitcpp
-+iokit/Kernel/arm/LiuqinFramebuffer.cpp                            optional iokitcpp
-+iokit/Kernel/arm/LiuqinKeyStore.cpp                               optional iokitcpp
-+iokit/Kernel/arm/LiuqinPlatformExpert.cpp                         optional iokitcpp
-+iokit/Kernel/arm/LiuqinSurface.cpp                                optional iokitcpp
-+iokit/Kernel/arm/LiuqinWatchdog.cpp                               optional iokitcpp
-+iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
-+iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
-+iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
-+iokit/Kernel/arm/hid/LiuqinHID.cpp                                optional iokitcpp
-+iokit/NativeAdreno/LiuqinStubs.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoAccelerator.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoBoard.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoClient.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoCpInit.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoCpu.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoFirmware.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoFirmwareDefaults.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoGmuConfig.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoGmuContext.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoGmuMemory.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoGmuPlatform.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoGmuService.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoGpu.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoGpuContext.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoIrq.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoKernelTime.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoMemory.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoPwrup.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoRing.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoService.cpp                            optional iokitcpp
-+iokit/NativeAdreno/ShengGmu.c                            optional iokitcpp
-+iokit/NativeAdreno/ShengGmuVotes.c                            optional iokitcpp
-+iokit/NativeAdreno/ShengGmuCommandDb.c                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoSha256.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoSmmuContext.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoSmmuMemory.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoSmmuService.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoSubmit.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoTimer.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoUserClient.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoVm.cpp                            optional iokitcpp
-+iokit/NativeAdreno/kits/AdrenoPM4/AdrenoConstants.c                            optional iokitcpp
-+iokit/NativeAdreno/kits/AdrenoPM4/AdrenoPM4.c                            optional iokitcpp
-+iokit/NativeAdreno/kits/AdrenoPM4/AdrenoRaster.c                            optional iokitcpp
-+iokit/NativeAdreno/kits/AdrenoPM4/AdrenoShader.c                            optional iokitcpp
-+iokit/NativeAdreno/kits/AdrenoPM4/AdrenoVPC.c                            optional iokitcpp
-+iokit/NativeAdreno/kits/AdrenoFirmware/AdrenoFirmware.c                            optional iokitcpp
-+iokit/NativeAdreno/kits/AdrenoFirmware/AdrenoHfi.c                            optional iokitcpp
-+iokit/NativeAdreno/kits/AdrenoFirmware/AdrenoHfiStartup.c                            optional iokitcpp
-+iokit/NativeAdreno/kits/AdrenoFirmware/AdrenoHfiVotes.c                            optional iokitcpp
-+iokit/NativeAdreno/kits/ArmSmmu4K/ArmSmmu4K.c                            optional iokitcpp
-+iokit/NativeAdreno/kits/ArmSmmu4K/ArmSmmu4KAudit.c                            optional iokitcpp
-+iokit/NativeAdreno/kits/ArmSmmu4K/ArmSmmu4KContext.c                            optional iokitcpp
-+iokit/NativeAdreno/kits/ArmSmmu4K/ArmSmmu4KLive.c                            optional iokitcpp
-+iokit/NativeAdreno/kits/ArmSmmu4K/ArmSmmu4KMmio.c                            optional iokitcpp
-+iokit/NativeAdreno/kits/ArmSmmu4K/ArmSmmu4KProgram.c                            optional iokitcpp
-+iokit/NativeAdreno/kits/ArmSmmu4K/ArmSmmu4KStreams.c                            optional iokitcpp
-+iokit/NativeAdreno/kits/ArmSmmu4K/ArmSmmu4KTableMemory.c                            optional iokitcpp
-+iokit/NativeAdreno/LiuqinAdrenoGlue.cpp                            optional iokitcpp
-+iokit/NativeAdreno/NativeAdrenoPublish.cpp                            optional iokitcpp
+ iokit/Kernel/arm/LiuqinCPU.cpp                                    optional iokitcpp
 --- a/bsd/dev/liuqin_touch.c
 +++ b/bsd/dev/liuqin_touch.c
 @@ -64,6 +64,8 @@
