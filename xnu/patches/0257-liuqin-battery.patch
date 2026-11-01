@@ -1,0 +1,659 @@
+--- a/iokit/Kernel/arm/LiuqinBattery.cpp
++++ b/iokit/Kernel/arm/LiuqinBattery.cpp
+@@ -0,0 +1,565 @@
++/*
++ * LIUQIN: the battery the iOS UI reads.
++ *
++ * iOS shows the charge level from an "AppleSmartBattery" IOService (a
++ * subclass of the in-kernel IOPMPowerSource) whose registry properties are
++ * the kIOPMPS*Key dictionary; BatteryCenter/powerlogd read the properties
++ * straight from the registry, and the IOKit IOPS* API matches a service
++ * named "AppleSmartBatteryManager".  This port has neither, so the status
++ * bar shows nothing.
++ *
++ * This file publishes both, named exactly like the Apple classes:
++ *
++ *   AppleSmartBatteryManager : IOService      (the IOPS-visible manager)
++ *   AppleSmartBattery        : IOPMPowerSource (the battery; its child)
++ *
++ * The charge level comes from the PMIC's ADC7: PMK8350 (SPMI SID 0),
++ * peripheral 0x3100, channel 0x8e (VPH_PWR - the battery rail, internally
++ * divided by 3).  One conversion = write DIG_PARAM..CONV_REQ (0x42..0x47),
++ * poll STATUS1 EOC, read DATA0/DATA1 (LSB/MSB; full scale 0x70e4 = 1.875 V
++ * at the ADC input, so mV = code * 1875 * 3 / 28900).  Same SPMI arbiter
++ * as the keys driver (0243); writes go through the arbiter's "chnls"
++ * region (0x0c500000), one 0x1000 page per APID (Linux
++ * drivers/spmi/spmi-pmic-arb.c, pmic_arb_offset_v7()).
++ *
++ * The stock tablet's charger stack runs on the ADSP (protection domain
++ * "msm/adsp/charger_pd" over pmic-glink, per the stock DT) and is
++ * unreachable here, so ExternalConnected/IsCharging report the passive
++ * state and the percentage is an open-circuit voltage estimate.
++ *
++ * Boot arg liuqinbatt=0 disables.  Every line greps as "LIUQIN BATT:".
++ */
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOTimerEventSource.h>
++#include <IOKit/pwr_mgt/IOPMPowerSource.h>
++#include <pexpert/pexpert.h>
++#include <libkern/c++/OSString.h>
++
++extern "C" {
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++uint64_t mach_absolute_time(void);
++vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++void thread_deallocate(thread_t);
++void delay(int);
++}
++
++/* ------------------------------------------------------------------ SPMI */
++#define SPMI_CORE_PA            0x0c400000u
++#define SPMI_CORE_SIZE          0x3000u
++#define SPMI_CFG0_PA            0x0c42d000u
++#define SPMI_CFG1_PA            0x0c432000u
++#define SPMI_CFG_SIZE           0x10000u
++#define SPMI_OBS_PA             0x0c440000u
++#define SPMI_OBS_SIZE           0x80000u
++#define SPMI_CHNLS_PA           0x0c500000u
++#define SPMI_CHNLS_SIZE         0x400000u
++
++#define SPMI_REG_VERSION        0x0000u
++#define SPMI_REG_FEATURES0      0x0004u
++#define SPMI_REG_FEATURES1      0x0008u
++#define SPMI_FEATURES_MASK      0x7ffu
++#define SPMI_APID_MAP(i)        (0x2000u + 4u * (i))
++#define SPMI_APID_MAX           1024u
++#define SPMI_PPID_MASK          0x0fffu
++
++#define SPMI_CH_CMD             0x00u
++#define SPMI_CH_STATUS          0x08u
++#define SPMI_CH_RDATA0          0x18u
++#define SPMI_CH_WDATA0          0x10u
++#define SPMI_CH_STRIDE          0x20u
++#define SPMI_OP_READ            15u
++#define SPMI_OP_WRITE           14u
++#define SPMI_ST_DONE            (1u << 0)
++#define SPMI_ST_ERR             0x7eu
++
++/* PMK8350 (SID 0) ADC7 root peripheral. */
++#define LIUQIN_ADC7_PPID        0x031u
++#define LIUQIN_BATT_MAX_MAH     8600u   /* BM58, datasheet typical */
++
++/* ADC7 user-channel registers, offsets inside peripheral 0x3100
++ * (drivers/iio/adc/qcom-spmi-adc5.c). */
++#define ADC_USR_STATUS1         0x08u
++#define ADC_USR_STATUS1_EOC     (1u << 0)
++#define ADC_USR_DIG_PARAM       0x42u
++#define ADC_USR_FAST_AVG_CTL    0x43u
++#define ADC_USR_CH_SEL_CTL      0x44u
++#define ADC_USR_DELAY_CTL       0x45u
++#define ADC_USR_EN_CTL1         0x46u
++#define ADC_USR_EN_CTL1_EN      (1u << 7)
++#define ADC_USR_CONV_REQ        0x47u
++#define ADC_USR_CONV_REQ_REQ    (1u << 7)
++#define ADC_USR_DATA0           0x50u
++#define ADC_USR_DATA1           0x51u
++#define ADC7_VPH_PWR            0x8eu
++#define ADC7_FULL_SCALE         0x70e4u
++#define ADC7_DATA_CHECK         0xffffu
++
++static vm_offset_t batt_core, batt_cfg0, batt_cfg1, batt_obs, batt_chnls;
++static uint32_t batt_bus0_apids, batt_bus1_apids;
++static uint32_t batt_adc_apid = (uint32_t)-1;
++static int liuqin_batt_chan;
++static OSSymbol *gKeyNominal;
++
++static inline uint32_t
++brd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static inline void
++bwr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++}
++
++static uint64_t
++batt_ns_since(uint64_t t0)
++{
++	uint64_t ns = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	return ns;
++}
++
++/* One SPMI register read through the observer channel (0243's format). */
++static int
++batt_spmi_read(uint32_t apid, uint32_t addr, uint8_t *buf, size_t len)
++{
++	const uint32_t ch = apid * SPMI_CH_STRIDE;
++	const uint32_t cmd = (SPMI_OP_READ << 27) |
++	    ((addr & 0xffu) << 4) | (uint32_t)(len - 1);
++	const uint64_t t0 = mach_absolute_time();
++	uint32_t st = 0;
++	unsigned i;
++
++	bwr(batt_obs, ch + SPMI_CH_CMD, cmd);
++	for (i = 0; i < 100000; i++) {
++		st = brd(batt_obs, ch + SPMI_CH_STATUS);
++		if ((st & SPMI_ST_DONE) != 0) {
++			break;
++		}
++		if (batt_ns_since(t0) >= 20ull * 1000 * 1000) {
++			break;
++		}
++		delay(1);
++	}
++	if ((st & SPMI_ST_DONE) == 0 || (st & SPMI_ST_ERR) != 0) {
++		return -1;
++	}
++	for (i = 0; i < len; i++) {
++		const uint32_t r = brd(batt_obs,
++		    ch + (i < 4 ? SPMI_CH_RDATA0 : SPMI_CH_RDATA0 + 4u));
++		buf[i] = (uint8_t)((r >> (8 * (i & 3))) & 0xff);
++	}
++	return 0;
++}
++
++/* One SPMI register write through the arbiter's own chnls page. */
++static int
++batt_spmi_write(uint32_t apid, uint32_t addr, const uint8_t *buf, size_t len)
++{
++	const uint32_t base = 0x1000u * apid;
++	const uint32_t cmd = (SPMI_OP_WRITE << 27) |
++	    ((addr & 0xffu) << 4) | (uint32_t)(len - 1);
++	const uint64_t t0 = mach_absolute_time();
++	uint32_t w0 = 0, w1 = 0, st = 0;
++	unsigned i;
++
++	for (i = 0; i < len; i++) {
++		if (i < 4) {
++			w0 |= (uint32_t)buf[i] << (8 * i);
++		} else {
++			w1 |= (uint32_t)buf[i] << (8 * (i - 4));
++		}
++	}
++	bwr(batt_chnls, base + SPMI_CH_WDATA0, w0);
++	if (len > 4) {
++		bwr(batt_chnls, base + SPMI_CH_WDATA0 + 4u, w1);
++	}
++	bwr(batt_chnls, base + SPMI_CH_CMD, cmd);
++	for (i = 0; i < 100000; i++) {
++		st = brd(batt_chnls, base + SPMI_CH_STATUS);
++		if ((st & SPMI_ST_DONE) != 0) {
++			break;
++		}
++		if (batt_ns_since(t0) >= 20ull * 1000 * 1000) {
++			break;
++		}
++		delay(1);
++	}
++	if ((st & SPMI_ST_DONE) == 0 || (st & SPMI_ST_ERR) != 0) {
++		return -1;
++	}
++	return 0;
++}
++
++/*
++ * One VPH_PWR conversion in millivolts, or -1.  Reads the calibration
++ * fields back first (the Linux driver does the same), selects the channel,
++ * enables, requests, polls EOC, reads the 16-bit LSB/MSB pair and scales
++ * it: mV = code * 1875 mV * 3 (the internal 1/3 divider) / 0x70e4.
++ */
++static int
++batt_read_vph_mv(void)
++{
++	uint8_t r[6];
++	uint8_t stb;
++	uint8_t d0, d1;
++	uint32_t code;
++
++	if (batt_adc_apid == (uint32_t)-1) {
++		return -1;
++	}
++	if (batt_spmi_read(batt_adc_apid, ADC_USR_DIG_PARAM, r, 6) != 0) {
++		return -1;
++	}
++	r[1] = (uint8_t)((r[1] & ~0x7u) & 0xffu);  /* fast avg: 1 sample  */
++	r[2] = (uint8_t)ADC7_VPH_PWR;              /* channel select      */
++	r[3] = (uint8_t)(r[3] & ~0xfu);            /* no hw settle delay  */
++	r[4] = (uint8_t)(r[4] | ADC_USR_EN_CTL1_EN);
++	r[5] = (uint8_t)ADC_USR_CONV_REQ_REQ;
++	if (batt_spmi_write(batt_adc_apid, ADC_USR_DIG_PARAM, r, 6) != 0) {
++		return -1;
++	}
++	for (unsigned i = 0; i < 2000; i++) {
++		if (batt_spmi_read(batt_adc_apid, ADC_USR_STATUS1, &stb, 1) != 0) {
++			return -1;
++		}
++		if ((stb & ADC_USR_STATUS1_EOC) != 0) {
++			break;
++		}
++		delay(1);
++		if (i == 1999) {
++			printf("LIUQIN BATT: ADC7 EOC timeout (status 0x%02x)\n", stb);
++			return -1;
++		}
++	}
++	if (batt_spmi_read(batt_adc_apid, ADC_USR_DATA0, &d0, 1) != 0 ||
++	    batt_spmi_read(batt_adc_apid, ADC_USR_DATA1, &d1, 1) != 0) {
++		return -1;
++	}
++	code = (uint32_t)d0 | ((uint32_t)d1 << 8);
++	if (code == ADC7_DATA_CHECK) {
++		printf("LIUQIN BATT: ADC7 invalid data 0x%04x\n", code);
++		return -1;
++	}
++	return (int)((code * 1875u * 3u) / ADC7_FULL_SCALE);
++}
++
++/*
++ * Open-circuit estimate for the BM58 LiPo (full 4.45 V, empty 3.5 V under
++ * the light load this port draws).  VPH sits a little below the cell's
++ * open-circuit voltage when the SoC is awake, so the curve reads slightly
++ * conservative - fine for a status bar.
++ */
++static const struct batt_curve_pt {
++	int mv;
++	int pct;
++} batt_curve[] = {
++	{ 4450, 100 }, { 4400, 95 }, { 4350, 89 }, { 4300, 82 },
++	{ 4250, 74 },  { 4200, 66 }, { 4150, 58 }, { 4100, 50 },
++	{ 4050, 42 },  { 4000, 35 }, { 3950, 28 }, { 3900, 22 },
++	{ 3850, 17 },  { 3800, 13 }, { 3750, 9 },  { 3700, 6 },
++	{ 3650, 4 },   { 3600, 2 },  { 3550, 1 },  { 3500, 0 },
++};
++
++static int
++batt_pct_from_mv(int mv)
++{
++	const unsigned n = sizeof(batt_curve) / sizeof(batt_curve[0]);
++
++	if (mv <= 0) {
++		return -1;
++	}
++	if (mv >= batt_curve[0].mv) {
++		return 100;
++	}
++	for (unsigned i = 1; i < n; i++) {
++		if (mv >= batt_curve[i].mv) {
++			const int hi_mv = batt_curve[i - 1].mv;
++			const int lo_mv = batt_curve[i].mv;
++			const int hi_pct = batt_curve[i - 1].pct;
++			const int lo_pct = batt_curve[i].pct;
++			return lo_pct + ((mv - lo_mv) * (hi_pct - lo_pct)) /
++			    (hi_mv - lo_mv);
++		}
++	}
++	return 0;
++}
++
++/* ---------------------------------------------------------------- classes */
++
++class AppleSmartBattery : public IOPMPowerSource {
++	OSDeclareDefaultStructors(AppleSmartBattery);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void refresh();
++private:
++	IOTimerEventSource *fTimer;
++	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
++};
++
++class AppleSmartBatteryManager : public IOService {
++	OSDeclareDefaultStructors(AppleSmartBatteryManager);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++#define super IOService
++OSDefineMetaClassAndStructors(AppleSmartBatteryManager, IOService);
++#undef super
++
++#define super IOPMPowerSource
++OSDefineMetaClassAndStructors(AppleSmartBattery, IOPMPowerSource);
++#undef super
++
++bool
++AppleSmartBattery::start(IOService *provider)
++{
++	if (!super::start(provider)) {
++		return false;
++	}
++	fTimer = NULL;
++
++	setBatteryInstalled(true);
++	setExternalConnected(false);
++	setExternalChargeCapable(true);
++	setIsCharging(false);
++	setAtWarnLevel(false);
++	setAtCriticalLevel(false);
++	setCurrentCapacity(0);
++	setMaxCapacity(LIUQIN_BATT_MAX_MAH);
++	setTimeRemaining(-1);
++	setAmperage(0);
++	setVoltage(0);
++	setCycleCount(1);
++	setAdapterInfo(0);
++	setLocation(0);
++	setErrorCondition(OSSymbol::withCString("Normal"));
++	setManufacturer(OSSymbol::withCString("SMP"));
++	setModel(OSSymbol::withCString("BM58"));
++	setSerial(OSSymbol::withCString("LIUQIN"));
++	gKeyNominal = OSSymbol::withCString("NominalChargeCapacity");
++	setPSProperty(OSSymbol::withCString("FullyCharged"),
++	    OSBoolean::withBooleanValue(false));
++	setPSProperty(OSSymbol::withCString("BatteryType"),
++	    OSSymbol::withCString("InternalBattery"));
++	setPSProperty(OSSymbol::withCString("DesignCapacity"),
++	    OSNumber::withNumber((unsigned long long)LIUQIN_BATT_MAX_MAH, 32));
++	setPSProperty(gKeyNominal,
++	    OSNumber::withNumber((unsigned long long)LIUQIN_BATT_MAX_MAH, 32));
++	setPSProperty(OSSymbol::withCString("PermanentFailureStatus"),
++	    OSNumber::withNumber(0ull, 32));
++	updateStatus();
++
++	fTimer = IOTimerEventSource::timerEventSource(this, &AppleSmartBattery::timerFired);
++	if (fTimer != NULL && getWorkLoop()->addEventSource(fTimer) == kIOReturnSuccess) {
++		fTimer->setTimeoutMS(5000);
++	} else {
++		printf("LIUQIN BATT: no refresh timer\n");
++	}
++
++	registerService();
++	printf("LIUQIN BATT: AppleSmartBattery published (id 0x%llx)\n",
++	    (unsigned long long)getRegistryEntryID());
++	return true;
++}
++
++void
++AppleSmartBattery::stop(IOService *provider)
++{
++	if (fTimer != NULL) {
++		getWorkLoop()->removeEventSource(fTimer);
++		fTimer->release();
++		fTimer = NULL;
++	}
++	super::stop(provider);
++}
++
++void
++AppleSmartBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	AppleSmartBattery *self = OSDynamicCast(AppleSmartBattery, owner);
++
++	if (self != NULL) {
++		self->refresh();
++		if (sender != NULL) {
++			sender->setTimeoutMS(20000);
++		}
++	}
++}
++
++void
++AppleSmartBattery::refresh()
++{
++	int mv = 0, sum = 0, good = 0, pct;
++
++	for (int i = 0; i < 4; i++) {
++		mv = batt_read_vph_mv();
++		if (mv > 0) {
++			sum += mv;
++			good++;
++		}
++		delay(1000);
++	}
++	if (good == 0) {
++		printf("LIUQIN BATT: no ADC answer this round\n");
++		return;
++	}
++	mv = sum / good;
++	pct = batt_pct_from_mv(mv);
++	if (pct < 0) {
++		return;
++	}
++	printf("LIUQIN BATT: vph %d mV (%d/%d ok) -> %d%%\n", mv, good, 4, pct);
++
++	setVoltage((unsigned int)mv);
++	setCurrentCapacity((unsigned int)(LIUQIN_BATT_MAX_MAH * pct / 100));
++	setTimeRemaining(pct * 7);          /* ~11.7 h at 100 % */
++	setAtWarnLevel(pct <= 15);
++	setAtCriticalLevel(pct <= 5);
++	setPSProperty(gKeyNominal,
++	    OSNumber::withNumber((unsigned long long)
++	    (LIUQIN_BATT_MAX_MAH * pct / 100), 32));
++	updateStatus();
++}
++
++bool
++AppleSmartBatteryManager::start(IOService *provider)
++{
++	AppleSmartBattery *batt;
++
++	if (!super::start(provider)) {
++		return false;
++	}
++	batt = OSTypeAlloc(AppleSmartBattery);
++	if (batt == NULL || !batt->init() || !batt->attach(this) ||
++	    !batt->start(this)) {
++		printf("LIUQIN BATT: battery child failed\n");
++		if (batt != NULL) {
++			batt->release();
++		}
++		return true;   /* the manager itself is still up */
++	}
++	registerService();
++	printf("LIUQIN BATT: AppleSmartBatteryManager published (id 0x%llx)\n",
++	    (unsigned long long)getRegistryEntryID());
++	return true;
++}
++
++void
++AppleSmartBatteryManager::stop(IOService *provider)
++{
++	super::stop(provider);
++}
++
++/* ---------------------------------------------------------------- bring-up */
++
++static void
++liuqin_battery_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint32_t arb_version, features0, features1, count;
++	uint32_t apid, mv;
++	int mv4 = 0, good = 0;
++	IOService *res;
++	AppleSmartBatteryManager *mgr;
++
++	/* Map the arbiter and find the ADC7 peripheral in the APID table. */
++	batt_core = ml_io_map(SPMI_CORE_PA, SPMI_CORE_SIZE);
++	batt_cfg0 = ml_io_map(SPMI_CFG0_PA, SPMI_CFG_SIZE);
++	batt_cfg1 = ml_io_map(SPMI_CFG1_PA, SPMI_CFG_SIZE);
++	batt_obs = ml_io_map(SPMI_OBS_PA, SPMI_OBS_SIZE);
++	batt_chnls = ml_io_map(SPMI_CHNLS_PA, SPMI_CHNLS_SIZE);
++	if (batt_core == 0 || batt_obs == 0 || batt_chnls == 0) {
++		printf("LIUQIN BATT: SPMI map failed\n");
++		return;
++	}
++	arb_version = brd(batt_core, SPMI_REG_VERSION);
++	features0 = brd(batt_core, SPMI_REG_FEATURES0);
++	features1 = brd(batt_core, SPMI_REG_FEATURES1);
++	count = features0 & SPMI_FEATURES_MASK;
++	batt_bus0_apids = count;
++	batt_bus1_apids = features1 & SPMI_FEATURES_MASK;
++	printf("LIUQIN BATT: arbiter 0x%08x, bus0 %u apids, bus1 %u\n",
++	    arb_version, batt_bus0_apids, batt_bus1_apids);
++	if (arb_version < 0x70000000u || arb_version >= 0x80000000u) {
++		printf("LIUQIN BATT: not a v7 arbiter, stopping\n");
++		return;
++	}
++	if (count == 0 || count > SPMI_APID_MAX) {
++		printf("LIUQIN BATT: bad bus0 APID count, stopping\n");
++		return;
++	}
++	if (batt_bus1_apids > SPMI_APID_MAX - count) {
++		batt_bus1_apids = SPMI_APID_MAX - count;
++	}
++	for (apid = 0; apid < count; apid++) {
++		const uint32_t m = brd(batt_core, SPMI_APID_MAP(apid));
++		const uint32_t ppid = (m >> 8) & SPMI_PPID_MASK;
++
++		if (m != 0 && ppid == LIUQIN_ADC7_PPID) {
++			batt_adc_apid = apid;
++			printf("LIUQIN BATT: ADC7 (ppid 0x031) at apid %u\n", apid);
++			break;
++		}
++	}
++	if (batt_adc_apid == (uint32_t)-1) {
++		printf("LIUQIN BATT: no ADC7 peripheral in the APID map, stopping\n");
++		return;
++	}
++
++	/* Probe the conversion before publishing anything. */
++	for (int i = 0; i < 4; i++) {
++		mv = batt_read_vph_mv();
++		if (mv > 0) {
++			mv4 += mv;
++			good++;
++		}
++		delay(1000);
++	}
++	if (good == 0) {
++		printf("LIUQIN BATT: ADC7 probe failed (write_ee or EOC), "
++		    "stopping - no battery published\n");
++		return;
++	}
++	mv4 /= good;
++	printf("LIUQIN BATT: probe vph %d mV -> %d%%\n", mv4,
++	    batt_pct_from_mv(mv4));
++
++	res = IOService::waitForService(IOService::serviceMatching("IOResources"));
++	if (res == NULL) {
++		printf("LIUQIN BATT: no IOResources\n");
++		return;
++	}
++	mgr = OSTypeAlloc(AppleSmartBatteryManager);
++	if (mgr == NULL || !mgr->init() || !mgr->attach(res) || !mgr->start(res)) {
++		printf("LIUQIN BATT: manager start failed\n");
++		if (mgr != NULL) {
++			mgr->release();
++		}
++		return;
++	}
++	printf("LIUQIN BATT: up\n");
++}
++
++extern "C" void
++liuqin_battery_start(void)
++{
++	int off = 0;
++	thread_t thread;
++
++	if (PE_parse_boot_argn("liuqinbatt", &off, sizeof(off)) && off == 0) {
++		printf("LIUQIN BATT: disabled by boot arg\n");
++		return;
++	}
++	if (kernel_thread_start(liuqin_battery_thread, NULL, &thread) ==
++	    KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index f731d43..82397b8 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -5,3 +5,66 @@ iokit/Kernel/IOPMrootDomain.cpp    					optional iokitcpp
+ 
+ # SMP
+ iokit/Kernel/arm/AppleARMSMP.cpp    					optional iokitcpp
++iokit/Kernel/arm/LiuqinBattery.cpp                               optional iokitcpp
++iokit/Kernel/arm/LiuqinCPU.cpp                                    optional iokitcpp
++iokit/Kernel/arm/LiuqinEntitlements.cpp                           optional iokitcpp
++iokit/Kernel/arm/LiuqinFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/arm/LiuqinKeyStore.cpp                               optional iokitcpp
++iokit/Kernel/arm/LiuqinPlatformExpert.cpp                         optional iokitcpp
++iokit/Kernel/arm/LiuqinSurface.cpp                                optional iokitcpp
++iokit/Kernel/arm/LiuqinWatchdog.cpp                               optional iokitcpp
++iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
++iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
++iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
++iokit/Kernel/arm/hid/LiuqinHID.cpp                                optional iokitcpp
++iokit/NativeAdreno/LiuqinStubs.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoAccelerator.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoBoard.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoClient.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoCpInit.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoCpu.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoFirmware.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoFirmwareDefaults.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoGmuConfig.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoGmuContext.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoGmuMemory.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoGmuPlatform.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoGmuService.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoGpu.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoGpuContext.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoIrq.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoKernelTime.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoMemory.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoPwrup.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoRing.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoService.cpp                            optional iokitcpp
++iokit/NativeAdreno/ShengGmu.c                            optional iokitcpp
++iokit/NativeAdreno/ShengGmuVotes.c                            optional iokitcpp
++iokit/NativeAdreno/ShengGmuCommandDb.c                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoSha256.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoSmmuContext.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoSmmuMemory.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoSmmuService.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoSubmit.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoTimer.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoUserClient.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoVm.cpp                            optional iokitcpp
++iokit/NativeAdreno/kits/AdrenoPM4/AdrenoConstants.c                            optional iokitcpp
++iokit/NativeAdreno/kits/AdrenoPM4/AdrenoPM4.c                            optional iokitcpp
++iokit/NativeAdreno/kits/AdrenoPM4/AdrenoRaster.c                            optional iokitcpp
++iokit/NativeAdreno/kits/AdrenoPM4/AdrenoShader.c                            optional iokitcpp
++iokit/NativeAdreno/kits/AdrenoPM4/AdrenoVPC.c                            optional iokitcpp
++iokit/NativeAdreno/kits/AdrenoFirmware/AdrenoFirmware.c                            optional iokitcpp
++iokit/NativeAdreno/kits/AdrenoFirmware/AdrenoHfi.c                            optional iokitcpp
++iokit/NativeAdreno/kits/AdrenoFirmware/AdrenoHfiStartup.c                            optional iokitcpp
++iokit/NativeAdreno/kits/AdrenoFirmware/AdrenoHfiVotes.c                            optional iokitcpp
++iokit/NativeAdreno/kits/ArmSmmu4K/ArmSmmu4K.c                            optional iokitcpp
++iokit/NativeAdreno/kits/ArmSmmu4K/ArmSmmu4KAudit.c                            optional iokitcpp
++iokit/NativeAdreno/kits/ArmSmmu4K/ArmSmmu4KContext.c                            optional iokitcpp
++iokit/NativeAdreno/kits/ArmSmmu4K/ArmSmmu4KLive.c                            optional iokitcpp
++iokit/NativeAdreno/kits/ArmSmmu4K/ArmSmmu4KMmio.c                            optional iokitcpp
++iokit/NativeAdreno/kits/ArmSmmu4K/ArmSmmu4KProgram.c                            optional iokitcpp
++iokit/NativeAdreno/kits/ArmSmmu4K/ArmSmmu4KStreams.c                            optional iokitcpp
++iokit/NativeAdreno/kits/ArmSmmu4K/ArmSmmu4KTableMemory.c                            optional iokitcpp
++iokit/NativeAdreno/LiuqinAdrenoGlue.cpp                            optional iokitcpp
++iokit/NativeAdreno/NativeAdrenoPublish.cpp                            optional iokitcpp
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -64,6 +64,8 @@
+ int liuqin_marks_draw = 0;
+ /* iokit/Kernel/arm/hid/LiuqinHID.cpp: a no-op when the HID service is absent. */
+ extern void liuqin_hid_touch(int finger, int down, int x, int y);
++/* iokit/Kernel/arm/LiuqinBattery.cpp: the AppleSmartBattery the UI reads. */
++extern void liuqin_battery_start(void);
+ 
+ #define GCC_PA          0x00100000
+ #define GCC_SIZE        0x00100000
+@@ -5532,6 +5534,8 @@
+ 
+ 	/* Buttons live on the PMICs and need nothing from the touch engine. */
+ 	liuqin_keys_start();
++	/* The battery: same SPMI arbiter, its own thread, no bring-up shift. */
++	liuqin_battery_start();
+ 
+ 	/* --- stage 3: SPI master, Novatek chip id, report thread --- */
+ 	if (level >= 3) {
