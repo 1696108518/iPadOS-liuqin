@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/LiuqinBattery.cpp
 +++ b/iokit/Kernel/arm/LiuqinBattery.cpp
-@@ -0,0 +1,644 @@
+@@ -0,0 +1,640 @@
 +/*
 + * LIUQIN: the battery the iOS UI reads.
 + *
@@ -16,23 +16,27 @@
 + *   AppleSmartBatteryManager : IOService      (the IOPS-visible manager)
 + *   AppleSmartBattery        : IOPMPowerSource (the battery; its child)
 + *
-+ * Channels (ground truth read from the stock kernel's IIO sysfs in TWRP,
-+ * see the 2026-11-01 log round: pm8350b_vbat_sns = 4.443 V with the tablet
-+ * on USB):
++ * ADC7 - what the stock tablet measures and how (all from the official
++ * dtbo overlay + drivers/iio/adc/qcom-spmi-adc5.c, cross-checked against
++ * the stock kernel's IIO sysfs in TWRP):
 + *
-+ *   battery voltage  PM8350B (SID 3) ADC7 0x8f VBAT_SNS, internal /6
-+ *                    -> mV = code * 1875 * 6 / 28900
-+ *   fallback rail    PM8350  (SID 1) ADC7 0x8e VPH_PWR, internal /3
-+ *   USB present      PM8350B (SID 3) ADC7 0x11 USB_IN_V_16, internal /16
++ *   - ONE ADC7 root exists in the APID map: pmk8350 vadc@3100 (PPID
++ *     0x031, SID 0).  Every PMIC's battery channels mux through it; the
++ *     target PMIC is selected per conversion with the ADC_APP_SID
++ *     register (0x40, bits 3:0) - a conversion without this write
++ *     measures SID 0's unconnected mux and returns junk.
++ *   - battery voltage: SID 3 (PM8350B), channel 0x8f (VBAT_SNS),
++ *     pre-scaling 1/3 (the DT overrides the driver's table!) -> mV =
++ *     code * 1875 * 3 / 28900.
++ *   - USB present:    SID 3, channel 0x11 (USB_IN_V_16), 1/16.
++ *   - fallback rail:  SID 1 (PM8350), channel 0x8e (VPH_PWR), 1/3.
 + *
-+ * (PMK8350's ADC7 - the first thing this driver tried - has no battery
-+ * channels at all and reads a constant junk 1.6 V on 0x8e.)
-+ *
-+ * One conversion = write DIG_PARAM..CONV_REQ (0x42..0x47), poll STATUS1
-+ * EOC, read DATA0/DATA1 (LSB/MSB; full scale 0x70e4 = 1.875 V at the ADC
-+ * input).  Same SPMI arbiter as the keys driver (0243); writes go through
-+ * the arbiter's "chnls" region (0x0c500000), one 0x1000 page per APID
-+ * (Linux drivers/spmi/spmi-pmic-arb.c, pmic_arb_offset_v7()).
++ * One conversion = APP_SID, then write DIG_PARAM..CONV_REQ
++ * (0x42..0x47), poll STATUS1 EOC, read DATA0/DATA1 (LSB/MSB; full scale
++ * 0x70e4 = 1.875 V at the ADC input).  Same SPMI arbiter as the keys
++ * driver (0243); writes go through the arbiter's "chnls" region
++ * (0x0c500000), one 0x1000 page per APID (Linux
++ * drivers/spmi/spmi-pmic-arb.c, pmic_arb_offset_v7()).
 + *
 + * The stock charger stack runs on the ADSP (charger_pd over pmic-glink)
 + * and is unreachable, so IsCharging is "USB voltage present" and the
@@ -89,13 +93,14 @@
 +#define SPMI_ST_DONE            (1u << 0)
 +#define SPMI_ST_ERR             0x7eu
 +
-+/* ADC7 roots (PPID = sid<<8 | peripheral>>8). */
-+#define LIUQIN_ADCB_PPID        0x331u  /* PM8350B, SID 3: vbat_sns + usb */
-+#define LIUQIN_ADCC_PPID        0x131u  /* PM8350,  SID 1: vph_pwr fallback */
++/* The one ADC7 root in the APID map: pmk8350 vadc@3100 (SID 0). */
++#define LIUQIN_ADC_PPID         0x031u
 +#define LIUQIN_BATT_MAX_MAH     8600u   /* BM58, datasheet typical */
 +
 +/* ADC7 user-channel registers, offsets inside the root peripheral
 + * (drivers/iio/adc/qcom-spmi-adc5.c). */
++#define ADC_APP_SID             0x40u   /* target PMIC SID, bits 3:0 */
++#define ADC_APP_SID_MASK        0x0fu
 +#define ADC_USR_STATUS1         0x08u
 +#define ADC_USR_STATUS1_EOC     (1u << 0)
 +#define ADC_USR_DIG_PARAM       0x42u
@@ -105,16 +110,23 @@
 +#define ADC_USR_CONV_REQ_REQ    (1u << 7)
 +#define ADC_USR_DATA0           0x50u
 +#define ADC_USR_DATA1           0x51u
-+#define ADC7_VPH_PWR            0x8eu
-+#define ADC7_VBAT_SNS           0x8fu
-+#define ADC7_USB_IN_V_16        0x11u
 +#define ADC7_FULL_SCALE         0x70e4u
 +#define ADC7_DATA_CHECK         0xffffu
 +
++/* Channels, exactly as the official dtbo overlay instantiates them. */
++#define LIUQIN_BATT_SID         3u      /* PM8350B */
++#define LIUQIN_BATT_CHAN        0x8fu   /* VBAT_SNS, 1/3 */
++#define LIUQIN_BATT_DIV         3u
++#define LIUQIN_USB_SID          3u      /* PM8350B */
++#define LIUQIN_USB_CHAN         0x11u   /* USB_IN_V_16, 1/16 */
++#define LIUQIN_USB_DIV          16u
++#define LIUQIN_VPH_SID          1u      /* PM8350 fallback */
++#define LIUQIN_VPH_CHAN         0x8eu   /* VPH_PWR, 1/3 */
++#define LIUQIN_VPH_DIV          3u
++
 +static vm_offset_t batt_core, batt_cfg0, batt_cfg1, batt_obs, batt_chnls;
 +static uint32_t batt_bus0_apids, batt_bus1_apids;
-+static uint32_t batt_adcb_apid = (uint32_t)-1;   /* PM8350B */
-+static uint32_t batt_adcc_apid = (uint32_t)-1;   /* PM8350  */
++static uint32_t batt_adc_apid = (uint32_t)-1;
 +static const OSSymbol *gKeyNominal;
 +
 +static inline uint32_t
@@ -211,24 +223,31 @@
 +}
 +
 +/*
-+ * One ADC7 conversion of `chan` on `apid`, scaled with the channel's
-+ * internal divider `div` (1, 3, 6, 16, ...): mV = code * 1875 * div /
-+ * 0x70e4.  Reads the calibration fields back first (the Linux driver does
-+ * the same), selects the channel, enables, requests, polls EOC, reads the
-+ * 16-bit LSB/MSB pair.
++ * One ADC7 conversion of `chan` on target PMIC `sid`, scaled with the
++ * channel's internal divider `div`: mV = code * 1875 * div / 0x70e4.
++ * Writes ADC_APP_SID first - without it the root measures SID 0's own
++ * (for our channels: unconnected) mux and returns constant junk.
 + */
 +static int
-+batt_read_mv(uint32_t apid, uint8_t chan, unsigned div, uint32_t *code_out)
++batt_read_mv(unsigned sid, uint8_t chan, unsigned div, uint32_t *code_out)
 +{
 +	uint8_t r[6];
 +	uint8_t stb;
 +	uint8_t d0, d1;
 +	uint32_t code;
 +
-+	if (apid == (uint32_t)-1) {
++	if (batt_adc_apid == (uint32_t)-1) {
 +		return -1;
 +	}
-+	if (batt_spmi_read(apid, ADC_USR_DIG_PARAM, r, 6) != 0) {
++	/* select the target PMIC for this conversion */
++	if (batt_spmi_read(batt_adc_apid, ADC_APP_SID, r, 1) != 0) {
++		return -1;
++	}
++	r[0] = (uint8_t)((r[0] & ~ADC_APP_SID_MASK) | (sid & ADC_APP_SID_MASK));
++	if (batt_spmi_write(batt_adc_apid, ADC_APP_SID, r, 1) != 0) {
++		return -1;
++	}
++	if (batt_spmi_read(batt_adc_apid, ADC_USR_DIG_PARAM, r, 6) != 0) {
 +		return -1;
 +	}
 +	r[1] = (uint8_t)((r[1] & ~0x7u) & 0xffu);  /* fast avg: 1 sample  */
@@ -236,11 +255,11 @@
 +	r[3] = (uint8_t)(r[3] & ~0xfu);            /* no hw settle delay  */
 +	r[4] = (uint8_t)(r[4] | ADC_USR_EN_CTL1_EN);
 +	r[5] = (uint8_t)ADC_USR_CONV_REQ_REQ;
-+	if (batt_spmi_write(apid, ADC_USR_DIG_PARAM, r, 6) != 0) {
++	if (batt_spmi_write(batt_adc_apid, ADC_USR_DIG_PARAM, r, 6) != 0) {
 +		return -1;
 +	}
 +	for (unsigned i = 0; i < 2000; i++) {
-+		if (batt_spmi_read(apid, ADC_USR_STATUS1, &stb, 1) != 0) {
++		if (batt_spmi_read(batt_adc_apid, ADC_USR_STATUS1, &stb, 1) != 0) {
 +			return -1;
 +		}
 +		if ((stb & ADC_USR_STATUS1_EOC) != 0) {
@@ -253,8 +272,8 @@
 +			return -1;
 +		}
 +	}
-+	if (batt_spmi_read(apid, ADC_USR_DATA0, &d0, 1) != 0 ||
-+	    batt_spmi_read(apid, ADC_USR_DATA1, &d1, 1) != 0) {
++	if (batt_spmi_read(batt_adc_apid, ADC_USR_DATA0, &d0, 1) != 0 ||
++	    batt_spmi_read(batt_adc_apid, ADC_USR_DATA1, &d1, 1) != 0) {
 +		return -1;
 +	}
 +	code = (uint32_t)d0 | ((uint32_t)d1 << 8);
@@ -268,24 +287,27 @@
 +	return (int)((code * 1875u * div) / ADC7_FULL_SCALE);
 +}
 +
-+/* Battery voltage: VBAT_SNS on PM8350B (/6), VPH fallback on PM8350 (/3). */
++/* Battery voltage: VBAT_SNS on PM8350B (/3), VPH on PM8350 fallback (/3). */
 +static int
 +batt_read_vbat_mv(uint32_t *code_out)
 +{
-+	int mv = batt_read_mv(batt_adcb_apid, ADC7_VBAT_SNS, 6, code_out);
++	int mv = batt_read_mv(LIUQIN_BATT_SID, LIUQIN_BATT_CHAN,
++	    LIUQIN_BATT_DIV, code_out);
 +
 +	if (mv > 0) {
 +		return mv;
 +	}
 +	printf("LIUQIN BATT: vbat_sns unavailable, falling back to vph_pwr\n");
-+	return batt_read_mv(batt_adcc_apid, ADC7_VPH_PWR, 3, NULL);
++	return batt_read_mv(LIUQIN_VPH_SID, LIUQIN_VPH_CHAN, LIUQIN_VPH_DIV,
++	    NULL);
 +}
 +
 +/* USB present: USB_IN_V_16 on PM8350B (/16).  ~5000 mV on a charger. */
 +static int
 +batt_read_vbus_mv(void)
 +{
-+	return batt_read_mv(batt_adcb_apid, ADC7_USB_IN_V_16, 16, NULL);
++	return batt_read_mv(LIUQIN_USB_SID, LIUQIN_USB_CHAN, LIUQIN_USB_DIV,
++	    NULL);
 +}
 +
 +/*
@@ -510,66 +532,6 @@
 +
 +/* ---------------------------------------------------------------- bring-up */
 +
-+static uint32_t
-+liuqin_batt_find_adcs(void)
-+{
-+	uint32_t arb_version, features0, features1, count;
-+
-+	arb_version = brd(batt_core, SPMI_REG_VERSION);
-+	features0 = brd(batt_core, SPMI_REG_FEATURES0);
-+	features1 = brd(batt_core, SPMI_REG_FEATURES1);
-+	count = features0 & SPMI_FEATURES_MASK;
-+	batt_bus0_apids = count;
-+	batt_bus1_apids = features1 & SPMI_FEATURES_MASK;
-+	printf("LIUQIN BATT: arbiter 0x%08x, bus0 %u apids, bus1 %u\n",
-+	    arb_version, batt_bus0_apids, batt_bus1_apids);
-+	if (arb_version < 0x70000000u || arb_version >= 0x80000000u) {
-+		printf("LIUQIN BATT: not a v7 arbiter\n");
-+		return -1;
-+	}
-+	if (count == 0 || count > SPMI_APID_MAX) {
-+		printf("LIUQIN BATT: bad bus0 APID count\n");
-+		return -1;
-+	}
-+	if (batt_bus1_apids > SPMI_APID_MAX - count) {
-+		batt_bus1_apids = SPMI_APID_MAX - count;
-+	}
-+
-+	/*
-+	 * The v7 APID->PPID table is ONE global array at core + 0x2000,
-+	 * 1024 entries; bus1's APIDs are numbered 768..1023 but their map
-+	 * entries sit at core + 0x2000 + 4 * global_apid like everybody
-+	 * else's (0243's note, and nts2/nts4 both proved it empirically).
-+	 * The nts4 attempt that scanned a separate "bus1 table" at
-+	 * cfg1 + 0x2000 found nothing because no such table exists.
-+	 */
-+	for (uint32_t apid = 0; apid < count + batt_bus1_apids &&
-+	    apid < SPMI_APID_MAX; apid++) {
-+		const uint32_t m = brd(batt_core, SPMI_APID_MAP(apid));
-+		const uint32_t ppid = (m >> 8) & SPMI_PPID_MASK;
-+
-+		if (m == 0) {
-+			continue;
-+		}
-+		if (ppid == LIUQIN_ADCB_PPID) {
-+			batt_adcb_apid = apid;
-+			printf("LIUQIN BATT: PM8350B ADC7 (ppid 0x331) at apid %u%s\n",
-+			    apid, apid >= count ? " (bus1)" : "");
-+		}
-+		if (ppid == LIUQIN_ADCC_PPID) {
-+			batt_adcc_apid = apid;
-+			printf("LIUQIN BATT: PM8350 ADC7 (ppid 0x131) at apid %u%s\n",
-+			    apid, apid >= count ? " (bus1)" : "");
-+		}
-+		/* diagnostic: every ADC-root-shaped peripheral on the map */
-+		if ((ppid & 0xffu) == 0x31u) {
-+			printf("LIUQIN BATT: map dump: apid %u ppid 0x%03x\n",
-+			    apid, ppid);
-+		}
-+	}
-+	return batt_adcb_apid;
-+}
-+
 +static void
 +liuqin_battery_thread(__unused void *arg, __unused wait_result_t wr)
 +{
@@ -578,7 +540,7 @@
 +	IOService *res;
 +	AppleSmartBatteryManager *mgr;
 +
-+	/* Map the arbiter and find the ADC7 peripherals in the APID table. */
++	/* Map the arbiter and find the ADC7 root in the APID table. */
 +	batt_core = ml_io_map(SPMI_CORE_PA, SPMI_CORE_SIZE);
 +	batt_cfg0 = ml_io_map(SPMI_CFG0_PA, SPMI_CFG_SIZE);
 +	batt_cfg1 = ml_io_map(SPMI_CFG1_PA, SPMI_CFG_SIZE);
@@ -588,9 +550,43 @@
 +		printf("LIUQIN BATT: SPMI map failed\n");
 +		return;
 +	}
-+	if (liuqin_batt_find_adcs() == (uint32_t)-1) {
-+		printf("LIUQIN BATT: no ADC7 battery peripheral in the APID map, "
-+		    "stopping\n");
++	{
++		const uint32_t arb_version = brd(batt_core, SPMI_REG_VERSION);
++		const uint32_t features0 = brd(batt_core, SPMI_REG_FEATURES0);
++		const uint32_t features1 = brd(batt_core, SPMI_REG_FEATURES1);
++		uint32_t count = features0 & SPMI_FEATURES_MASK;
++
++		batt_bus0_apids = count;
++		batt_bus1_apids = features1 & SPMI_FEATURES_MASK;
++		printf("LIUQIN BATT: arbiter 0x%08x, bus0 %u apids, bus1 %u\n",
++		    arb_version, batt_bus0_apids, batt_bus1_apids);
++		if (arb_version < 0x70000000u || arb_version >= 0x80000000u) {
++			printf("LIUQIN BATT: not a v7 arbiter\n");
++			return;
++		}
++		if (count == 0 || count > SPMI_APID_MAX) {
++			printf("LIUQIN BATT: bad bus0 APID count\n");
++			return;
++		}
++		if (batt_bus1_apids > SPMI_APID_MAX - count) {
++			batt_bus1_apids = SPMI_APID_MAX - count;
++		}
++		/* one global table at core + 0x2000, all 1024 APIDs */
++		for (uint32_t apid = 0; apid < count + batt_bus1_apids &&
++		    apid < SPMI_APID_MAX; apid++) {
++			const uint32_t m = brd(batt_core, SPMI_APID_MAP(apid));
++			const uint32_t ppid = (m >> 8) & SPMI_PPID_MASK;
++
++			if (m != 0 && ppid == LIUQIN_ADC_PPID) {
++				batt_adc_apid = apid;
++				printf("LIUQIN BATT: ADC7 root (ppid 0x031) at apid %u\n",
++				    apid);
++				break;
++			}
++		}
++	}
++	if (batt_adc_apid == (uint32_t)-1) {
++		printf("LIUQIN BATT: no ADC7 root in the APID map, stopping\n");
 +		return;
 +	}
 +
