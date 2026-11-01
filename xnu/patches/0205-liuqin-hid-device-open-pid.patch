@@ -1,0 +1,30 @@
+--- a/iokit/Kernel/arm/hid/LiuqinHID.cpp
++++ b/iokit/Kernel/arm/hid/LiuqinHID.cpp
+@@ -18,6 +18,9 @@
+  */
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <kern/task.h>
++#include <sys/proc.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <libkern/c++/OSArray.h>
+ #include <pexpert/pexpert.h>
+@@ -605,7 +608,16 @@
+ {
+ 	IOUserClient *client;
+ 
+-	IOLog("LIUQIN HID: IOHIDDevice stub newUserClient type 0x%x\n", (unsigned)type);
++	{
++		proc_t proc = (proc_t)get_bsdtask_info(owningTask);
++		char pname[64] = "?";
++
++		if (proc) {
++			proc_name(proc_pid(proc), pname, sizeof(pname));
++		}
++		IOLog("LIUQIN HID: IOHIDDevice stub newUserClient type 0x%x by %s\n",
++		    (unsigned)type, pname);
++	}
+ 	if (type == 0x00484944 /* kIOHIDLibUserClientConnectManager */) {
+ 		client = OSTypeAlloc(LiuqinHIDDeviceUserClient);
+ 		if (client && !client->initWithTask(owningTask, securityID, type, properties)) {

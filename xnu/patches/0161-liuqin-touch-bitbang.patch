@@ -1,0 +1,213 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -296,6 +296,8 @@
+ 	uint32_t    div;                /* SE clock divider */
+ 	uint32_t    spi_hz;
+ 	bool        fifo_capable;      /* GENI_IF_DISABLE_RO says FIFO works */
++	bool        bitbang;            /* drive gpio16..19 as a software SPI */
++	uint32_t    pin_clk, pin_mosi, pin_miso, pin_cs;
+ 	vm_offset_t dma;                /* staging page for SE DMA */
+ 	uint64_t    dma_pa;
+ 	uint32_t    dma_tx_status;      /* last SE_DMA_TX/RX_IRQ_STAT */
+@@ -497,13 +499,86 @@
+ 		return -1;
+ 	}
+ 	return 0;
++}
++
++/*
++ * Software SPI on the four touch pads.
++ *
++ * This serial engine has no FIFO interface (GENI_IF_DISABLE_RO) and its own
++ * DMA wedges the interconnect on this port's memory map, so the pads are
++ * driven as plain GPIOs instead: mode 0, MSB first, clock stretching harmless.
++ * The TLMM register is one 0x1000 block per pin; its IO register is at +0x4
++ * with the output value in bit 1 and the input in bit 0 (SM8450 PINGROUP).
++ */
++static void
++tch_bb_dir(uint32_t pin, bool out, int level)
++{
++	uint32_t io = tch_rd(tch.tlmm, TLMM_CTL(pin) + TLMM_IN_OUT);
++
++	io = (io & ~TLMM_OUT_BIT) | (level ? TLMM_OUT_BIT : 0);
++	tch_wr(tch.tlmm, TLMM_CTL(pin) + TLMM_IN_OUT, io);
++	/* mux 0 (GPIO), no pull, 6 mA, output enable in bit 9 */
++	tch_wr(tch.tlmm, TLMM_CTL(pin), (out ? (1u << 9) : 0) | (2u << 6));
+ }
+ 
++static inline void
++bb_set(uint32_t pin, int level)
++{
++	volatile uint32_t *io = (volatile uint32_t *)(tch.tlmm + TLMM_CTL(pin) + TLMM_IN_OUT);
++	const uint32_t v = *io;
++
++	*io = (v & ~TLMM_OUT_BIT) | (level ? TLMM_OUT_BIT : 0);
++}
++
++static inline int
++bb_get(uint32_t pin)
++{
++	const uint32_t v = *(volatile uint32_t *)(tch.tlmm + TLMM_CTL(pin) + TLMM_IN_OUT);
++
++	return (v & TLMM_IN_BIT) != 0;
++}
++
++static inline void
++bb_pace(void)
++{
++	for (int i = 0; i < 8; i++) {
++		__asm__ volatile ("nop");
++	}
++}
++
++static void
++tch_bb_xfer(const uint8_t *tx, uint8_t *rx, size_t len)
++{
++	for (size_t i = 0; i < len; i++) {
++		const uint8_t out = tx != NULL ? tx[i] : 0xff;
++		uint8_t in = 0;
++
++		for (int b = 7; b >= 0; b--) {
++			bb_set(tch.pin_mosi, (out >> b) & 1);
++			bb_pace();
++			bb_set(tch.pin_clk, 1);
++			bb_pace();
++			in = (uint8_t)((in << 1) | (bb_get(tch.pin_miso) ? 1 : 0));
++			bb_set(tch.pin_clk, 0);
++			bb_pace();
++		}
++		if (rx != NULL) {
++			rx[i] = in;
++		}
++	}
++}
++
+ /* SPI_CS_ASSERT (8) / SPI_CS_DEASSERT (9); the transfer itself does not
+  * toggle the line because CS_TOGGLE was cleared at init. */
+ static int
+ tch_cs(bool assert)
+ {
++	if (tch.bitbang) {
++		bb_set(tch.pin_cs, assert ? 0 : 1);     /* active low */
++		bb_pace();
++		bb_pace();
++		return 0;
++	}
+ 	tch_fifo_mode();
+ 	const uint32_t irq = tch_run_cmd(((assert ? SPI_CS_ASSERT : SPI_CS_DEASSERT) << M_OPCODE_SHFT),
+ 	    NULL, 0, NULL, 0, NULL, 20);
+@@ -787,6 +862,13 @@
+ static int
+ tch_xfer(const uint8_t *tx, uint8_t *rx, size_t len)
+ {
++	if (tch.bitbang) {
++		if (len == 0 || len > 256) {
++			return -1;
++		}
++		tch_bb_xfer(tx, rx, len);
++		return 0;
++	}
+ 	return tch.fifo_capable ? tch_fifo_xfer(tx, rx, len) : tch_dma_xfer(tx, rx, len);
+ }
+ 
+@@ -824,6 +906,50 @@
+ 		err = -1;
+ 	}
+ 	return err;
++}
++
++/* Find which pad is the clock, which is MOSI and which is MISO: nothing in the
++ * device tree names the roles, so try the six assignments and keep the one
++ * that answers with a Novatek trim id.  gpio19 is the chip select (the DT's
++ * qup_spi4_cs group) and stays one. */
++static int
++tch_bitbang_start(void)
++{
++	static const uint32_t data_pins[3] = { 16, 17, 18 };
++	static const uint8_t perm[6][3] = {
++		{ 0, 1, 2 }, { 0, 2, 1 }, { 1, 0, 2 },
++		{ 1, 2, 0 }, { 2, 0, 1 }, { 2, 1, 0 },
++	};
++	uint8_t id[6];
++
++	tch.pin_cs = 19;
++	tch_bb_dir(tch.pin_cs, true, 1);                /* chip select deasserted */
++	tch.bitbang = true;
++	tch.cs_manual = true;
++
++	for (unsigned p = 0; p < 6; p++) {
++		tch.pin_clk = data_pins[perm[p][0]];
++		tch.pin_mosi = data_pins[perm[p][1]];
++		tch.pin_miso = data_pins[perm[p][2]];
++		tch_bb_dir(tch.pin_clk, true, 0);
++		tch_bb_dir(tch.pin_mosi, true, 0);
++		tch_bb_dir(tch.pin_miso, false, 0);
++		memset(id, 0, sizeof(id));
++		const int err = tch_nvt_read(NVT_CHIP_VER_TRIM_ADDR, id, sizeof(id));
++
++		printf("LIUQIN TOUCH: bitbang %u: clk gpio%u mosi gpio%u miso gpio%u -> "
++		    "%02x %02x %02x %02x %02x %02x%s\n",
++		    p, tch.pin_clk, tch.pin_mosi, tch.pin_miso,
++		    id[0], id[1], id[2], id[3], id[4], id[5],
++		    err != 0 ? " (read failed)" : "");
++		if (err == 0 && id[3] == 0x65 && id[4] == 0x03) {
++			printf("LIUQIN TOUCH: bit-banged SPI: clk gpio%u mosi gpio%u miso gpio%u cs gpio%u\n",
++			    tch.pin_clk, tch.pin_mosi, tch.pin_miso, tch.pin_cs);
++			return 0;
++		}
++	}
++	printf("LIUQIN TOUCH: no pad assignment answered with a Novatek id\n");
++	return -1;
+ }
+ 
+ static const char *
+@@ -929,16 +1055,40 @@
+ 	    tch_rd(tch.se, SE_SPI_TRANS_CFG), tch_rd(tch.se, SE_SPI_SLAVE_EN));
+ 	tch_visible_mark("touch spi cfg");
+ 	tch.fifo_capable = (tch_rd(tch.se, GENI_IF_DISABLE_RO) & FIFO_IF_DISABLE) == 0;
+-	if (!tch.fifo_capable && tch_dma_alloc() != 0) {
+-		printf("LIUQIN TOUCH: FIFO interface is disabled (if_disable 0x%08x) "
+-		    "and there is no DMA memory\n", tch_rd(tch.se, GENI_IF_DISABLE_RO));
+-		return -1;
+-	}
+-	printf("LIUQIN TOUCH: FIFO interface %s (if_disable 0x%08x), transfers over %s\n",
+-	    tch.fifo_capable ? "present" : "disabled",
+-	    tch_rd(tch.se, GENI_IF_DISABLE_RO),
+-	    tch.fifo_capable ? "the FIFOs" : "SE DMA");
++	printf("LIUQIN TOUCH: FIFO interface %s (if_disable 0x%08x)\n",
++	    tch.fifo_capable ? "present" : "disabled", tch_rd(tch.se, GENI_IF_DISABLE_RO));
+ 	tch_dump_state("after init");
++
++	if (!tch.fifo_capable) {
++		/*
++		 * The engine rejects FIFO transfers, and its own DMA freezes the
++		 * whole machine on the first transfer: the staging page lands at
++		 * 0x8a0150000 (34.5 GiB, this port's ADT only knows a bank above
++		 * 32 GiB) and the QUP's DMA cannot complete a transaction there.
++		 * Drive the four pads as GPIOs instead; liuqintouchdma=1 retries
++		 * the engine's DMA path for a future memory/IOMMU fix.
++		 */
++		int use_dma = 0;
++
++		(void)PE_parse_boot_argn("liuqintouchdma", &use_dma, sizeof(use_dma));
++		if (!use_dma) {
++			printf("LIUQIN TOUCH: SE DMA not usable here, using bit-banged SPI\n");
++			tch_visible_mark("touch bitbang probe");
++			return tch_bitbang_start();
++		}
++		printf("LIUQIN TOUCH: liuqintouchdma=1, trying SE DMA again\n");
++		if (tch_dma_alloc() != 0) {
++			return -1;
++		}
++		tch_visible_mark("touch bus probe");
++		if (tch_se_start() != 0) {
++			return -1;
++		}
++		printf("LIUQIN TOUCH: SE4 running, chip select %s\n",
++		    tch.cs_manual ? "by hand" : "driven by the engine");
++		return 0;
++	}
++
+ 	tch_visible_mark("touch bus probe");
+ 	if (tch_se_start() != 0) {
+ 		return -1;

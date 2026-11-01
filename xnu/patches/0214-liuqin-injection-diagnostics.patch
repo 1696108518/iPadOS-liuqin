@@ -1,0 +1,97 @@
+--- a/bsd/kern/liuqin_amfi.c
++++ b/bsd/kern/liuqin_amfi.c
+@@ -331,15 +331,30 @@
+ 	} args;
+ 	uint64_t flags = AMFI_DYLD_OUTPUT_ALLOW_ALL;
+ 	uint64_t state = AMFI_BOOTARG_STATE_NOT_ENFORCING;
+-	static bool logged;
+ 	int error;
+ 
+-	if (!logged) {
+-		logged = true;
+-		char name[32];
++	{
++		/* Say once per process that asks, so the boot log shows who asked. */
++		static pid_t seen[64];
++		static unsigned nseen;
++		pid_t pid = proc_pid(p);
++		bool known = false;
+ 
+-		proc_name(proc_pid(p), name, sizeof(name));
+-		printf("LIUQIN AMFI: first policy syscall (call %d, from %s)\n", call, name);
++		for (unsigned i = 0; i < nseen && i < 64; i++) {
++			if (seen[i] == pid) {
++				known = true;
++				break;
++			}
++		}
++		if (!known) {
++			char name[32];
++
++			if (nseen < 64) {
++				seen[nseen++] = pid;
++			}
++			proc_name(pid, name, sizeof(name));
++			printf("LIUQIN AMFI: policy syscall %d from %s (pid %d)\n", call, name, pid);
++		}
+ 	}
+ 	if (call == AMFI_SYSCALL_QUERY_BOOTARG_STATE) {
+ 		return copyout(&state, arg, sizeof(state));
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -36,6 +36,8 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/liuqin_input.h>
++#include <sys/vnode.h>
++#include <sys/vfs_context.h>
+ #include <sys/kernel.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+@@ -2241,6 +2243,38 @@
+  * (id << 3 | event, x high, y high, x low nibble << 4 | y low nibble,
+  * weight, pressure).  Finger ids are 1-based and become HID slots 0..9.
+  * Returns how many fingers the frame reports. */
++/*
++ * Does the flashed root really carry the injected library and the plist that
++ * asks for it?  Nothing in user space can tell us until the library runs, so the
++ * kernel looks (vnode_lookup + a size query) and says so in the log.
++ */
++static void
++tch_probe_injection_files(void)
++{
++	static const char *const paths[] = {
++		"/usr/lib/libliuqintouch.dylib",
++		"/System/Library/LaunchDaemons/com.apple.backboardd.plist",
++	};
++
++	for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
++		vnode_t vp = NULLVP;
++		struct vnode_attr va;
++		errno_t err = vnode_lookup(paths[i], 0, &vp, vfs_context_current());
++
++		if (err != 0 || vp == NULLVP) {
++			printf("LIUQIN INPUT: %s missing (%d)\n", paths[i], err);
++			continue;
++		}
++		VATTR_INIT(&va);
++		VATTR_WANTED(&va, va_data_size);
++		if (vnode_getattr(vp, &va, vfs_context_current()) == 0) {
++			printf("LIUQIN INPUT: %s present, %lld bytes\n", paths[i],
++			    (long long)va.va_data_size);
++		}
++		vnode_put(vp);
++	}
++}
++
+ static uint32_t tch_last_x[NVT_MAX_FINGERS], tch_last_y[NVT_MAX_FINGERS];
+ 
+ static int
+@@ -2554,6 +2588,7 @@
+ {
+ 	thread_t thread;
+ 
++	tch_probe_injection_files();
+ 	if (kernel_thread_start(liuqin_touch_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {

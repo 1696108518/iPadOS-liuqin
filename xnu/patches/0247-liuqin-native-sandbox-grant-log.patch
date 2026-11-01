@@ -1,0 +1,40 @@
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -4363,12 +4363,23 @@
+ static bool
+ native_sandbox_grant(IOService * service)
+ {
+-	OSString * list = OSDynamicCast(OSString, service->getProperty("NativeSandboxGrantProcess"));
++	OSObject * property = service->getProperty("NativeSandboxGrantProcess");
++	OSString * list = OSDynamicCast(OSString, property);
+ 	char name[17] = {};
++	const char * cls = service->getMetaClass() ? service->getMetaClass()->getClassName() : "?";
+ 	if (!list) {
++		/* Only the accelerator is expected to carry the property; log the
++		 * mismatch (wrong class or missing) without flooding every open. */
++		if (property) {
++			IOLog("NativeSandboxGrant: %s property is %s\n", cls,
++			    property->getMetaClass() ? property->getMetaClass()->getClassName() : "?");
++		} else if (!strcmp(cls, "AGXAccelerator")) {
++			IOLog("NativeSandboxGrant: %s has no NativeSandboxGrantProcess\n", cls);
++		}
+ 		return false;
+ 	}
+ 	proc_selfname(name, sizeof(name));
++	IOLog("NativeSandboxGrant: %s proc %s list %s\n", cls, name, list->getCStringNoCopy());
+ 	for (const char * at = list->getCStringNoCopy(); *at;) {
+ 		size_t length = 0;
+ 		while (at[length] && at[length] != ',') {
+@@ -4377,10 +4388,12 @@
+ 		/* A process name holds 16 characters, so a longer entry is compared by its first 16. */
+ 		if (length && 0 == strncmp(name, at, length < sizeof(name) - 1 ? length : sizeof(name) - 1)
+ 		    && (length >= sizeof(name) - 1 || name[length] == 0)) {
++			IOLog("NativeSandboxGrant: %s grants %s\n", cls, name);
+ 			return true;
+ 		}
+ 		at += length + (at[length] == ',' ? 1 : 0);
+ 	}
++	IOLog("NativeSandboxGrant: %s does not list %s\n", cls, name);
+ 	return false;
+ }
+ 

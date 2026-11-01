@@ -1,0 +1,171 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -618,6 +618,7 @@
+ 
+ static int tch_xfer(const uint8_t *tx, uint8_t *rx, size_t len);
+ static void tch_nvt_bringup(void);
++static int tch_nvt_write8(uint32_t addr, uint8_t val);
+ static void liuqin_touch_int_watch(void *arg, wait_result_t wr);
+ static void liuqin_touch_reports_start(void);
+ 
+@@ -1158,6 +1159,143 @@
+ 	printf("LIUQIN TOUCH: touch firmware %u bytes at %p (%02x %02x %02x %02x %02x %02x)\n",
+ 	    *size, fw, fw[0], fw[1], fw[2], fw[3], fw[4], fw[5]);
+ 	return fw;
++}
++
++/* Firmware download, transcribed from the official Google novatek_touch module
++ * (nt36xxx_fw_update.c / nt36xxx_mem_map.h, kept in refs/novatek):
++ *
++ *   BOOT_RDY_ADDR = 0x1f141, POR_CD_ADDR = 0x1f61c, EVENT_BUF_ADDR = 0x11a00,
++ *   NVT_TRANSFER_LEN = 0xfc00, container = 12-byte ILM/DLM records from 0 and
++ *   16-byte info records from 0x30 (cascade uses end/2 for the info count).
++ */
++#define NVT_BOOT_RDY_ADDR       0x1f141u
++#define NVT_POR_CD_ADDR         0x1f61cu
++#define NVT_EVENT_BASE          0x11a00u
++#define NVT_FW_CHUNK            0xfc00u
++
++static uint32_t
++tch_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++	    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++/* One section: chunks of NVT_FW_CHUNK, each a page write followed by a single
++ * chip-select window holding [sram & 0x7f] and the payload. */
++static int
++tch_fw_write_sram(const uint8_t *img, uint32_t sram, uint32_t size, uint32_t off)
++{
++	for (uint32_t done = 0; done < size; done += NVT_FW_CHUNK) {
++		uint8_t page[3], hdr[1];
++		uint32_t addr = sram + done;
++		uint32_t len = size - done;
++		int err;
++
++		if (len > NVT_FW_CHUNK) {
++			len = NVT_FW_CHUNK;
++		}
++		page[0] = 0xff;
++		page[1] = (uint8_t)((addr >> 15) & 0xff);
++		page[2] = (uint8_t)((addr >> 7) & 0xff);
++		if (tch_cs(true) != 0) {
++			return -1;
++		}
++		err = tch_xfer(page, NULL, sizeof(page));
++		if (tch_cs(false) != 0) {
++			err = -1;
++		}
++		if (err != 0) {
++			return -1;
++		}
++		hdr[0] = (uint8_t)(addr & 0x7f);
++		if (tch_cs(true) != 0) {
++			return -1;
++		}
++		err = tch_xfer(hdr, NULL, 1);
++		if (err == 0) {
++			err = tch_xfer(img + off + done, NULL, len);
++		}
++		if (tch_cs(false) != 0) {
++			err = -1;
++		}
++		if (err != 0) {
++			return -1;
++		}
++	}
++	return 0;
++}
++
++static bool
++tch_fw_state_ready(void)
++{
++	uint8_t st[6] = { 0 };
++
++	(void)tch_nvt_read(NVT_EVENT_BASE + 0x60, st, sizeof(st));
++	return st[0] >= 0xa0 && st[0] <= 0xaf;
++}
++
++static int
++tch_fw_download(void)
++{
++	uint32_t size = 0;
++	const uint8_t *fw = liuqin_fw_get("novatek_nt36532_m81_fw_csot.bin", &size);
++	uint32_t end, info_num, ovly_num, parts;
++
++	if (fw == NULL) {
++		return -1;
++	}
++	end = tch_le32(fw);
++	info_num = (((end / 2) - 0x30) / 0x10) + 1;
++	ovly_num = (fw[0x28] & 0x10) ? (fw[0x28] & 0x0f) : 0;
++	parts = 2 + ovly_num + info_num;
++	printf("LIUQIN TOUCH: fw download: end 0x%x cascade %u info %u parts %u size %u\n",
++	    end, (fw[0x20] >> 1) & 1, info_num, parts, size);
++
++	(void)tch_nvt_write8(0x00000, 0x69);            /* bootloader reset */
++	delay(35 * 1000);
++
++	for (uint32_t i = 0; i < parts; i++) {
++		uint32_t bin, sram, len;
++
++		if (i < 2) {
++			bin = tch_le32(fw + i * 12);
++			sram = tch_le32(fw + 4 + i * 12);
++			len = tch_le32(fw + 8 + i * 12);
++		} else {
++			const uint32_t pos = 0x30 + 0x10 * (i - 2);
++
++			sram = tch_le32(fw + pos);
++			len = tch_le32(fw + pos + 4);
++			bin = tch_le32(fw + pos + 8);
++		}
++		if (len == 0) {
++			continue;
++		}
++		if (bin + len > size) {
++			printf("LIUQIN TOUCH: fw part %u out of range\n", i);
++			return -1;
++		}
++		printf("LIUQIN TOUCH: fw part %u: sram 0x%x len 0x%x bin 0x%x\n", i, sram, len, bin);
++		if (tch_fw_write_sram(fw, sram, len + 1, bin) != 0) {
++			printf("LIUQIN TOUCH: fw part %u write failed\n", i);
++			return -1;
++		}
++	}
++
++	(void)tch_nvt_write8(NVT_BOOT_RDY_ADDR, 1);
++	delay(5 * 1000);
++	(void)tch_nvt_write8(NVT_BOOT_RDY_ADDR, 0);
++	(void)tch_nvt_write8(NVT_POR_CD_ADDR, 0xa0);
++
++	for (unsigned i = 0; i < 10; i++) {
++		if (tch_fw_state_ready()) {
++			printf("LIUQIN TOUCH: firmware booted, state ready after %u polls\n", i);
++			return 0;
++		}
++		delay(10 * 1000);
++	}
++	printf("LIUQIN TOUCH: firmware did not report ready\n");
++	return -1;
+ }
+ 
+ /* Read the firmware state register (event 0x60) at both candidate bases; the
+@@ -1644,6 +1782,16 @@
+ 
+ 	bool valid = have_id && name != NULL;
+ 
++	/*
++	 * The application firmware does not survive the handover: ABL and a
++	 * reboot leave the part in its bootloader, which answers register reads
++	 * but never scans.  Download the image from the firmware area unless the
++	 * chip already reports a running firmware.
++	 */
++	if (have_id && !tch_fw_state_ready()) {
++		tch_fw_download();
++	}
++
+ 	uint8_t fw[16] = { 0 };
+ 	if (tch_nvt_read(NVT_FWINFO_ADDR, fw, sizeof(fw)) == 0) {
+ 		const uint32_t max_x = ((uint32_t)fw[4] << 8) | fw[5];

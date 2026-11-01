@@ -1,0 +1,29 @@
+--- a/iokit/Kernel/arm/hid/LiuqinHID.cpp
++++ b/iokit/Kernel/arm/hid/LiuqinHID.cpp
+@@ -553,7 +553,25 @@
+ 	if (!IOHIDDevice::start(provider)) {
+ 		return false;
+ 	}
+-	IOLog("LIUQIN HID: AppleMultitouchDevice started (0xff00/0xf)\n");
++	/*
++	 * MultitouchSupport attaches through CFPlugIn: it looks the device up in
++	 * IOCFPlugInTypes by UUID and loads the bundle named there.  The root ships
++	 * that plugin inside AppleMultitouchSPI.kext, so publishing the mapping is
++	 * what makes the multitouch stack pick the device up at all.
++	 */
++	{
++		OSDictionary *plugins = OSDictionary::withCapacity(1);
++		OSString *path = OSString::withCString(
++		    "AppleMultitouchSPI.kext/PlugIns/MultitouchHID.plugin");
++
++		if (plugins && path) {
++			plugins->setObject("0516B563-B15B-11DA-96EB-0014519758EF", path);
++			setProperty("IOCFPlugInTypes", plugins);
++		}
++		OSSafeReleaseNULL(path);
++		OSSafeReleaseNULL(plugins);
++	}
++	IOLog("LIUQIN HID: AppleMultitouchDevice started (0xff00/0xf, IOCFPlugInTypes)\n");
+ 	return true;
+ }
+ 

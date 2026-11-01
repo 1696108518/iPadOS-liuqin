@@ -1,0 +1,72 @@
+--- a/bsd/kern/liuqin_amfi.c
++++ b/bsd/kern/liuqin_amfi.c
+@@ -304,9 +304,59 @@
+ 		return 0;
+ 	}
+ }
++
++/*
++ * dyld asks AMFI what a process may do (mac policy syscall request 0x5a,
++ * "check dyld policy"): the argument is { flags in, pointer to flags out }.  All
++ * of it is allowed here - @paths, the DYLD_* variables, inserted libraries and
++ * interposing - which is what lets our own library be loaded into stock daemons
++ * (DYLD_INSERT_LIBRARIES into backboardd).  Without this the call fails with
++ * ENOPOLICY, dyld treats the process as restricted and prunes the environment.
++ *
++ * Request 0x60 ("query boot-arg state", amfi_interface_query_bootarg_state) is
++ * asked by ExtensionKit; answer "nothing is enforced".  See ios-sweet's sibling
++ * project hackios (bsd/kern/kern_minimac.c), which established both numbers.
++ */
++#define AMFI_SYSCALL_CHECK_DYLD_POLICY  0x5a
++#define AMFI_SYSCALL_QUERY_BOOTARG_STATE 0x60
++#define AMFI_DYLD_OUTPUT_ALLOW_ALL      0xffULL
++#define AMFI_BOOTARG_STATE_NOT_ENFORCING 0x86ULL
+ 
++static int
++liuqin_amfi_policy_syscall(struct proc *p, int call, user_addr_t arg)
++{
++	struct {
++		uint64_t input_flags;
++		user_addr_t output_flags;
++	} args;
++	uint64_t flags = AMFI_DYLD_OUTPUT_ALLOW_ALL;
++	uint64_t state = AMFI_BOOTARG_STATE_NOT_ENFORCING;
++	static bool logged;
++	int error;
++
++	if (!logged) {
++		logged = true;
++		char name[32];
++
++		proc_name(proc_pid(p), name, sizeof(name));
++		printf("LIUQIN AMFI: first policy syscall (call %d, from %s)\n", call, name);
++	}
++	if (call == AMFI_SYSCALL_QUERY_BOOTARG_STATE) {
++		return copyout(&state, arg, sizeof(state));
++	}
++	if (call != AMFI_SYSCALL_CHECK_DYLD_POLICY) {
++		return ENOPOLICY;
++	}
++	error = copyin(arg, &args, sizeof(args));
++	if (error == 0) {
++		error = copyout(&flags, args.output_flags, sizeof(flags));
++	}
++	return error;
++}
++
+ static const struct mac_policy_ops liuqin_amfi_mac_ops = {
+ 	.mpo_vnode_check_signature = liuqin_amfi_vnode_check_signature,
++	.mpo_policy_syscall = liuqin_amfi_policy_syscall,
+ };
+ 
+ /*
+@@ -360,7 +410,8 @@
+ static mac_policy_handle_t liuqin_sandbox_mac_handle;
+ 
+ static struct mac_policy_conf liuqin_amfi_mac_conf = {
+-	.mpc_name = "LIUQIN AMFI",
++	/* libamfi's mac_syscall arrives under this exact name. */
++	.mpc_name = "AMFI",
+ 	.mpc_fullname = "LIUQIN built-in Mobile File Integrity",
+ 	.mpc_ops = &liuqin_amfi_mac_ops,
+ };

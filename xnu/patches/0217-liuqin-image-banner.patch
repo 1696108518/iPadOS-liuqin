@@ -1,0 +1,9 @@
+--- a/bsd/dev/liuqin_input.c
++++ b/bsd/dev/liuqin_input.c
+@@ -120,4 +120,6 @@
+ 	} else {
+ 		printf("liuqin-touch: /dev/liuqin-touch ready\n");
+ 	}
++	/* Which payload is running: every log then says it, no guessing. */
++	printf("LIUQIN IMAGE: built %s %s\n", __DATE__, __TIME__);
+ }

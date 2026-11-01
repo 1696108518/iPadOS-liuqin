@@ -1,0 +1,55 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -1006,7 +1006,9 @@
+ 	(void)tch_nvt_read(NVT_CHIP_VER_TRIM_ADDR, id, sizeof(id));
+ 	(void)tch_nvt_read(NVT_FWINFO_ADDR, fw, sizeof(fw));
+ 	(void)tch_nvt_read(NVT_CHIP_INFO_PAGE, old, sizeof(old));
+-	const bool id_ok = (id[3] == 0x65 && id[4] == 0x03) ||
++	const bool id_ok = (id[0] == 0x65 && id[1] == 0x03) ||
++	    (id[3] == 0x65 && id[4] == 0x03) ||
++	    (old[0] == 0x65 && old[1] == 0x03) ||
+ 	    (old[3] == 0x65 && old[4] == 0x03);
+ 	const bool ok = id_ok || (uint8_t)(fw[0] + fw[1]) == 0xff;
+ 
+@@ -1102,7 +1104,12 @@
+ {
+ 	tch_roles(17, 18, 19, 16);
+ 	tch.page8 = false;
+-	tch.dummy = 1;
++	/*
++	 * CTP_SPI_READ transfers len+1 bytes and the vendor driver reads the data
++	 * from buf[1]: there is no dummy byte between the address and the data.
++	 * Reading rx[2] shifted every byte we ever fetched by one.
++	 */
++	tch.dummy = 0;
+ 	tch.bb_pace_us = 5;
+ 	tch.bb_cpol = 0;
+ 	tch.bb_cpha = 0;
+@@ -1139,6 +1146,11 @@
+ 	tch_nvt_bringup();
+ 	tch_read_id_line("MISO with pull-up");
+ 	tch_bb_dir(16, false, 0);
++
++	tch.dummy = 1;
++	tch_nvt_bringup();
++	tch_read_id_line("one dummy byte (old framing)");
++	tch.dummy = 0;
+ }
+ 
+ static int
+@@ -1322,11 +1334,11 @@
+ tch_nvt_bringup(void)
+ {
+ 	(void)tch_nvt_write8(0x00000, 0x69);            /* bootloader reset */
+-	delay(40 * 1000);
+-	(void)tch_nvt_write8(0x00000, 0xa5);            /* software reset idle */
+-	delay(20 * 1000);
++	delay(18 * 1000);                               /* vendor: 44728 udelay */
++	(void)tch_nvt_write8(0x00000, 0xa5);            /* software reset idle */
++	delay(15 * 1000);
+ 	(void)tch_nvt_write8(0x00000, 0x35);            /* unlock */
+-	delay(20 * 1000);
++	delay(10 * 1000);
+ }
+ 
+ static const char *

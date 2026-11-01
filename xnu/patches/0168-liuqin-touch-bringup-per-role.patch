@@ -1,0 +1,58 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -967,30 +967,38 @@
+  * device tree names the roles, so try the six assignments and keep the one
+  * that answers with a Novatek trim id.  gpio19 is the chip select (the DT's
+  * qup_spi4_cs group) and stays one. */
++/* The vendor driver's chip-info page; the SPI trim id sits at 0x3f004, and
++ * older parts answer on the page address instead. */
++#define NVT_CHIP_INFO_PAGE      0x1f64eu
++
+ /* One trim-id + FWINFO read with the current role assignment. */
+ static int
+ tch_probe_roles(const char *what, unsigned n)
+ {
+ 	uint8_t id[6] = { 0 };
++	uint8_t old[6] = { 0 };
+ 	uint8_t fw[16] = { 0 };
+ 
+ 	(void)tch_nvt_read(NVT_CHIP_VER_TRIM_ADDR, id, sizeof(id));
+ 	(void)tch_nvt_read(NVT_FWINFO_ADDR, fw, sizeof(fw));
+-	const bool ok = (id[3] == 0x65 && id[4] == 0x03) ||
+-	    (uint8_t)(fw[0] + fw[1]) == 0xff;
++	(void)tch_nvt_read(NVT_CHIP_INFO_PAGE, old, sizeof(old));
++	const bool id_ok = (id[3] == 0x65 && id[4] == 0x03) ||
++	    (old[3] == 0x65 && old[4] == 0x03) ||
++	    (id[0] != 0x00 && id[0] != 0xff) || (old[0] != 0x00 && old[0] != 0xff);
++	const bool ok = id_ok || (uint8_t)(fw[0] + fw[1]) == 0xff;
+ 
+ 	if (n != 0) {
+ 		printf("LIUQIN TOUCH: bitbang %u: cs gpio%u clk gpio%u mosi gpio%u miso gpio%u -> "
+-		    "%02x %02x %02x %02x %02x %02x | fw %02x %02x %02x %02x%s\n",
++		    "%02x %02x %02x %02x %02x %02x | page %02x %02x %02x %02x%s\n",
+ 		    n, tch.pin_cs, tch.pin_clk, tch.pin_mosi, tch.pin_miso,
+ 		    id[0], id[1], id[2], id[3], id[4], id[5],
+-		    fw[0], fw[1], fw[2], fw[3], ok ? "  <-- ANSWER" : "");
++		    old[0], old[1], old[2], old[3], ok ? "  <-- ANSWER" : "");
+ 	} else {
+ 		printf("LIUQIN TOUCH: %s: cs gpio%u clk gpio%u mosi gpio%u miso gpio%u -> "
+-		    "%02x %02x %02x %02x %02x %02x | fw %02x %02x %02x %02x%s\n",
++		    "%02x %02x %02x %02x %02x %02x | page %02x %02x %02x %02x%s\n",
+ 		    what, tch.pin_cs, tch.pin_clk, tch.pin_mosi, tch.pin_miso,
+ 		    id[0], id[1], id[2], id[3], id[4], id[5],
+-		    fw[0], fw[1], fw[2], fw[3], ok ? "  <-- ANSWER" : "");
++		    old[0], old[1], old[2], old[3], ok ? "  <-- ANSWER" : "");
+ 	}
+ 	return ok ? 0 : -1;
+ }
+@@ -1036,6 +1044,10 @@
+ 		for (unsigned p = 0; p < 6; p++) {
+ 			tch_roles(pads[cs], data[perm[p][0]], data[perm[p][1]], data[perm[p][2]]);
+ 			(*combos)++;
++			/* The vendor driver resets the part into its bootloader
++			 * before the first read; on the wrong pins that write goes
++			 * nowhere, so do it again for every assignment. */
++			tch_nvt_bringup();
+ 			if (tch_probe_roles("bitbang", *combos) == 0) {
+ 				return 0;
+ 			}

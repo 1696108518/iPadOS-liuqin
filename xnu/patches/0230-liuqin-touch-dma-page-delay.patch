@@ -1,0 +1,121 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -375,6 +375,18 @@
+  * is what upstream does today and the only ordering touch151 has not tried. */
+ static int tch_dma_order;
+ 
++/*
++ * touch159's wire capture settled the data-path question: at 4.7 kHz the same
++ * SE transfers put "ff 3f 62" on MOSI and the panel answers the real read with
++ * "20 00 00 32 65 03" - correct data, correct TX, correct RX.  At 600 kHz the
++ * same read returns garbage, so what is left is timing: how long the page
++ * write is given to settle before the read's chip select, and how long after
++ * a chip-select command the first clock may come.  The wire capture had a
++ * printf between the two transactions; the driver has almost nothing.
++ */
++static unsigned tch_page_dly;           /* us between page write and read */
++static unsigned tch_cs_dly;             /* us after CS assert before data */
++
+ static uint32_t
+ tch_rd(vm_offset_t base, uint32_t off)
+ {
+@@ -730,7 +742,13 @@
+ 	}
+ 	const uint32_t irq = tch_run_cmd(((assert ? SPI_CS_ASSERT : SPI_CS_DEASSERT) << M_OPCODE_SHFT),
+ 	    NULL, 0, NULL, 0, NULL, 20);
+-	return (irq & M_CMD_DONE_EN) ? 0 : -1;
++	if ((irq & M_CMD_DONE_EN) == 0) {
++		return -1;
++	}
++	if (assert && tch_cs_dly != 0) {
++		delay(tch_cs_dly);
++	}
++	return 0;
+ }
+ 
+ static int tch_xfer(const uint8_t *tx, uint8_t *rx, size_t len);
+@@ -1732,6 +1750,12 @@
+ 	if (err != 0) {
+ 		return -1;
+ 	}
++	/* touch159: the same read through the same engine answers with the real
++	 * trim id when the page write is given a long gap (the wire capture had
++	 * a printf in between) and with garbage when it is not. */
++	if (tch_page_dly != 0) {
++		delay(tch_page_dly);
++	}
+ 
+ 	if (tch_cs(true) != 0) {
+ 		return -1;
+@@ -2011,6 +2035,51 @@
+ 					tch_wire_capture(true, "txonly", page3, 3);
+ 					tch_wire_capture(false, "readcmd", cmd8, 8);
+ 				}
++				/* The wire says the data path is perfect at 4.7 kHz and
++				 * the panel answers the real read with the real trim id;
++				 * at 600 kHz the same read is garbage.  That leaves the
++				 * two gaps the driver keeps short and the capture keeps
++				 * long: page write -> read, and CS assert -> first clock.
++				 * Walk them and keep the first combination that answers
++				 * correctly, so the rest of the session uses it. */
++				{
++					static const unsigned dlys[4][2] = {
++						{ 0, 0 }, { 1000, 0 }, { 1000, 50 },
++						{ 5000, 50 }
++					};
++					bool kept = false;
++
++					tch.div = 32;
++					tch_wr(tch.se, GENI_SER_M_CLK_CFG,
++					    (32u << CLK_DIV_SHFT) | SER_CLK_EN);
++					tch_dma_order = 1;
++					for (unsigned i = 0; i < 4 && !kept; i++) {
++						uint8_t id[6] = { 0 };
++						int err;
++
++						tch_page_dly = dlys[i][0];
++						tch_cs_dly = dlys[i][1];
++						err = tch_nvt_read(NVT_CHIP_VER_TRIM_ADDR, id,
++						    sizeof(id));
++						printf("LIUQIN TOUCH: page delay %u us, cs delay "
++						    "%u us: %02x %02x %02x %02x %02x %02x (%s)\n",
++						    dlys[i][0], dlys[i][1], id[0], id[1], id[2],
++						    id[3], id[4], id[5],
++						    err != 0 ? "read failed" :
++						    (id[4] == 0x65 && id[5] == 0x03) ?
++						    "MATCH" : "no match");
++						if (err == 0 && id[4] == 0x65 && id[5] == 0x03) {
++							kept = true;
++							printf("LIUQIN TOUCH: keeping page delay "
++							    "%u us, cs delay %u us\n", dlys[i][0],
++							    dlys[i][1]);
++						}
++					}
++					if (!kept) {
++						tch_page_dly = 0;
++						tch_cs_dly = 0;
++					}
++				}
+ 				/* Before switching the mux, one raw look at what the
+ 				 * engine captures: the whole RX of an 8-byte read
+ 				 * (skip nothing) and of a 9-byte double-address read -
+@@ -2403,6 +2472,9 @@
+ 	}
+ 	if (err != 0) {
+ 		return -1;
++	}
++	if (tch_page_dly != 0) {
++		delay(tch_page_dly);
+ 	}
+ 	/*
+ 	 * The address phase is a write, and every Novatek write carries
+@@ -3265,6 +3337,9 @@
+ 	if (err != 0) {
+ 		return -1;
+ 	}
++	if (tch_page_dly != 0) {
++		delay(tch_page_dly);
++	}
+ 
+ 	if (tch_cs(true) != 0) {
+ 		return -1;

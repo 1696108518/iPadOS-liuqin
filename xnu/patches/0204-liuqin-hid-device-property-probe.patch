@@ -1,0 +1,62 @@
+--- a/iokit/Kernel/arm/hid/LiuqinHID.cpp
++++ b/iokit/Kernel/arm/hid/LiuqinHID.cpp
+@@ -482,6 +482,8 @@
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	virtual IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
+ 	    OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++	virtual OSObject *getProperty(const OSSymbol *aKey) const APPLE_KEXT_OVERRIDE;
++	virtual OSObject *getProperty(const char *aKey) const APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(IOHIDDevice, IOService)
+@@ -546,9 +548,25 @@
+ public:
+ 	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+ 	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientDied(void) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(LiuqinHIDDeviceUserClient, IOUserClient)
++
++IOReturn
++LiuqinHIDDeviceUserClient::clientClose(void)
++{
++	IOLog("LIUQIN HID: device client closed\n");
++	return kIOReturnSuccess;
++}
++
++IOReturn
++LiuqinHIDDeviceUserClient::clientDied(void)
++{
++	IOLog("LIUQIN HID: device client died\n");
++	return kIOReturnSuccess;
++}
+ 
+ IOReturn
+ LiuqinHIDDeviceUserClient::externalMethod(uint32_t selector,
+@@ -563,8 +581,24 @@
+ 	    (unsigned)args->scalarInputCount, (unsigned)args->structureInputSize,
+ 	    (unsigned)args->structureOutputSize, (unsigned)args->scalarOutputCount);
+ 	return kIOReturnUnsupported;
++}
++
++OSObject *
++IOHIDDevice::getProperty(const OSSymbol *aKey) const
++{
++	if (aKey) {
++		IOLog("LIUQIN HID: IOHIDDevice property get %s\n", aKey->getCStringNoCopy());
++	}
++	return super::getProperty(aKey);
+ }
+ 
++OSObject *
++IOHIDDevice::getProperty(const char *aKey) const
++{
++	IOLog("LIUQIN HID: IOHIDDevice property get %s\n", aKey ? aKey : "?");
++	return super::getProperty(aKey);
++}
++
+ IOReturn
+ IOHIDDevice::newUserClient(task_t owningTask, void *securityID, UInt32 type,
+     OSDictionary *properties, IOUserClient **handler)

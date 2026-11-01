@@ -1,0 +1,68 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -1474,8 +1474,8 @@
+ 	if (tch_dma_order == 0) {
+ 		tch_dma_arm(tx != NULL, rx != NULL, tx_pa, rx_pa, len);
+ 	}
+-	if (tch_dma_count < 8) {
+-		tch_dma_count++;
++	tch_dma_count++;
++	if (tch_dma_count <= 8) {
+ 		printf("LIUQIN TOUCH: DMA #%u %s len %u tx 0x%llx rx 0x%llx dma_mode "
+ 		    "0x%08x gsi 0x%08x seirq 0x%08x\n",
+ 		    tch_dma_count, cmd == SPI_TX_RX ? "tx+rx" : (tx != NULL ? "tx" : "rx"),
+@@ -1532,11 +1532,15 @@
+ 		if (irq & TCH_IRQ_ERRS) {
+ 			break;
+ 		}
+-		/* Complete when the DMA says so *or* when the byte counters say the
+-		 * engine moved everything: SE_IRQ_EN is 0 here, so the status bits
+-		 * are a bonus, not the only witness. */
+-		if ((tx == NULL || (txst & TX_DMA_DONE) || txin == (uint32_t)len) &&
+-		    (rx == NULL || (rxst & RX_DMA_DONE) || rxin == (uint32_t)len)) {
++		/* The command, not the DMA byte counter, is what completes a
++		 * transfer: SE_DMA_TX_LEN_IN reaches the programmed length as soon
++		 * as the engine has *fetched* the bytes, while the SPI still has to
++		 * shift them out (256 B at 600 kHz is 4.3 ms; LEN_IN said 256 after
++		 * 1.75 ms).  touch152 returned on LEN_IN, started the next command
++		 * while the previous one was still clocking - the panel saw half a
++		 * transaction (garbage IDs) and every second command died with
++		 * M_CMD_OVERRUN (irq 0x2).  M_CMD_DONE is the end of the shift. */
++		if (irq & M_CMD_DONE_EN) {
+ 			break;
+ 		}
+ 		delay(50);
+@@ -1549,9 +1553,9 @@
+ 	tch.dma_tx_status = txst;
+ 	tch.dma_rx_status = rxst;
+ 	tch.last_irq = irq;
+-	ok = (tx == NULL || (txst & TX_DMA_DONE) || txin == (uint32_t)len) &&
+-	    (rx == NULL || (rxst & RX_DMA_DONE) || rxin == (uint32_t)len) &&
+-	    (irq & TCH_IRQ_ERRS) == 0;
++	ok = (irq & M_CMD_DONE_EN) != 0 && (irq & TCH_IRQ_ERRS) == 0 &&
++	    (tx == NULL || (txst & TX_DMA_DONE) != 0) &&
++	    (rx == NULL || (rxst & RX_DMA_DONE) != 0);
+ 	if (tx != NULL && txst != 0) {
+ 		tch_wr(tch.se, SE_DMA_TX_IRQ_CLR, txst);
+ 	}
+@@ -1594,11 +1598,15 @@
+ 			    tch_rd(tch.se, SE_DMA_RX_IRQ_EN));
+ 			printf("LIUQIN TOUCH: DMA #%u at 1 ms: debug 0x%08x len_in tx %u "
+ 			    "rx %u\n", tch_dma_count, dbg_mid, txin_mid, rxin_mid);
+-			if (dbg_mid == 0 && txin_mid == 0 && rxin_mid == 0) {
+-				printf("LIUQIN TOUCH: DMA #%u never started: gsi 0x%08x "
+-				    "dma_mode 0x%08x - the sequencer is not taking SE DMA\n",
+-				    tch_dma_count, tch_rd(tch.se, SE_GSI_EVENT_EN),
+-				    tch_rd(tch.se, SE_GENI_DMA_MODE_EN));
++			if ((irq & M_CMD_DONE_EN) == 0) {
++				printf("LIUQIN TOUCH: DMA #%u no M_CMD_DONE: status 0x%08x "
++				    "irq 0x%08x tx 0x%08x rx 0x%08x gsi 0x%08x\n", tch_dma_count,
++				    tch_rd(tch.se, SE_GENI_STATUS), irq, txst, rxst,
++				    tch_rd(tch.se, SE_GSI_EVENT_EN));
++			} else if ((tx != NULL && (txst & TX_DMA_DONE) == 0) ||
++			    (rx != NULL && (rxst & RX_DMA_DONE) == 0)) {
++				printf("LIUQIN TOUCH: DMA #%u command done, DMA status short: "
++				    "tx 0x%08x rx 0x%08x\n", tch_dma_count, txst, rxst);
+ 			}
+ 			printf("LIUQIN TOUCH: DMA #%u staging: tx %02x %02x %02x %02x "
+ 			    "rx %02x %02x %02x %02x\n", tch_dma_count,

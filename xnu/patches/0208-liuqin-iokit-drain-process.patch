@@ -1,0 +1,17 @@
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -1039,8 +1039,13 @@
+ #if defined(ARM64_BOARD_CONFIG_LIUQIN)
+ 	{
+ 		IOService *svc = OSDynamicCast(IOService, result);
++		proc_t proc = (proc_t)get_bsdtask_info(current_task());
++		char pname[64] = "?";
+ 
+-		IOLog("LIUQIN IOK: notification drain -> %s%s (armed %d)\n",
++		if (proc) {
++			proc_name(proc_pid(proc), pname, sizeof(pname));
++		}
++		IOLog("LIUQIN IOK: notification drain by %s -> %s%s (armed %d)\n", pname,
+ 		    result ? result->getMetaClass()->getClassName() : "empty",
+ 		    svc ? svc->getName() : "", armed ? 1 : 0);
+ 	}

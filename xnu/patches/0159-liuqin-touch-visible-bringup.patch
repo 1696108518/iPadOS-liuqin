@@ -1,0 +1,48 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -50,8 +50,10 @@
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+-/* bsd/dev/liuqin_ufs.c: the only lines the muted console still draws. */
++/* bsd/dev/liuqin_ufs.c: boot marks, and the flag that lets a muted console
++ * draw a line anyway (osfmk/console/serial_console.c). */
+ extern void liuqin_boot_mark(const char *what);
++extern int liuqin_console_force;
+ /* iokit/Kernel/arm/hid/LiuqinHID.cpp: a no-op when the HID service is absent. */
+ extern void liuqin_hid_touch(int finger, int down, int x, int y);
+ 
+@@ -908,6 +910,7 @@
+ 	    "fifo %u byte/word, trans_cfg 0x%08x slave_en 0x%08x\n",
+ 	    tch.spi_hz / 1000, tch.div, tch.bytes_per_fifo_word,
+ 	    tch_rd(tch.se, SE_SPI_TRANS_CFG), tch_rd(tch.se, SE_SPI_SLAVE_EN));
++	liuqin_boot_mark("touch spi cfg");
+ 	tch.fifo_capable = (tch_rd(tch.se, GENI_IF_DISABLE_RO) & FIFO_IF_DISABLE) == 0;
+ 	if (!tch.fifo_capable && tch_dma_alloc() != 0) {
+ 		printf("LIUQIN TOUCH: FIFO interface is disabled (if_disable 0x%08x) "
+@@ -919,6 +922,7 @@
+ 	    tch_rd(tch.se, GENI_IF_DISABLE_RO),
+ 	    tch.fifo_capable ? "the FIFOs" : "SE DMA");
+ 	tch_dump_state("after init");
++	liuqin_boot_mark("touch bus probe");
+ 	if (tch_se_start() != 0) {
+ 		return -1;
+ 	}
+@@ -1147,11 +1151,17 @@
+ 	(void)tsleep(&liuqin_touch_chan, PZERO, "liuqintspi", hz * delay_s);
+ 
+ 	liuqin_boot_mark("touch spi start");
++	/* Draw the bring-up lines as well: with liuqinmute=1 they would only
++	 * reach the persistent log, and a wedge here freezes the log thread
++	 * before it flushes.  The last line on screen then names the step. */
++	liuqin_console_force = 1;
+ 	if (liuqin_touch_spi_setup() != 0) {
++		liuqin_console_force = 0;
+ 		liuqin_boot_mark("touch spi failed");
+ 		return;
+ 	}
+ 	tch_novatek_info();
++	liuqin_console_force = 0;
+ 	liuqin_boot_mark("touch id read");
+ 	liuqin_touch_reports_start();
+ 	liuqin_boot_mark("touch reports up");

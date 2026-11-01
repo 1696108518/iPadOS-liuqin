@@ -1,0 +1,130 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -300,6 +300,8 @@
+ 	bool        cs_high;            /* chip select is active high */
+ 	bool        page8;              /* page bytes as addr>>16 / addr>>8 */
+ 	uint32_t    dummy;              /* dummy bytes before the data (1) */
++	int         bb_cpol;            /* clock idle level */
++	int         bb_cpha;            /* sample on the trailing edge */
+ 	uint32_t    pin_clk, pin_mosi, pin_miso, pin_cs;
+ 	uint32_t    pin_reset;          /* gpio20, active low */
+ 	uint32_t    bb_pace_us;         /* half clock period, default 5 us */
+@@ -555,18 +557,30 @@
+ static void
+ tch_bb_xfer(const uint8_t *tx, uint8_t *rx, size_t len)
+ {
++	const int idle = tch.bb_cpol;           /* clock level between bits */
++	const int cpha = tch.bb_cpha;
++
+ 	for (size_t i = 0; i < len; i++) {
+ 		const uint8_t out = tx != NULL ? tx[i] : 0xff;
+ 		uint8_t in = 0;
+ 
+ 		for (int b = 7; b >= 0; b--) {
+-			bb_set(tch.pin_mosi, (out >> b) & 1);
+-			bb_pace();
+-			bb_set(tch.pin_clk, 1);
++			if (!cpha) {
++				bb_set(tch.pin_mosi, (out >> b) & 1);
++				bb_pace();
++			}
++			bb_set(tch.pin_clk, !idle);     /* leading edge */
+ 			bb_pace();
+-			in = (uint8_t)((in << 1) | (bb_get(tch.pin_miso) ? 1 : 0));
+-			bb_set(tch.pin_clk, 0);
++			if (!cpha) {
++				in = (uint8_t)((in << 1) | (bb_get(tch.pin_miso) ? 1 : 0));
++			} else {
++				bb_set(tch.pin_mosi, (out >> b) & 1);
++			}
++			bb_set(tch.pin_clk, idle);      /* trailing edge */
+ 			bb_pace();
++			if (cpha) {
++				in = (uint8_t)((in << 1) | (bb_get(tch.pin_miso) ? 1 : 0));
++			}
+ 		}
+ 		if (rx != NULL) {
+ 			rx[i] = in;
+@@ -993,8 +1007,7 @@
+ 	(void)tch_nvt_read(NVT_FWINFO_ADDR, fw, sizeof(fw));
+ 	(void)tch_nvt_read(NVT_CHIP_INFO_PAGE, old, sizeof(old));
+ 	const bool id_ok = (id[3] == 0x65 && id[4] == 0x03) ||
+-	    (old[3] == 0x65 && old[4] == 0x03) ||
+-	    (id[0] != 0x00 && id[0] != 0xff) || (old[0] != 0x00 && old[0] != 0xff);
++	    (old[3] == 0x65 && old[4] == 0x03);
+ 	const bool ok = id_ok || (uint8_t)(fw[0] + fw[1]) == 0xff;
+ 
+ 	if (n != 0) {
+@@ -1070,11 +1083,14 @@
+ tch_read_id_line(const char *what)
+ {
+ 	uint8_t id[6] = { 0 };
++	uint8_t fw[16] = { 0 };
+ 
+ 	(void)tch_nvt_read(NVT_CHIP_VER_TRIM_ADDR, id, sizeof(id));
+-	printf("LIUQIN TOUCH: %s: %02x %02x %02x %02x %02x %02x%s\n",
+-	    what, id[0], id[1], id[2], id[3], id[4], id[5],
+-	    (id[3] == 0x65 && id[4] == 0x03) ? "  <-- ANSWER" : "");
++	(void)tch_nvt_read(NVT_FWINFO_ADDR, fw, sizeof(fw));
++	printf("LIUQIN TOUCH: %s: %02x %02x %02x %02x %02x %02x | fw %02x %02x%s\n",
++	    what, id[0], id[1], id[2], id[3], id[4], id[5], fw[0], fw[1],
++	    ((id[3] == 0x65 && id[4] == 0x03) || (uint8_t)(fw[0] + fw[1]) == 0xff) ?
++	    "  <-- ANSWER" : "");
+ }
+ 
+ /* On the discovered pins the controller answers, but the bytes are not stable
+@@ -1088,15 +1104,34 @@
+ 	tch.page8 = false;
+ 	tch.dummy = 1;
+ 	tch.bb_pace_us = 5;
++	tch.bb_cpol = 0;
++	tch.bb_cpha = 0;
+ 	tch_bb_dir(16, false, 0);                       /* MISO, no bias */
+ 
+-	tch_nvt_bringup();
+-	tch_read_id_line("baseline: 5 us half period, one dummy byte");
++	/*
++	 * SPI mode is the one knob never varied, and a wrong sampling edge
++	 * produces exactly what we have seen: plausible but boot-dependent
++	 * bytes.  Walk all four modes at two clock rates.
++	 */
++	for (unsigned slow = 0; slow < 2; slow++) {
++		const unsigned pace = slow ? 25 : 5;
+ 
+-	tch.bb_pace_us = 25;
+-	tch_nvt_bringup();
+-	tch_read_id_line("slow: 25 us half period");
++		tch.bb_pace_us = pace;
++		for (unsigned mode = 0; mode < 4; mode++) {
++			char label[64];
++
++			tch.bb_cpol = (mode >> 1) & 1;  /* the usual mode numbering */
++			tch.bb_cpha = mode & 1;
++			bb_set(tch.pin_clk, tch.bb_cpol);
++			tch_nvt_bringup();
++			snprintf(label, sizeof(label), "mode %u at %u us", mode, pace);
++			tch_read_id_line(label);
++		}
++	}
+ 	tch.bb_pace_us = 5;
++	tch.bb_cpol = 0;
++	tch.bb_cpha = 0;
++	bb_set(tch.pin_clk, 0);
+ 
+ 	/* A line the controller drives ignores a pull-up; a floating one reads 1 */
+ 	tch_wr(tch.tlmm, TLMM_CTL(16), (0u << 2) | (3u << 0) | (2u << 6));
+@@ -1104,14 +1139,6 @@
+ 	tch_nvt_bringup();
+ 	tch_read_id_line("MISO with pull-up");
+ 	tch_bb_dir(16, false, 0);
+-
+-	tch.dummy = 0;
+-	tch_nvt_bringup();
+-	tch_read_id_line("no dummy byte");
+-	tch.dummy = 2;
+-	tch_nvt_bringup();
+-	tch_read_id_line("two dummy bytes");
+-	tch.dummy = 1;
+ }
+ 
+ static int

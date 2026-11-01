@@ -1,0 +1,357 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -42,10 +42,14 @@
+ #include <libkern/libkern.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* iokit/Kernel/arm/hid/LiuqinHID.cpp: a no-op when the HID service is absent. */
+ extern void liuqin_hid_touch(int finger, int down, int x, int y);
+ 
+@@ -126,8 +130,37 @@
+ #define SE_GENI_TX_WATERMARK_REG 0x80c
+ #define SE_GENI_RX_WATERMARK_REG 0x810
+ #define SE_GENI_RX_RFR_WATERMARK_REG 0x814
++#define SE_DMA_TX_PTR_L         0xc30
++#define SE_DMA_TX_PTR_H         0xc34
++#define SE_DMA_TX_ATTR          0xc38
++#define SE_DMA_TX_LEN           0xc3c
++#define SE_DMA_TX_IRQ_STAT      0xc40
+ #define SE_DMA_TX_IRQ_CLR       0xc44
++#define SE_DMA_TX_IRQ_EN_SET    0xc4c
++#define SE_DMA_TX_FSM_RST       0xc58
++#define SE_DMA_RX_PTR_L         0xd30
++#define SE_DMA_RX_PTR_H         0xd34
++#define SE_DMA_RX_ATTR          0xd38
++#define SE_DMA_RX_LEN           0xd3c
++#define SE_DMA_RX_IRQ_STAT      0xd40
+ #define SE_DMA_RX_IRQ_CLR       0xd44
++#define SE_DMA_RX_IRQ_EN_SET    0xd4c
++#define SE_DMA_RX_FSM_RST       0xd58
++
++/* SE_DMA_*_IRQ_STAT fields and the enable bits of geni_se_tx/rx_init_dma(). */
++#define TX_DMA_DONE             (1u << 0)
++#define TX_EOT                  (1u << 1)
++#define TX_SBE                  (1u << 2)
++#define TX_RESET_DONE           (1u << 3)
++#define RX_DMA_DONE             (1u << 0)
++#define RX_EOT                  (1u << 1)
++#define RX_SBE                  (1u << 2)
++#define RX_RESET_DONE           (1u << 3)
++#define GENI_SE_DMA_DONE_EN     (1u << 0)
++#define GENI_SE_DMA_EOT_EN      (1u << 1)
++#define GENI_SE_DMA_AHB_ERR_EN  (1u << 2)
++#define GENI_SE_DMA_EOT_BUF     (1u << 0)
++#define DMA_IRQ_EN              (GENI_SE_DMA_DONE_EN | GENI_SE_DMA_EOT_EN | GENI_SE_DMA_AHB_ERR_EN)
+ #define SE_GSI_EVENT_EN         0xe18
+ #define SE_IRQ_EN               0xe1c
+ #define SE_HW_PARAM_0           0xe24
+@@ -172,6 +205,11 @@
+ #define SPI_CS_DEASSERT         9u
+ #define FRAGMENTATION           (1u << 2)
+ 
++/* Command errors that make a transfer fail. */
++#define TCH_IRQ_ERRS (M_CMD_OVERRUN_EN | M_ILLEGAL_CMD_EN | M_CMD_FAILURE_EN | \
++    M_CMD_CANCEL_EN | M_CMD_ABORT_EN | M_RX_FIFO_RD_ERR_EN | M_RX_FIFO_WR_ERR_EN | \
++    M_TX_FIFO_RD_ERR_EN | M_TX_FIFO_WR_ERR_EN)
++
+ /* GENI_M_IRQ_* fields. */
+ #define M_CMD_DONE_EN           (1u << 0)
+ #define M_CMD_OVERRUN_EN        (1u << 1)
+@@ -229,6 +267,12 @@
+ #define SE_GENI_M_GP_LENGTH     0x910
+ #define M_GENI_CMD_ACTIVE       (1u << 0)
+ 
++/* One page of physically contiguous memory stages every SE-DMA transfer;
++ * TX and RX live 256 bytes apart so a cache-line flush never overlaps. */
++#define TCH_DMA_TX_OFF          0x000
++#define TCH_DMA_RX_OFF          0x100
++#define TCH_DMA_MAX             128
++
+ /* Novatek NT36xxx SPI protocol (vendor nt36xxx driver, SPI variant). */
+ #define NVT_CHIP_VER_TRIM_ADDR  0x3f004u
+ #define NVT_EVENT_BUF_ADDR      0x2fe00u
+@@ -247,6 +291,11 @@
+ 	uint32_t    bytes_per_fifo_word;
+ 	uint32_t    div;                /* SE clock divider */
+ 	uint32_t    spi_hz;
++	bool        fifo_capable;      /* GENI_IF_DISABLE_RO says FIFO works */
++	vm_offset_t dma;                /* staging page for SE DMA */
++	uint64_t    dma_pa;
++	uint32_t    dma_tx_status;      /* last SE_DMA_TX/RX_IRQ_STAT */
++	uint32_t    dma_rx_status;
+ 	uint32_t    last_irq;           /* M_IRQ_STATUS of the last command */
+ 	uint32_t    first_irq;          /* first M_IRQ_STATUS read of it */
+ 	uint32_t    status_after_cmd;   /* GENI_STATUS right after M_CMD0 */
+@@ -414,10 +463,10 @@
+ 	return irq;
+ }
+ 
+-/* One SPI transfer with chip select held: mode 0, 8-bit words, both
+- * directions when rx is given (the FIFO duplex opcode is TX|RX). */
++/* One SPI transfer through the FIFOs: mode 0, 8-bit words, both directions
++ * when rx is given.  Only used when GENI_IF_DISABLE_RO says the FIFO exists. */
+ static int
+-tch_xfer(const uint8_t *tx, uint8_t *rx, size_t len)
++tch_fifo_xfer(const uint8_t *tx, uint8_t *rx, size_t len)
+ {
+ 	uint32_t cmd = 0;
+ 	size_t got = 0;
+@@ -456,6 +505,8 @@
+ 	return (irq & M_CMD_DONE_EN) ? 0 : -1;
+ }
+ 
++static int tch_xfer(const uint8_t *tx, uint8_t *rx, size_t len);
++
+ /* What the bootloader left in the engine, and what it looks like after every
+  * step: the first touch4 boot could only tell us "irq 0x2", which is not
+  * enough to pick a fix. */
+@@ -492,41 +543,42 @@
+ 	return (irq & M_CMD_DONE_EN) ? 0 : -1;
+ }
+ 
+-/* A one-byte TX_ONLY with CS deasserted: proves whether the SE runs commands
+- * at all without touching the chip. */
++/* One duplex byte through the real data path with CS deasserted: proves that
++ * the engine moves data at all without touching the chip. */
+ static int
+ tch_tx_probe(const char *after)
+ {
+ 	uint8_t byte = 0xff;
+-
+-	tch_fifo_mode();
+-	tch_wr(tch.se, SE_SPI_TX_TRANS_LEN, 1);
+-	const uint32_t irq = tch_run_cmd((SPI_TX_ONLY << M_OPCODE_SHFT) | FRAGMENTATION,
+-	    &byte, 1, NULL, 0, NULL, 20);
++	uint8_t echo = 0x00;
++	const int err = tch_xfer(&byte, &echo, 1);
+ 
+-	printf("LIUQIN TOUCH: TX probe %s: after-cmd 0x%08x first-irq 0x%08x irq 0x%08x\n",
+-	    after, tch.status_after_cmd, tch.first_irq, irq);
+-	return (irq & M_CMD_DONE_EN) ? 0 : -1;
++	printf("LIUQIN TOUCH: TX probe %s: %s irq 0x%08x dma tx 0x%08x rx 0x%08x\n",
++	    after, err == 0 ? "ok" : "failed", tch.last_irq,
++	    tch.dma_tx_status, tch.dma_rx_status);
++	return err;
+ }
+ 
+-/* Is the bus usable, and does it need help with chip select?  Tries the
+- * CS_ASSERT/CS_DEASSERT pair first and falls back to a bare transfer, which is
+- * all Qualcomm's own GENI SPI driver uses: if the engine accepts transfers but
+- * not the CS commands, it drives CS per transfer by itself. */
++/* Is the bus usable, and does it need help with chip select?  The data path
++ * has to work; the CS commands are optional, because Qualcomm's own GENI SPI
++ * driver never sends them and lets the engine drive CS per transfer. */
+ static int
+ tch_probe_bus(const char *how)
+ {
+-	if (tch_cs_probe(how) == 0) {
++	const bool cs_ok = tch_cs_probe(how) == 0;
++
++	if (cs_ok) {
+ 		tch.cs_manual = true;
+ 		(void)tch_cs(false);
+-		return 0;
+-	}
+-	if (tch_tx_probe(how) == 0) {
++	} else {
+ 		tch.cs_manual = false;
++	}
++	if (tch_tx_probe(how) != 0) {
++		return -1;
++	}
++	if (!cs_ok) {
+ 		printf("LIUQIN TOUCH: transfers work, CS commands do not: CS per transfer\n");
+-		return 0;
+ 	}
+-	return -1;
++	return 0;
+ }
+ 
+ /* The first touch4 boot answered "no" to every command with M_CMD_OVERRUN,
+@@ -566,6 +618,148 @@
+ 	return -1;
+ }
+ 
++/* One page of staging memory for the SE DMA, physically contiguous because the
++ * engine is handed a physical address and is not cache coherent. */
++static int
++tch_dma_alloc(void)
++{
++	if (tch.dma != 0) {
++		return 0;
++	}
++	if (kmem_alloc_contig(kernel_map, &tch.dma, PAGE_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("LIUQIN TOUCH: no contiguous DMA memory\n");
++		tch.dma = 0;
++		return -1;
++	}
++	const ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)tch.dma);
++
++	if (pn == 0) {
++		printf("LIUQIN TOUCH: DMA page has no physical address\n");
++		return -1;
++	}
++	tch.dma_pa = ptoa_64(pn);
++	printf("LIUQIN TOUCH: DMA staging page at 0x%llx (phys 0x%llx)\n",
++	    (uint64_t)tch.dma, tch.dma_pa);
++	return 0;
++}
++
++/* geni_se_select_mode(GENI_SE_DMA): the SE moves the data itself. */
++static void
++tch_dma_mode(void)
++{
++	tch_irq_clear();
++	tch_wr(tch.se, SE_GENI_DMA_MODE_EN,
++	    tch_rd(tch.se, SE_GENI_DMA_MODE_EN) | GENI_DMA_MODE_EN);
++}
++
++static void
++tch_dma_abort(void)
++{
++	tch_wr(tch.se, SE_GENI_M_CMD_CTRL_REG, M_GENI_CMD_ABORT);
++	for (unsigned i = 0; i < 200; i++) {
++		if (tch_status() & M_CMD_ABORT_EN) {
++			break;
++		}
++		delay(50);
++	}
++	tch_wr(tch.se, SE_GENI_M_IRQ_CLEAR, 0xffffffff);
++}
++
++/* One SPI transfer through the serial engine's own DMA engine: what an SE with
++ * FIFO_IF_DISABLE set needs (geni_se_tx/rx_init_dma, then poll the DMA status,
++ * exactly as geni_se_tx/rx_init_dma() and the U-Boot GENI SPI driver do). */
++static int
++tch_dma_xfer(const uint8_t *tx, uint8_t *rx, size_t len)
++{
++	const uint64_t tx_pa = tch.dma_pa + TCH_DMA_TX_OFF;
++	const uint64_t rx_pa = tch.dma_pa + TCH_DMA_RX_OFF;
++	const uint32_t cmd = (tx != NULL && rx != NULL) ? SPI_TX_RX :
++	    (tx != NULL ? SPI_TX_ONLY : SPI_RX_ONLY);
++	uint32_t txst = 0, rxst = 0, irq = 0;
++	bool ok;
++
++	if (tch.dma == 0 || len == 0 || len > TCH_DMA_MAX) {
++		return -1;
++	}
++	if (tx != NULL) {
++		memcpy((void *)(tch.dma + TCH_DMA_TX_OFF), tx, len);
++		flush_dcache64((addr64_t)tx_pa, (unsigned)len, TRUE);
++	}
++	if (rx != NULL) {
++		/* Nothing dirty may survive into the buffer the engine is about
++		 * to overwrite, and nothing stale may survive the transfer. */
++		memset((void *)(tch.dma + TCH_DMA_RX_OFF), 0, len);
++		flush_dcache64((addr64_t)rx_pa, (unsigned)len, TRUE);
++	}
++	tch_wr(tch.se, SE_SPI_TX_TRANS_LEN, tx != NULL ? (uint32_t)len : 0);
++	tch_wr(tch.se, SE_SPI_RX_TRANS_LEN, rx != NULL ? (uint32_t)len : 0);
++	tch_dma_mode();
++	tch_wr(tch.se, SE_GENI_M_CMD0, (cmd << M_OPCODE_SHFT) | FRAGMENTATION);
++	if (rx != NULL) {
++		tch_wr(tch.se, SE_DMA_RX_IRQ_EN_SET, DMA_IRQ_EN);
++		tch_wr(tch.se, SE_DMA_RX_PTR_L, (uint32_t)rx_pa);
++		tch_wr(tch.se, SE_DMA_RX_PTR_H, (uint32_t)(rx_pa >> 32));
++		tch_wr(tch.se, SE_DMA_RX_ATTR, 0);
++		tch_wr(tch.se, SE_DMA_RX_LEN, (uint32_t)len);
++	}
++	if (tx != NULL) {
++		tch_wr(tch.se, SE_DMA_TX_IRQ_EN_SET, DMA_IRQ_EN);
++		tch_wr(tch.se, SE_DMA_TX_PTR_L, (uint32_t)tx_pa);
++		tch_wr(tch.se, SE_DMA_TX_PTR_H, (uint32_t)(tx_pa >> 32));
++		tch_wr(tch.se, SE_DMA_TX_ATTR, GENI_SE_DMA_EOT_BUF);
++		tch_wr(tch.se, SE_DMA_TX_LEN, (uint32_t)len);
++	}
++	for (unsigned i = 0; i < 50 * 20; i++) {
++		txst = tx != NULL ? tch_rd(tch.se, SE_DMA_TX_IRQ_STAT) : 0;
++		rxst = rx != NULL ? tch_rd(tch.se, SE_DMA_RX_IRQ_STAT) : 0;
++		irq = tch_status();
++		if (irq & TCH_IRQ_ERRS) {
++			break;
++		}
++		if ((tx == NULL || (txst & TX_DMA_DONE)) &&
++		    (rx == NULL || (rxst & RX_DMA_DONE))) {
++			break;
++		}
++		delay(50);
++	}
++	tch.dma_tx_status = txst;
++	tch.dma_rx_status = rxst;
++	tch.last_irq = irq;
++	ok = (tx == NULL || (txst & TX_DMA_DONE)) &&
++	    (rx == NULL || (rxst & RX_DMA_DONE)) && (irq & TCH_IRQ_ERRS) == 0;
++	if (tx != NULL && txst != 0) {
++		tch_wr(tch.se, SE_DMA_TX_IRQ_CLR, txst);
++	}
++	if (rx != NULL && rxst != 0) {
++		tch_wr(tch.se, SE_DMA_RX_IRQ_CLR, rxst);
++	}
++	if (irq != 0) {
++		tch_wr(tch.se, SE_GENI_M_IRQ_CLEAR, irq);
++	}
++	if (!ok) {
++		if (tx != NULL) {
++			tch_wr(tch.se, SE_DMA_TX_FSM_RST, 1);
++		}
++		if (rx != NULL) {
++			tch_wr(tch.se, SE_DMA_RX_FSM_RST, 1);
++		}
++		tch_dma_abort();
++		return -1;
++	}
++	if (rx != NULL) {
++		flush_dcache64((addr64_t)rx_pa, (unsigned)len, TRUE);
++		memcpy(rx, (void *)(tch.dma + TCH_DMA_RX_OFF), len);
++	}
++	return 0;
++}
++
++static int
++tch_xfer(const uint8_t *tx, uint8_t *rx, size_t len)
++{
++	return tch.fifo_capable ? tch_fifo_xfer(tx, rx, len) : tch_dma_xfer(tx, rx, len);
++}
++
+ /* Novatek page/address framing: three bytes set the page, then the address
+  * with bit 7 clear selects a read, the part returns one dummy byte and then
+  * the data.  Mirrors nvt_spi_read() in the vendor driver (and the
+@@ -703,10 +897,16 @@
+ 	    "fifo %u byte/word, trans_cfg 0x%08x slave_en 0x%08x\n",
+ 	    tch.spi_hz / 1000, tch.div, tch.bytes_per_fifo_word,
+ 	    tch_rd(tch.se, SE_SPI_TRANS_CFG), tch_rd(tch.se, SE_SPI_SLAVE_EN));
+-	if (tch_rd(tch.se, GENI_IF_DISABLE_RO) & FIFO_IF_DISABLE) {
+-		printf("LIUQIN TOUCH: FIFO interface is disabled (if_disable 0x%08x): "
+-		    "this engine only does GPI DMA\n", tch_rd(tch.se, GENI_IF_DISABLE_RO));
++	tch.fifo_capable = (tch_rd(tch.se, GENI_IF_DISABLE_RO) & FIFO_IF_DISABLE) == 0;
++	if (!tch.fifo_capable && tch_dma_alloc() != 0) {
++		printf("LIUQIN TOUCH: FIFO interface is disabled (if_disable 0x%08x) "
++		    "and there is no DMA memory\n", tch_rd(tch.se, GENI_IF_DISABLE_RO));
++		return -1;
+ 	}
++	printf("LIUQIN TOUCH: FIFO interface %s (if_disable 0x%08x), transfers over %s\n",
++	    tch.fifo_capable ? "present" : "disabled",
++	    tch_rd(tch.se, GENI_IF_DISABLE_RO),
++	    tch.fifo_capable ? "the FIFOs" : "SE DMA");
+ 	tch_dump_state("after init");
+ 	if (tch_se_start() != 0) {
+ 		return -1;
+@@ -889,7 +1089,8 @@
+ 		const bool health = !go;
+ 		if (tch_nvt_read(NVT_EVENT_BUF_ADDR, frame, sizeof(frame)) != 0) {
+ 			if (errors++ < 4) {
+-				printf("LIUQIN TOUCH: event read failed (irq 0x%08x)\n", tch.last_irq);
++				printf("LIUQIN TOUCH: event read failed (irq 0x%08x dma tx 0x%08x rx 0x%08x)\n",
++				    tch.last_irq, tch.dma_tx_status, tch.dma_rx_status);
+ 			}
+ 		} else if (tch_frame_valid(frame)) {
+ 			if (memcmp(frame, last, sizeof(frame)) != 0) {

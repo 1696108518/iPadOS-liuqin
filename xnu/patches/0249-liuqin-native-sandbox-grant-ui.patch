@@ -1,0 +1,11 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -545,7 +545,7 @@
+                     accelerator->setProperty("MetalPluginName","NativeAdrenoMetal");
+                     accelerator->setProperty("MetalPluginClassName","NativeAdrenoMetalDevice");
+                     accelerator->setProperty("NativeSandboxGrantProcess",
+-                        "backboardd,iconservicesagent,WidgetRenderer_Default,PosterBoard");
++                        "backboardd,iconservicesagent,WidgetRenderer_Default,PosterBoard,SpringBoard,Setup,chronod");
+                     if(accelerator->attach(IOService::getPlatform())) {
+                         accelerator->registerService();
+                         IOLog("NativeAdreno: accelerator published (IOAcceleratorES)\n");

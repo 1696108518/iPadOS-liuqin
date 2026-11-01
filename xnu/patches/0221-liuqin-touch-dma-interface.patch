@@ -1,0 +1,331 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -144,7 +144,9 @@
+ #define SE_DMA_TX_LEN           0xc3c
+ #define SE_DMA_TX_IRQ_STAT      0xc40
+ #define SE_DMA_TX_IRQ_CLR       0xc44
++#define SE_DMA_TX_IRQ_EN        0xc48
+ #define SE_DMA_TX_IRQ_EN_SET    0xc4c
++#define SE_DMA_TX_LEN_IN        0xc54
+ #define SE_DMA_TX_FSM_RST       0xc58
+ #define SE_DMA_RX_PTR_L         0xd30
+ #define SE_DMA_RX_PTR_H         0xd34
+@@ -152,8 +154,31 @@
+ #define SE_DMA_RX_LEN           0xd3c
+ #define SE_DMA_RX_IRQ_STAT      0xd40
+ #define SE_DMA_RX_IRQ_CLR       0xd44
++#define SE_DMA_RX_IRQ_EN        0xd48
+ #define SE_DMA_RX_IRQ_EN_SET    0xd4c
++#define SE_DMA_RX_LEN_IN        0xd54
+ #define SE_DMA_RX_FSM_RST       0xd58
++#define SE_DMA_DEBUG_REG0       0xe40
++#define DMA_TX_ACTIVE           (1u << 0)
++#define DMA_RX_ACTIVE           (1u << 1)
++
++/*
++ * The QUPv3 serial engine control block.  These registers sit past the GENI
++ * window (0x0000..0x0fff) and past the firmware RAM (0x1000..0x1fff), and no
++ * run so far has ever read them.  geni_load_se_fw() programs exactly this
++ * block when it sets an engine's transfer mode: the DMA *interface* enable
++ * decides whether the engine may touch memory at all, and SE_FIFO_IF_DISABLE
++ * is the writable twin of the read-only GENI_IF_DISABLE_RO@0x64 (which reads
++ * 1 here).  An engine whose FIFO interface is disabled and whose DMA
++ * interface was never enabled takes a data command, holds it
++ * (GENI_STATUS.M_GENI_CMD_ACTIVE), moves nothing and raises no interrupt -
++ * which is what touch150 logged.
++ */
++#define SE_GENI_CLK_CTRL        0x2000
++#define SE_DMA_IF_EN            0x2004
++#define SE_FIFO_IF_DISABLE      0x2008
++#define DMA_IF_EN               (1u << 0)
++#define DMA_IF_EN_RO            0xe20
+ 
+ /* SE_DMA_*_IRQ_STAT fields and the enable bits of geni_se_tx/rx_init_dma(). */
+ #define TX_DMA_DONE             (1u << 0)
+@@ -326,6 +351,7 @@
+ 	bool        use_dma;            /* transfers go through the SE's DMA */
+ 	vm_offset_t smmu;               /* apps_smmu global space 0 window */
+ 	int         smmu_smr;           /* SMR entry matching the SE, or -1 */
++	vm_offset_t smmu_cb;            /* the bypass context bank, 0 if none */
+ 	uint32_t    dma_tx_status;      /* last SE_DMA_TX/RX_IRQ_STAT */
+ 	uint32_t    dma_rx_status;
+ 	uint32_t    last_irq;           /* M_IRQ_STATUS of the last command */
+@@ -344,6 +370,10 @@
+ };
+ static void *liuqin_touch_chan;
+ static unsigned tch_dma_count;
++/* 0: descriptor registers first, then M_CMD0 (what every Linux release before
++ * the 2024 rework did).  1: M_CMD0 first, then the descriptor registers, which
++ * is what upstream does today and the only ordering touch151 has not tried. */
++static int tch_dma_order;
+ 
+ static uint32_t
+ tch_rd(vm_offset_t base, uint32_t off)
+@@ -803,25 +833,38 @@
+ /* The first touch4 boot answered "no" to every command with M_CMD_OVERRUN,
+  * which means the master sequencer is either still busy with something the
+  * bootloader left behind or disabled.  Walk the ways out of that state,
+- * logging each one, and stop at the first that works. */
++ * logging each one, and stop at the first that works.
++ *
++ * The first step is not a register poke: it is the other legal ordering of a
++ * DMA command (M_CMD0 first, descriptor registers behind it, which is what
++ * upstream spi-geni-qcom does today) and it goes first because every failed
++ * transfer leaves the sequencer wedged, so it wants the cleanest state the
++ * walk can offer.  reg == 0 means "no register write". */
+ static int
+ tch_se_start(void)
+ {
+ 	static const struct {
+ 		uint32_t reg, val;
++		int order;              /* -1: keep, else force the DMA ordering */
+ 		const char *what;
+ 	} fixes[] = {
+-		{ SE_GENI_M_CMD_CTRL_REG, M_GENI_CMD_CANCEL, "cancel" },
+-		{ SE_GENI_M_CMD_CTRL_REG, M_GENI_CMD_ABORT, "abort" },
+-		{ SE_GENI_M_CMD_CTRL_REG, 0, "clear-disable" },
+-		{ SE_GENI_CFG_SEQ_START, START_TRIGGER, "start-trigger" },
++		{ 0, 0, 1, "cmd-first" },
++		{ SE_GENI_M_CMD_CTRL_REG, M_GENI_CMD_CANCEL, -1, "cancel" },
++		{ SE_GENI_M_CMD_CTRL_REG, M_GENI_CMD_ABORT, -1, "abort" },
++		{ SE_GENI_M_CMD_CTRL_REG, 0, -1, "clear-disable" },
++		{ SE_GENI_CFG_SEQ_START, START_TRIGGER, -1, "start-trigger" },
+ 	};
+ 
+ 	if (tch_probe_bus("as configured") == 0) {
+ 		return 0;
+ 	}
+ 	for (unsigned i = 0; i < sizeof(fixes) / sizeof(fixes[0]); i++) {
+-		tch_wr(tch.se, fixes[i].reg, fixes[i].val);
++		if (fixes[i].reg != 0) {
++			tch_wr(tch.se, fixes[i].reg, fixes[i].val);
++		}
++		if (fixes[i].order >= 0) {
++			tch_dma_order = fixes[i].order;
++		}
+ 		delay(2000);
+ 		printf("LIUQIN TOUCH: %s: status 0x%08x irq 0x%08x ctrl 0x%08x\n",
+ 		    fixes[i].what, tch_rd(tch.se, SE_GENI_STATUS),
+@@ -876,6 +919,37 @@
+ 	}
+ }
+ 
++/*
++ * The engine's DMA interface.  A QUPv3 serial engine is loaded with its
++ * protocol firmware and its transfer mode by the bootloader (geni_load_se_fw:
++ * SE_DMA_IF_EN, SE_FIFO_IF_DISABLE), after which GENI_IF_DISABLE_RO@0x64 reads
++ * 1 for a DMA/GSI engine.  If that single enable never made it, the sequencer
++ * accepts a data command, cannot fetch the descriptor's bytes, and holds
++ * GENI_STATUS.M_GENI_CMD_ACTIVE forever without raising one interrupt - which
++ * is precisely the touch150 log.  Read the whole block, set the bit if it is
++ * clear, read it back.  liuqintouchdmaif=0 only reports.
++ */
++static void
++tch_se_dma_if(void)
++{
++	int on = 1;
++	uint32_t before, after;
++
++	(void)PE_parse_boot_argn("liuqintouchdmaif", &on, sizeof(on));
++	before = tch_rd(tch.se, SE_DMA_IF_EN);
++	printf("LIUQIN TOUCH: SE4 clk_ctrl 0x%08x dma_if_en 0x%08x (ro 0x%08x) "
++	    "fifo_if_disable 0x%08x gsi_ev 0x%08x\n", tch_rd(tch.se, SE_GENI_CLK_CTRL),
++	    before, tch_rd(tch.se, DMA_IF_EN_RO), tch_rd(tch.se, SE_FIFO_IF_DISABLE),
++	    tch_rd(tch.se, SE_GSI_EVENT_EN));
++	if (on <= 0 || (before & DMA_IF_EN)) {
++		return;
++	}
++	tch_wr(tch.se, SE_DMA_IF_EN, before | DMA_IF_EN);
++	after = tch_rd(tch.se, SE_DMA_IF_EN);
++	printf("LIUQIN TOUCH: SE4 dma_if_en 0x%08x -> 0x%08x (%s)\n", before, after,
++	    (after & DMA_IF_EN) ? "set" : "write ignored");
++}
++
+ /* One page of staging memory for the SE DMA, physically contiguous because the
+  * engine is handed a physical address and is not cache coherent.
+  *
+@@ -1079,6 +1153,22 @@
+ 	tch_wr(cb, 0, 0);
+ 	printf("LIUQIN TOUCH: SMMU CBAR 0x%08x SCTLR 0x%08x (after)\n",
+ 	    tch_rd(gr1, 4u * cbndx), tch_rd(cb, 0));
++	/* Kept so a failed transfer can say whether the stream faulted and at
++	 * which address: FSR@0x58, FAR@0x60, FSYNR0@0x68 (arm-smmu.h).  A fault
++	 * left over from an earlier probe would make that dump a lie, and FSR is
++	 * write-one-to-clear, so read it out and drop it now. */
++	{
++		const uint32_t fsr = tch_rd(cb, 0x58);
++
++		if (fsr != 0) {
++			const uint32_t far = tch_rd(cb, 0x60);
++
++			tch_wr(cb, 0x58, fsr);
++			printf("LIUQIN TOUCH: SMMU cb had a stale fault fsr 0x%08x far 0x%08x, "
++			    "cleared\n", fsr, far);
++		}
++	}
++	tch.smmu_cb = cb;
+ 	return cbndx;
+ }
+ 
+@@ -1281,15 +1371,43 @@
+ 
+ 	for (size_t i = 0; i < len; i++) {
+ 		p[i] = 0;
++	}
++}
++
++/*
++ * geni_se_tx_init_dma() / geni_se_rx_init_dma(): the descriptor lives in
++ * registers, so the engine needs the pointer, the attribute and the length
++ * before it can fetch anything.  RX is not an EOT buffer, TX is.
++ */
++static void
++tch_dma_arm(bool tx, bool rx, uint64_t tx_pa, uint64_t rx_pa, size_t len)
++{
++	if (rx) {
++		tch_wr(tch.se, SE_DMA_RX_IRQ_CLR, 0xffffffff);
++		tch_wr(tch.se, SE_DMA_RX_IRQ_EN_SET, DMA_IRQ_EN);
++		tch_wr(tch.se, SE_DMA_RX_PTR_L, (uint32_t)rx_pa);
++		tch_wr(tch.se, SE_DMA_RX_PTR_H, (uint32_t)(rx_pa >> 32));
++		tch_wr(tch.se, SE_DMA_RX_ATTR, 0);
++		tch_wr(tch.se, SE_DMA_RX_LEN, (uint32_t)len);
+ 	}
++	if (tx) {
++		tch_wr(tch.se, SE_DMA_TX_IRQ_CLR, 0xffffffff);
++		tch_wr(tch.se, SE_DMA_TX_IRQ_EN_SET, DMA_IRQ_EN);
++		tch_wr(tch.se, SE_DMA_TX_PTR_L, (uint32_t)tx_pa);
++		tch_wr(tch.se, SE_DMA_TX_PTR_H, (uint32_t)(tx_pa >> 32));
++		tch_wr(tch.se, SE_DMA_TX_ATTR, GENI_SE_DMA_EOT_BUF);
++		tch_wr(tch.se, SE_DMA_TX_LEN, (uint32_t)len);
++	}
+ }
+ 
+ /*
+  * One SPI transfer through the serial engine's own DMA engine: what an SE with
+- * FIFO_IF_DISABLE set needs (geni_se_tx/rx_init_dma, then the command).  The
+- * order matters and used to be backwards: Linux programs the DMA pointer,
+- * attribute and length *first* and only then writes SE_GENI_M_CMD0, so the
+- * sequencer finds the descriptor ready when the command starts.
++ * FIFO_IF_DISABLE set needs (geni_se_tx/rx_init_dma and the command).  Both
++ * orderings are in Linux: every release up to the 2024 rework arms the
++ * descriptor registers and then writes SE_GENI_M_CMD0, while upstream writes
++ * the command first and arms the descriptor behind it.  touch129..150 only
++ * ever tried the first, so liuqintouchdmaorder=1 - and the "cmd-first" step of
++ * the probe walk - tries the second without a rebuild.
+  */
+ static int
+ tch_dma_xfer(const uint8_t *tx, uint8_t *rx, size_t len)
+@@ -1314,25 +1432,13 @@
+ 	tch_wr(tch.se, SE_SPI_TX_TRANS_LEN, tx != NULL ? (uint32_t)len : 0);
+ 	tch_wr(tch.se, SE_SPI_RX_TRANS_LEN, rx != NULL ? (uint32_t)len : 0);
+ 
+-	/* geni_se_select_mode(GENI_SE_DMA) + geni_se_tx/rx_init_dma(). */
++	/* geni_se_select_mode(GENI_SE_DMA): the mode is not part of the command
++	 * and has to be in place before either ordering starts. */
+ 	tch_wr(tch.se, SE_GENI_DMA_MODE_EN,
+ 	    tch_rd(tch.se, SE_GENI_DMA_MODE_EN) | GENI_DMA_MODE_EN);
+-	if (rx != NULL) {
+-		tch_wr(tch.se, SE_DMA_RX_IRQ_CLR, 0xffffffff);
+-		tch_wr(tch.se, SE_DMA_RX_IRQ_EN_SET, DMA_IRQ_EN);
+-		tch_wr(tch.se, SE_DMA_RX_PTR_L, (uint32_t)rx_pa);
+-		tch_wr(tch.se, SE_DMA_RX_PTR_H, (uint32_t)(rx_pa >> 32));
+-		tch_wr(tch.se, SE_DMA_RX_ATTR, 0);
+-		tch_wr(tch.se, SE_DMA_RX_LEN, (uint32_t)len);
++	if (tch_dma_order == 0) {
++		tch_dma_arm(tx != NULL, rx != NULL, tx_pa, rx_pa, len);
+ 	}
+-	if (tx != NULL) {
+-		tch_wr(tch.se, SE_DMA_TX_IRQ_CLR, 0xffffffff);
+-		tch_wr(tch.se, SE_DMA_TX_IRQ_EN_SET, DMA_IRQ_EN);
+-		tch_wr(tch.se, SE_DMA_TX_PTR_L, (uint32_t)tx_pa);
+-		tch_wr(tch.se, SE_DMA_TX_PTR_H, (uint32_t)(tx_pa >> 32));
+-		tch_wr(tch.se, SE_DMA_TX_ATTR, GENI_SE_DMA_EOT_BUF);
+-		tch_wr(tch.se, SE_DMA_TX_LEN, (uint32_t)len);
+-	}
+ 	if (tch_dma_count < 8) {
+ 		tch_dma_count++;
+ 		printf("LIUQIN TOUCH: DMA #%u %s len %u tx 0x%llx rx 0x%llx mode 0x%08x\n",
+@@ -1361,10 +1467,14 @@
+ 			    tch_rd(tch.se, SE_DMA_GENERAL_CFG),
+ 			    tch_rd(tch.se, SE_GENI_STATUS));
+ 		}
+-		printf("LIUQIN TOUCH: DMA #%u issuing opcode %u (the transfer starts here)\n",
+-		    tch_dma_count, (unsigned)cmd);
++		printf("LIUQIN TOUCH: DMA #%u issuing opcode %u, %s (the transfer starts "
++		    "here)\n", tch_dma_count, (unsigned)cmd, tch_dma_order ?
++		    "command before descriptor" : "descriptor before command");
+ 	}
+ 	tch_wr(tch.se, SE_GENI_M_CMD0, (cmd << M_OPCODE_SHFT) | FRAGMENTATION);
++	if (tch_dma_order != 0) {
++		tch_dma_arm(tx != NULL, rx != NULL, tx_pa, rx_pa, len);
++	}
+ 	tch.status_after_cmd = tch_rd(tch.se, SE_GENI_STATUS);
+ 	for (i = 0; i < 50 * 20; i++) {
+ 		txst = tx != NULL ? tch_rd(tch.se, SE_DMA_TX_IRQ_STAT) : 0;
+@@ -1409,6 +1519,39 @@
+ 			    tch_rd(tch.se, SE_GENI_DMA_MODE_EN),
+ 			    tch_rd(tch.se, SE_DMA_GENERAL_CFG));
+ 		}
++		/*
++		 * What separates "the engine never asked for memory" from "the
++		 * memory side said no": the DMA state machine and how many bytes
++		 * each direction actually moved, the staging contents (RX is
++		 * zeroed before the command, so a written byte proves the DMA ran
++		 * even if its completion never arrived), and the context bank's
++		 * fault registers.  Only the first few attempts, to keep the ring
++		 * log readable.
++		 */
++		if (tch_dma_count <= 3) {
++			uint8_t txb[4], rxb[4];
++			const uint32_t dbg = tch_rd(tch.se, SE_DMA_DEBUG_REG0);
++
++			tch_dma_get(TCH_DMA_TX_OFF, txb, sizeof(txb));
++			tch_dma_get(TCH_DMA_RX_OFF, rxb, sizeof(rxb));
++			printf("LIUQIN TOUCH: DMA #%u state: debug 0x%08x (tx_active %u "
++			    "rx_active %u) len_in tx %u rx %u irq_en tx 0x%x rx 0x%x\n",
++			    tch_dma_count, dbg, (dbg & DMA_TX_ACTIVE) != 0,
++			    (dbg & DMA_RX_ACTIVE) != 0,
++			    tch_rd(tch.se, SE_DMA_TX_LEN_IN),
++			    tch_rd(tch.se, SE_DMA_RX_LEN_IN),
++			    tch_rd(tch.se, SE_DMA_TX_IRQ_EN),
++			    tch_rd(tch.se, SE_DMA_RX_IRQ_EN));
++			printf("LIUQIN TOUCH: DMA #%u staging: tx %02x %02x %02x %02x "
++			    "rx %02x %02x %02x %02x\n", tch_dma_count,
++			    txb[0], txb[1], txb[2], txb[3],
++			    rxb[0], rxb[1], rxb[2], rxb[3]);
++			if (tch.smmu_cb != 0) {
++				printf("LIUQIN TOUCH: SMMU cb fsr 0x%08x far 0x%08x "
++				    "fsynr0 0x%08x\n", tch_rd(tch.smmu_cb, 0x58),
++				    tch_rd(tch.smmu_cb, 0x60), tch_rd(tch.smmu_cb, 0x68));
++			}
++		}
+ 		if (tx != NULL) {
+ 			tch_wr(tch.se, SE_DMA_TX_FSM_RST, 1);
+ 		}
+@@ -2892,6 +3035,15 @@
+ 			return tch_bitbang_start();
+ 		}
+ 		printf("LIUQIN TOUCH: liuqintouchdma=1, trying SE DMA again\n");
++		/* Only reachable when the pads are the only way in, so the engine's
++		 * data path is the thing under test: the ordering is selectable for
++		 * a run that wants the upstream one. */
++		{
++			int order = 0;
++
++			(void)PE_parse_boot_argn("liuqintouchdmaorder", &order, sizeof(order));
++			tch_dma_order = (order != 0);
++		}
+ 		/*
+ 		 * The AHB master clock first: touch147 hung with the SMMU probe
+ 		 * entirely skipped (liuqintouchsmmu=0), so the DMA path itself is
+@@ -2899,6 +3051,10 @@
+ 		 * that leaves the register interface working.
+ 		 */
+ 		tch_qup_dma_clocks();
++		/* The engine-side half of the same question: an SE strapped for DMA
++		 * (GENI_IF_DISABLE_RO = 1) whose DMA interface enable is clear holds
++		 * a data command forever, which is exactly what touch150 logged. */
++		tch_se_dma_if();
+ 		/*
+ 		 * Order is the whole point of the 2026-10-27 handoff: report and
+ 		 * fix the stream the SE will use, and only then map/zero the

@@ -1,0 +1,509 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -324,6 +324,8 @@
+ 	vm_offset_t dma;                /* staging page for SE DMA */
+ 	uint64_t    dma_pa;
+ 	bool        use_dma;            /* transfers go through the SE's DMA */
++	vm_offset_t smmu;               /* apps_smmu global space 0 window */
++	int         smmu_smr;           /* SMR entry matching the SE, or -1 */
+ 	uint32_t    dma_tx_status;      /* last SE_DMA_TX/RX_IRQ_STAT */
+ 	uint32_t    dma_rx_status;
+ 	uint32_t    last_irq;           /* M_IRQ_STATUS of the last command */
+@@ -834,9 +836,55 @@
+ 	printf("LIUQIN TOUCH: SE4 rejects every command, bus not started\n");
+ 	return -1;
+ }
++
++/* The QUP's DMA master reaches memory through the wrapper's AHB port.  Its
++ * register interface can look perfectly alive - every SE read answers - while
++ * that port is gated, and then the engine's first transaction never completes
++ * and the interconnect hangs with no panic.  The wrapper's clocks are bits
++ * 6..9 of GCC_QUPV3_WRAP0_CBCR (clk-qcom: one branch per clock, all
++ * BRANCH_HALT_VOTED), and the bit-banged path never needed any of them.
++ * Read, enable what is missing, read back.  liuqintouchqupclk=0 skips it. */
++static void
++tch_qup_dma_clocks(void)
++{
++	const uint32_t off = GCC_QUPV3_WRAP0_CBCR - 0x62000u;
++	const uint32_t want = QUP_CBCR_M_AHB | QUP_CBCR_S_AHB |
++	    QUP_CBCR_CORE | QUP_CBCR_CORE_2X;
++	int on = 1;
++	vm_offset_t gcc;
++	uint32_t v;
+ 
++	(void)PE_parse_boot_argn("liuqintouchqupclk", &on, sizeof(on));
++	if (on <= 0) {
++		printf("LIUQIN TOUCH: QUP DMA clocks left as they are\n");
++		return;
++	}
++	gcc = ml_io_map(GCC_PA + 0x62000u, 0x4000u);
++	if (gcc == 0) {
++		printf("LIUQIN TOUCH: GCC 0x%x map failed\n", GCC_PA + 0x62000u);
++		return;
++	}
++	v = tch_rd(gcc, off);
++	printf("LIUQIN TOUCH: QUP CBCR 0x%08x [m_ahb %d s_ahb %d core %d core2x %d "
++	    "s4 %d]\n", v, (v & QUP_CBCR_M_AHB) != 0, (v & QUP_CBCR_S_AHB) != 0,
++	    (v & QUP_CBCR_CORE) != 0, (v & QUP_CBCR_CORE_2X) != 0,
++	    (v & QUP_CBCR_S4) != 0);
++	if ((v & want) != want) {
++		tch_wr(gcc, off, v | want);
++		printf("LIUQIN TOUCH: QUP CBCR forced 0x%08x -> 0x%08x (AHB master for DMA)\n",
++		    v, tch_rd(gcc, off));
++	}
++}
++
+ /* One page of staging memory for the SE DMA, physically contiguous because the
+- * engine is handed a physical address and is not cache coherent. */
++ * engine is handed a physical address and is not cache coherent.
++ *
++ * The page is fixed, not allocated: the QUP's DMA only addresses 32-bit
++ * physical memory and the allocator hands out pages above 32 GiB on this
++ * port.  0x85200000 sits in the free window between cdsp_secure_heap and
++ * video_region; 0x85E00000 (34 MiB, below the 0x88000000 line) is the
++ * documented fallback, selectable at boot with liuqintouchdmaphys=0x85e00000
++ * so a freeze does not need a rebuild to test the other window. */
+ static int
+ tch_dma_alloc(void)
+ {
+@@ -877,6 +925,22 @@
+ 		}
+ 		printf("LIUQIN TOUCH: DMA page fixed at phys 0x%llx (%s)\n",
+ 		    tch.dma_pa, fixed == 0x85200000 ? "default window" : "requested");
++		/* Prove the page is backed before the engine reads it: a PA that is
++		 * not real memory makes the QUP's first transaction hang the bus
++		 * with no panic, and no SMMU or descriptor change would help. */
++		{
++			volatile uint32_t *probe = (volatile uint32_t *)tch.dma;
++			const uint32_t a = 0xa5a5a5a5u, b = 0x5a5a5a5au;
++			uint32_t r0, r1;
++
++			probe[0] = a;
++			probe[TCH_DMA_RX_OFF / 4] = b;
++			__asm__ volatile ("dsb sy" ::: "memory");
++			r0 = probe[0];
++			r1 = probe[TCH_DMA_RX_OFF / 4];
++			printf("LIUQIN TOUCH: DMA page self-test %s (0x%08x 0x%08x)\n",
++			    (r0 == a && r1 == b) ? "ok" : "MISMATCH", r0, r1);
++		}
+ 	}
+ 	if (tch.dma_pa == 0) {
+ 		printf("LIUQIN TOUCH: DMA page maps to physical 0\n");
+@@ -895,63 +959,269 @@
+ /*
+  * apps_smmu (vendor DTB: soc/apps-smmu@15000000, "qcom,qsmmu-v500", 1 MiB).
+  * QUPv3_0's GENI SE - the wrapper that owns SE4 - carries
+- * iommus = <&apps_smmu 0x5a3 0>, so every SE DMA transaction is translated by
+- * stream 0x5A3.  An S2CR that is not in bypass makes that transaction fault,
+- * and a stalled fault stalls the interconnect: the machine froze on the very
+- * first DMA opcode with nothing else printed.  qsmmu-v500 indexes S2CR by the
+- * stream id at 0x8000 + 4*n, so the register is 0x15000000 + 0x968c.
++ * iommus = <&apps_smmu 0x5a3 0>, so every SE DMA transaction carries stream
++ * id 0x5A3.
+  *
+- * liuqintouchsmmu: 0 off, 1 report only, 2 report and set the stream to bypass.
++ * Register map (measured on touch145/146, plus the device tree):
++ *
++ *   SCR0  0x0000   IDR0  0x0020
++ *   SMR   0x0800 + 4*n   VALID(31) | MASK[30:16] | ID[15:0]
++ *   S2CR  0x0c00 + 4*n   TYPE[17:16] (0 translate, 1 bypass, 2 fault),
++ *                        CBNDX[7:0]  - not type[1:0]/cb[15:8]
++ *
++ * The array holds IDR0[7:0] = 0x71 = 113 entries.  Reading entry 113 - one
++ * past the end - is what killed touch146 (FAR = window + 0x9c4, ESR
++ * 0x96000010, PC at the SMR load), so stay strictly below the count.
++ * All of it is global space 0; 0x8000+ is global space 1 and traps (touch145
++ * died on 0x1500968c, and GpuPowerBoard.h records the same for gr1), so the
++ * old "S2CR indexed by stream id at 0x8000" idea is gone for good.
++ *
++ * What touch146-gr0 read back: SMR[0] valid id 0, SMR[3] 0x84022800 = the
++ * display stream (DT: qcom,smmu_sde_unsec_cb is <&apps_smmu 0x2800 0x402>,
++ * exactly qcom,handoff-smrs = <0x2800 0x402>), and S2CR[i] = CBNDX i with
++ * type translate.  Nothing matched the QUP's 0x5A3, so the SE's DMA would be
++ * an unmatched transaction.  This function therefore (1) bypasses an
++ * existing match, (2) else programs an entry whose SMR is invalid (it
++ * matches nothing, so its S2CR is unused), (3) else reuses a redundant
++ * "valid, id 0, mask 0" entry - such an entry only ever matches stream 0,
++ * and the lowest one keeps that match.
++ *
++ * One 16 KiB window covers all of it.  tch_smmu_fix() must run *before*
++ * tch_dma_alloc(): the touch132 freeze differed from the readable touch135
++ * probe by touching the 0x85200000 staging page first.
++ *
++ * liuqintouchsmmu: 0 off, 1 report only, 2 report and (bypass | program).
+  */
+-#define APPS_SMMU_PA   0x15000000u
+-#define SMMU_SCR0      0x0000u
+-#define SMMU_IDR0      0x0020u
+-#define SMMU_S2CR(n)   (0x8000u + (n) * 4u)
+-#define SMMU_STREAM    0x5a3u
+-#define S2CR_TYPE_BYPASS 0x1u
++#define APPS_SMMU_PA    0x15000000u
++#define SMMU_SCR0       0x0000u
++#define SMMU_IDR1       0x0024u
++#define SMMU_IDR0       0x0020u
++#define SMMU_SMR(n)     (0x0800u + (n) * 4u)
++#define SMMU_S2CR(n)    (0x0c00u + (n) * 4u)
++#define SMMU_ENTRY_MAX  256u           /* sanity cap; real count is IDR0[7:0] */
++#define SMMU_WIN_SIZE   0x4000u        /* one 16 KiB page of device registers */
++#define SMMU_STREAM     0x5a3u
++#define SMR_VALID       0x80000000u
++#define SMR_ID(smr)     ((smr) & 0xffffu)
++#define SMR_MASK(smr)   (((smr) >> 16) & 0x7fffu)
++#define S2CR_TYPE_MSK   (3u << 16)
++#define S2CR_TYPE_BYPASS 1u
++#define S2CR_TYPE(s2cr) (((s2cr) >> 16) & 3u)
++#define S2CR_CB(s2cr)   ((s2cr) & 0xffu)
++#define CBAR_TYPE_MSK   (3u << 16)
++#define CBAR_TYPE_S1_S2_BYPASS 1u
+ 
++/* arm_smmu SMR semantics: VALID, then id equal to the stream id on every bit
++ * the mask does not ignore. */
++static bool
++tch_smr_matches(uint32_t smr, uint32_t sid)
++{
++	const uint32_t mask = SMR_MASK(smr);
++
++	if ((smr & SMR_VALID) == 0) {
++		return false;
++	}
++	return (((sid ^ smr) & 0xffffu) & ~mask) == 0;
++}
++
++
++/*
++ * qsmmu writes S2CR TYPE=BYPASS as TYPE=FAULT (measured: 0x00010000 came back
++ * 0x00020000), which is why the "just bypass the stream" plan can never work
++ * here.  Linux' arm-smmu-qcom handles the same quirk by reserving a context
++ * bank, setting CBAR to S1_TRANS_S2_BYPASS with SCTLR=0, and pointing the
++ * stream at that bank with TYPE=TRANS.  Do the same and return the bank, or
++ * 0xff when the geometry or the accesses do not work out.
++ *
++ * Geometry from IDR1 (arm-smmu.h): PAGESIZE bit31, NUMPAGENDXB [30:28],
++ * NUMCB [7:0]; GR1 page = 1 << pgshift, CBAR(n) = GR1 + 4*n,
++ * CB(n) = (numpage + n) << pgshift.
++ */
++static unsigned
++tch_smmu_bypass_cb(vm_offset_t gr0)
++{
++	int enable = 1;
++	uint32_t idr1, pgshift, numpage, ncb, cbndx, gr1_off, cb_off;
++	vm_offset_t gr1, cb;
++
++	(void)PE_parse_boot_argn("liuqintouchbypass", &enable, sizeof(enable));
++	if (enable <= 0) {
++		printf("LIUQIN TOUCH: SMMU bypass CB disabled by boot arg\n");
++		return 0xffu;
++	}
++	idr1 = tch_rd(gr0, SMMU_IDR1);
++	pgshift = (idr1 & (1u << 31)) ? 16u : 12u;
++	numpage = 1u << (((idr1 >> 28) & 7u) + 1u);
++	ncb = idr1 & 0xffu;
++	cbndx = (ncb > 1u) ? ncb - 1u : 77u;
++	gr1_off = (1u << pgshift);
++	cb_off = (numpage + cbndx) << pgshift;
++	printf("LIUQIN TOUCH: SMMU quirk: idr1 0x%08x (pgshift %u, numpage %u, numcb %u)"
++	    " -> bypass CB %u, CBAR at +0x%x, CB at +0x%x\n",
++	    idr1, pgshift, numpage, ncb, cbndx, gr1_off + 4u * cbndx, cb_off);
++	if (cb_off >= 0x100000u || gr1_off >= 0x100000u) {
++		/* The device tree says the block is 1 MiB; a CB outside it means the
++		 * IDR1 geometry is not what we think, so do not poke it. */
++		printf("LIUQIN TOUCH: SMMU CB/CBAR outside the 1 MiB block; not touching it\n");
++		return 0xffu;
++	}
++
++	gr1 = ml_io_map(APPS_SMMU_PA + gr1_off, PAGE_SIZE);
++	cb = ml_io_map(APPS_SMMU_PA + cb_off, PAGE_SIZE);
++	if (gr1 == 0 || cb == 0) {
++		printf("LIUQIN TOUCH: SMMU cannot map CBAR/CB (0x%llx/0x%llx)\n",
++		    (uint64_t)gr1, (uint64_t)cb);
++		return 0xffu;
++	}
++	printf("LIUQIN TOUCH: SMMU CBAR 0x%08x SCTLR 0x%08x (before)\n",
++	    tch_rd(gr1, 4u * cbndx), tch_rd(cb, 0));
++	tch_wr(gr1, 4u * cbndx, CBAR_TYPE_S1_S2_BYPASS << 16);
++	tch_wr(cb, 0, 0);
++	printf("LIUQIN TOUCH: SMMU CBAR 0x%08x SCTLR 0x%08x (after)\n",
++	    tch_rd(gr1, 4u * cbndx), tch_rd(cb, 0));
++	return cbndx;
++}
++
+ static void
+ tch_smmu_fix(void)
+ {
+ 	int mode = 1;
+-	vm_offset_t smmu;
+-	uint32_t scr0, idr0, s2cr0, s2cr1, s2cr;
++	vm_offset_t gr0;
++	uint32_t scr0, idr0;
++	uint32_t hit_smr = 0, hit_s2cr = 0;
++	unsigned nsmr, valid = 0, free_slots = 0, shown = 0, sid0 = 0;
++	unsigned free_at = SMMU_ENTRY_MAX, spare_at = SMMU_ENTRY_MAX;
++	unsigned sid0_first = SMMU_ENTRY_MAX;
++	int hit = -1;
+ 
+ 	(void)PE_parse_boot_argn("liuqintouchsmmu", &mode, sizeof(mode));
+ 	if (mode <= 0) {
+ 		return;
+ 	}
+-	smmu = ml_io_map(APPS_SMMU_PA, 0x10000);
+-	if (smmu == 0) {
+-		printf("LIUQIN TOUCH: SMMU: cannot map 0x%x\n", APPS_SMMU_PA);
++	gr0 = ml_io_map(APPS_SMMU_PA, SMMU_WIN_SIZE);
++	if (gr0 == 0) {
++		printf("LIUQIN TOUCH: SMMU: cannot map 0x%x, DMA path continues without it\n",
++		    APPS_SMMU_PA);
+ 		return;
+ 	}
+-	scr0 = tch_rd(smmu, SMMU_SCR0);
+-	idr0 = tch_rd(smmu, SMMU_IDR0);
+-	s2cr0 = tch_rd(smmu, SMMU_S2CR(0));
+-	s2cr1 = tch_rd(smmu, SMMU_S2CR(1));
+-	s2cr = tch_rd(smmu, SMMU_S2CR(SMMU_STREAM));
+-	printf("LIUQIN TOUCH: SMMU scr0 0x%08x idr0 0x%08x S2CR[0] 0x%08x S2CR[1] 0x%08x\n",
+-	    scr0, idr0, s2cr0, s2cr1);
+-	printf("LIUQIN TOUCH: SMMU S2CR[0x%x] 0x%08x type %u (0 translate, 1 bypass, 2 fault)\n",
+-	    SMMU_STREAM, s2cr, s2cr & 3u);
+-	if (mode < 2) {
++	tch.smmu = gr0;
++	tch.smmu_smr = -1;
++	scr0 = tch_rd(gr0, SMMU_SCR0);
++	idr0 = tch_rd(gr0, SMMU_IDR0);
++	nsmr = idr0 & 0xffu;
++	printf("LIUQIN TOUCH: SMMU gr0 scr0 0x%08x idr0 0x%08x, %u entries "
++	    "(SMR@0x800 S2CR@0xc00)\n", scr0, idr0, nsmr);
++	if (nsmr == 0 || nsmr > SMMU_ENTRY_MAX) {
++		printf("LIUQIN TOUCH: SMMU implausible entry count, leaving it alone\n");
+ 		return;
+ 	}
+-	if (idr0 == 0 || idr0 == 0xffffffffu) {
+-		/* Not an SMMU register block: never write into whatever this is. */
+-		printf("LIUQIN TOUCH: SMMU: no IDR0, refusing to write\n");
++
++	for (unsigned i = 0; i < nsmr; i++) {
++		const uint32_t smr = tch_rd(gr0, SMMU_SMR(i));
++		const uint32_t s2cr = tch_rd(gr0, SMMU_S2CR(i));
++		const bool v = (smr & SMR_VALID) != 0;
++
++		if (v) {
++			valid++;
++		}
++		if (!v) {
++			/* No valid SMR: the entry matches nothing, so its S2CR is
++			 * unused and the slot is ours to take.  (Its S2CR being
++			 * non-zero is not a reason to skip it - that mistake is what
++			 * made touch147 leave the table alone.) */
++			free_slots++;
++			if (free_at == SMMU_ENTRY_MAX) {
++				free_at = i;
++			}
++		}
++		if (v && SMR_ID(smr) == 0 && SMR_MASK(smr) == 0) {
++			sid0++;
++			/* Matches stream 0 only; the first one keeps that match. */
++			if (sid0_first == SMMU_ENTRY_MAX) {
++				sid0_first = i;
++			} else {
++				spare_at = i;
++			}
++		}
++		if (v && SMR_ID(smr) != 0 && shown < 12) {
++			printf("LIUQIN TOUCH: SMMU [%3u] SMR 0x%08x id 0x%x mask 0x%x, "
++			    "S2CR 0x%08x type %u cb %u\n", i, smr, SMR_ID(smr),
++			    SMR_MASK(smr), s2cr, S2CR_TYPE(s2cr), S2CR_CB(s2cr));
++			shown++;
++		}
++		if (hit < 0 && tch_smr_matches(smr, SMMU_STREAM)) {
++			hit = (int)i;
++			hit_smr = smr;
++			hit_s2cr = s2cr;
++		}
++	}
++	printf("LIUQIN TOUCH: SMMU %u entries: %u valid (%u match only stream 0), "
++	    "%u free\n", nsmr, valid, sid0, free_slots);
++
++	if (hit >= 0) {
++		tch.smmu_smr = hit;
++		printf("LIUQIN TOUCH: SMMU stream 0x%x matches SMR[%d] id 0x%x mask 0x%x, "
++		    "S2CR 0x%08x type %u cb %u\n", SMMU_STREAM, hit, SMR_ID(hit_smr),
++		    SMR_MASK(hit_smr), hit_s2cr, S2CR_TYPE(hit_s2cr), S2CR_CB(hit_s2cr));
++		if (mode < 2) {
++			return;
++		}
++		if (S2CR_TYPE(hit_s2cr) == S2CR_TYPE_BYPASS) {
++			printf("LIUQIN TOUCH: SMMU stream already bypasses, nothing to write\n");
++			return;
++		}
++		printf("LIUQIN TOUCH: SMMU writing bypass to S2CR[%d] (0x%08x -> 0x%08x)\n",
++		    hit, hit_s2cr,
++		    (hit_s2cr & ~S2CR_TYPE_MSK) | (S2CR_TYPE_BYPASS << 16));
++		tch_wr(gr0, SMMU_S2CR((unsigned)hit),
++		    (hit_s2cr & ~S2CR_TYPE_MSK) | (S2CR_TYPE_BYPASS << 16));
++		printf("LIUQIN TOUCH: SMMU S2CR[%d] now 0x%08x\n", hit,
++		    tch_rd(gr0, SMMU_S2CR((unsigned)hit)));
+ 		return;
+ 	}
+-	if ((s2cr & 3u) == S2CR_TYPE_BYPASS) {
+-		printf("LIUQIN TOUCH: SMMU stream already bypasses, nothing to write\n");
++
++	printf("LIUQIN TOUCH: SMMU no valid SMR matches stream 0x%x\n", SMMU_STREAM);
++	if (mode < 2) {
+ 		return;
+ 	}
+-	printf("LIUQIN TOUCH: SMMU writing bypass to S2CR[0x%x] (0x%08x -> 0x%08x)\n",
+-	    SMMU_STREAM, s2cr, (s2cr & ~3u) | S2CR_TYPE_BYPASS);
+-	tch_wr(smmu, SMMU_S2CR(SMMU_STREAM), (s2cr & ~3u) | S2CR_TYPE_BYPASS);
+-	printf("LIUQIN TOUCH: SMMU S2CR[0x%x] now 0x%08x\n", SMMU_STREAM,
+-	    tch_rd(smmu, SMMU_S2CR(SMMU_STREAM)));
++	/*
++	 * Nothing matches the SE's stream.  Program one entry for it: prefer a
++	 * completely untouched one; otherwise reuse a redundant stream-0 match
++	 * (stream 0 keeps its lowest entry, so that route does not change).
++	 * S2CR first, so the new match only appears once bypass is in place.
++	 */
++	{
++		unsigned slot, cbndx;
++
++		if (free_at < nsmr) {
++			slot = free_at;
++			printf("LIUQIN TOUCH: SMMU programming free entry %u (SMR %s)\n",
++			    slot, "invalid");
++		} else if (spare_at < nsmr) {
++			slot = spare_at;
++			printf("LIUQIN TOUCH: SMMU no untouched entry; reusing redundant "
++			    "stream-0 match at %u (stream 0 keeps entry %u)\n",
++			    slot, sid0_first);
++		} else {
++			printf("LIUQIN TOUCH: SMMU no free or spare entry; leaving the "
++			    "table alone\n");
++			return;
++		}
++		cbndx = tch_smmu_bypass_cb(gr0);
++		if (cbndx >= 0xffu) {
++			printf("LIUQIN TOUCH: SMMU no bypass context bank; not "
++			    "programming the stream\n");
++			return;
++		}
++		printf("LIUQIN TOUCH: SMMU writing S2CR[%u] = 0x%08x (translate via "
++		    "bypass CB %u), SMR[%u] = 0x%08x\n", slot, cbndx, cbndx, slot,
++		    SMR_VALID | SMMU_STREAM);
++		tch_wr(gr0, SMMU_S2CR(slot), cbndx);
++		tch_wr(gr0, SMMU_SMR(slot), SMR_VALID | SMMU_STREAM);
++		tch.smmu_smr = (int)slot;
++		printf("LIUQIN TOUCH: SMMU readback SMR 0x%08x S2CR 0x%08x\n",
++		    tch_rd(gr0, SMMU_SMR(slot)), tch_rd(gr0, SMMU_S2CR(slot)));
++	}
+ }
+ 
+ /* geni_se_select_mode(GENI_SE_DMA): the SE moves the data itself. */
+@@ -1072,6 +1342,25 @@
+ 	}
+ 
+ 	if (tch_dma_count <= 8) {
++		if (tch_dma_count == 1) {
++			/* The point of this run: what the stream looks like at the
++			 * moment the engine starts, not only what tch_smmu_fix()
++			 * read a few hundred microseconds earlier. */
++			if (tch.smmu != 0 && tch.smmu_smr >= 0) {
++				printf("LIUQIN TOUCH: SMMU SMR[%d] before DMA #1 is 0x%08x "
++				    "(S2CR 0x%08x)\n", tch.smmu_smr,
++				    tch_rd(tch.smmu, SMMU_SMR((unsigned)tch.smmu_smr)),
++				    tch_rd(tch.smmu, SMMU_S2CR((unsigned)tch.smmu_smr)));
++			} else {
++				printf("LIUQIN TOUCH: SMMU no matching stream entry, DMA #1 "
++				    "runs with the table as the bootloader left it\n");
++			}
++			printf("LIUQIN TOUCH: DMA #1 config: dma_mode_en 0x%08x "
++			    "general_cfg 0x%08x status 0x%08x\n",
++			    tch_rd(tch.se, SE_GENI_DMA_MODE_EN),
++			    tch_rd(tch.se, SE_DMA_GENERAL_CFG),
++			    tch_rd(tch.se, SE_GENI_STATUS));
++		}
+ 		printf("LIUQIN TOUCH: DMA #%u issuing opcode %u (the transfer starts here)\n",
+ 		    tch_dma_count, (unsigned)cmd);
+ 	}
+@@ -1115,8 +1404,10 @@
+ 	if (!ok) {
+ 		if (tch_dma_count <= 8) {
+ 			printf("LIUQIN TOUCH: DMA failed: status 0x%08x irq 0x%08x tx 0x%08x "
+-			    "rx 0x%08x after %u polls\n", tch_rd(tch.se, SE_GENI_STATUS),
+-			    irq, txst, rxst, i);
++			    "rx 0x%08x after %u polls, dma_mode_en 0x%08x general_cfg 0x%08x\n",
++			    tch_rd(tch.se, SE_GENI_STATUS), irq, txst, rxst, i,
++			    tch_rd(tch.se, SE_GENI_DMA_MODE_EN),
++			    tch_rd(tch.se, SE_DMA_GENERAL_CFG));
+ 		}
+ 		if (tx != NULL) {
+ 			tch_wr(tch.se, SE_DMA_TX_FSM_RST, 1);
+@@ -2530,7 +2821,24 @@
+ 	const uint32_t pack_words = (width % 8) ? 1 : width / 8;
+ 	tch_config_packing(8, pack_words);
+ 	tch_wr(tch.se, SE_SPI_WORD_LEN, (8 - MIN_WORD_LEN) & WORD_LEN_MSK);
+-	tch_wr(tch.se, SE_SPI_LOOPBACK, 0);
++	/*
++	 * SE_SPI_LOOPBACK: bit 0 is the enable (the engine feeds its own MOSI
++	 * back into MISO), higher bits select the self-test source.  Written as
++	 * a raw value so a run can ask for a bit the driver does not know yet,
++	 * e.g. liuqintouchloopback=3.  A DMA that completes in loopback but not
++	 * against the panel separates "staging page/descriptors" from "SPI
++	 * slave side" (DMA_HANDOFF step 4).  Default 0 = pads, as before.
++	 */
++	{
++		int loopback = 0;
++
++		(void)PE_parse_boot_argn("liuqintouchloopback", &loopback, sizeof(loopback));
++		tch_wr(tch.se, SE_SPI_LOOPBACK, (uint32_t)loopback);
++		if (loopback != 0) {
++			printf("LIUQIN TOUCH: SE SPI loopback 0x%x written to 0x22c "
++			    "(MOSI fed back into MISO)\n", (unsigned)loopback);
++		}
++	}
+ 	tch_wr(tch.se, SE_SPI_DEMUX_SEL, 0);
+ 	tch_wr(tch.se, SE_SPI_CPHA, 0);
+ 	tch_wr(tch.se, SE_SPI_CPOL, 0);
+@@ -2566,12 +2874,14 @@
+ 
+ 	if (!tch.fifo_capable) {
+ 		/*
+-		 * The engine rejects FIFO transfers, and its own DMA freezes the
+-		 * whole machine on the first transfer: the staging page lands at
+-		 * 0x8a0150000 (34.5 GiB, this port's ADT only knows a bank above
+-		 * 32 GiB) and the QUP's DMA cannot complete a transaction there.
+-		 * Drive the four pads as GPIOs instead; liuqintouchdma=1 retries
+-		 * the engine's DMA path for a future memory/IOMMU fix.
++		 * The FIFO interface has never moved a byte (GENI_IF_DISABLE_RO
++		 * says it is present, but every transfer has been bit-banged),
++		 * and the SE's own DMA froze the machine on the first opcode in
++		 * touch129.  Two suspects have been removed since: the staging
++		 * page is no longer whatever the allocator hands out above 32 GiB
++		 * but a fixed low page (0x85200000), and the SE's apps_smmu
++		 * stream 0x5a3 can now be forced to bypass.  Drive the four pads
++		 * as GPIOs by default; liuqintouchdma=1 enters the retry path.
+ 		 */
+ 		int use_dma = 0;
+ 
+@@ -2582,10 +2892,23 @@
+ 			return tch_bitbang_start();
+ 		}
+ 		printf("LIUQIN TOUCH: liuqintouchdma=1, trying SE DMA again\n");
++		/*
++		 * The AHB master clock first: touch147 hung with the SMMU probe
++		 * entirely skipped (liuqintouchsmmu=0), so the DMA path itself is
++		 * suspect, and a gated wrapper AHB port is exactly a no-panic hang
++		 * that leaves the register interface working.
++		 */
++		tch_qup_dma_clocks();
++		/*
++		 * Order is the whole point of the 2026-10-27 handoff: report and
++		 * fix the stream the SE will use, and only then map/zero the
++		 * staging page.  touch132 did it the other way round and froze on
++		 * the first DMA opcode with no register read to show for it.
++		 */
++		tch_smmu_fix();
+ 		if (tch_dma_alloc() != 0) {
+ 			return -1;
+ 		}
+-		tch_smmu_fix();
+ 		tch_visible_mark("touch bus probe");
+ 		if (tch_se_start() != 0) {
+ 			/* The low page did not fix it: keep the boot usable by going

@@ -1,0 +1,123 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -318,7 +318,7 @@
+ /* Printed once, before anything else this driver does.  Every log line that
+  * follows can then be attributed to a build without guessing: a log whose
+  * stamp is missing or old is a log from an older image, not a new failure. */
+-#define TCH_BUILD               "touch169 dma-late-status+16k-chunks"
++#define TCH_BUILD               "touch170 length-scaled-wait+cancel"
+ 
+ /* Novatek NT36xxx SPI protocol (vendor nt36xxx driver, SPI variant). */
+ /* The vendor driver (TWRP's nt36532_touch.ko) reads the trim id at 0x1fb104
+@@ -422,6 +422,9 @@
+ static uint32_t tch_dma_last_irq;
+ static uint32_t tch_dma_last_len;
+ static uint32_t tch_dma_last_cmd;
++/* touch170: cancels issued after a timeout.  A timeout leaves the command
++ * ACTIVE; the cancel is what keeps the retry from stacking on top of it. */
++static unsigned tch_dma_cancels;
+ 
+ static uint32_t
+ tch_duplex_opcode(void)
+@@ -1581,7 +1584,8 @@
+ 	uint32_t txst = 0, rxst = 0, irq = 0;
+ 	uint32_t txin = 0, rxin = 0, dbg_mid = 0, txin_mid = 0, rxin_mid = 0;
+ 	bool ok;
+-	unsigned i;
++	unsigned i, budget;
++	uint32_t prog[3] = { 0, 0, 0 };
+ 
+ 	if (tch.dma == 0 || len == 0 || len > TCH_DMA_MAX) {
+ 		return -1;
+@@ -1650,11 +1654,41 @@
+ 		tch_dma_arm(tx != NULL, rx != NULL, tx_pa, rx_pa, len);
+ 	}
+ 	tch.status_after_cmd = tch_rd(tch.se, SE_GENI_STATUS);
+-	for (i = 0; i < 50 * 20; i++) {
++	/*
++	 * touch170: the wait has to follow the length.  touch169 handed 16128
++	 * bytes to one command - 215 ms of SPI at 600 kHz - and waited
++	 * 1000 * 50 us, so every attempt "failed" at LEN_IN 5504..6208
++	 * (73..83 ms at 600 kHz) with the command still ACTIVE, no error bit and
++	 * the counter still climbing: the engine was shifting the bytes, the loop
++	 * gave up first.  One poll costs 50 us plus seven register reads, so the
++	 * budget is the wire time in 50 us units plus 20 ms of slack.
++	 */
++	{
++		uint64_t wire_us = tch.spi_hz != 0 ?
++		    (uint64_t)len * 8u * 1000000u / tch.spi_hz : 0;
++
++		budget = (unsigned)(wire_us / 50u) + 400u;
++		if (budget < 1000) {
++			budget = 1000;
++		}
++		if (budget > 100000) {
++			budget = 100000;
++		}
++	}
++	for (i = 0; i < budget; i++) {
+ 		txst = tx != NULL ? tch_rd(tch.se, SE_DMA_TX_IRQ_STAT) : 0;
+ 		rxst = rx != NULL ? tch_rd(tch.se, SE_DMA_RX_IRQ_STAT) : 0;
+ 		txin = tx != NULL ? tch_rd(tch.se, SE_DMA_TX_LEN_IN) : 0;
+ 		rxin = rx != NULL ? tch_rd(tch.se, SE_DMA_RX_LEN_IN) : 0;
++		/* Three progress points, so a later timeout says whether the engine
++		 * was advancing (rate too slow) or stuck (bus/panel). */
++		if (i == budget / 4) {
++			prog[0] = txin;
++		} else if (i == budget / 2) {
++			prog[1] = txin;
++		} else if (i == (budget * 3) / 4) {
++			prog[2] = txin;
++		}
+ 		irq = tch_status();
+ 		if (i == 0) {
+ 			tch.first_irq = irq;
+@@ -1750,11 +1784,46 @@
+ 			tch_dma_fail_lines++;
+ 			printf("LIUQIN TOUCH: DMA #%u failed: cmd %u len %u status 0x%08x "
+ 			    "irq 0x%08x tx 0x%08x rx 0x%08x len_in tx %u rx %u after %u "
+-			    "polls, dma_mode_en 0x%08x general_cfg 0x%08x\n",
++			    "of %u polls, dma_mode_en 0x%08x general_cfg 0x%08x\n",
+ 			    tch_dma_count, cmd, (unsigned)len,
+ 			    tch_rd(tch.se, SE_GENI_STATUS), irq, txst, rxst, txin, rxin,
+-			    i, tch_rd(tch.se, SE_GENI_DMA_MODE_EN),
++			    i, budget, tch_rd(tch.se, SE_GENI_DMA_MODE_EN),
+ 			    tch_rd(tch.se, SE_DMA_GENERAL_CFG));
++			printf("LIUQIN TOUCH: DMA #%u tx progress at 25/50/75%% of "
++			    "the wait: %u %u %u of %u\n", tch_dma_count, prog[0],
++			    prog[1], prog[2], (unsigned)len);
++		}
++		/*
++		 * touch170: leave the engine in a defined state before the caller
++		 * retries.  A timeout leaves the command ACTIVE (GENI_STATUS bit 0)
++		 * with its bytes still on the wire; issuing the retry on top of it is
++		 * how a chunk ends up half written twice.  M_GENI_CMD_CANCEL is the
++		 * SPI core's own path (geni_se_cancel_m_cmd) and returns once the
++		 * engine drops ACTIVE.
++		 */
++		if ((tch_rd(tch.se, SE_GENI_STATUS) & M_GENI_CMD_ACTIVE) != 0) {
++			unsigned n;
++			uint32_t st;
++			const char *how;
++
++			tch_wr(tch.se, SE_GENI_M_CMD_CTRL_REG, M_GENI_CMD_CANCEL);
++			for (n = 0; n < 400; n++) {
++				if ((tch_rd(tch.se, SE_GENI_STATUS) &
++				    M_GENI_CMD_ACTIVE) == 0) {
++					break;
++				}
++				delay(50);
++			}
++			st = tch_rd(tch.se, SE_GENI_STATUS);
++			how = (st & M_GENI_CMD_ACTIVE) != 0 ? "did not clear" : "cleared";
++			tch_dma_cancels++;
++			if (tch_dma_cancels <= 8) {
++				printf("LIUQIN TOUCH: DMA #%u timed out with the command "
++				    "active; cancel %s after %u polls (status "
++				    "0x%08x, %u total)\n", tch_dma_count, how, n, st,
++				    tch_dma_cancels);
++			}
++			tch_wr(tch.se, SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
+ 		}
+ 		/*
+ 		 * What separates "the engine never asked for memory" from "the

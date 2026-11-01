@@ -1,0 +1,24 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -2418,6 +2418,21 @@
+ 				tch_visible_mark(mark);
+ 			}
+ 			memcpy(last, frame, sizeof(frame));
++		} else if (!tch_frame_valid(frame)) {
++			/*
++			 * The controller reports a lift as an empty frame (all
++			 * 0xff, and 0xfd at the end of a gesture).  Without this
++			 * branch the last finger stays down forever: backboardd
++			 * keeps it pressed and ignores everything that follows.
++			 * A spurious release costs one frame, the stuck finger
++			 * costs the whole session.
++			 */
++			for (int slot = 0; slot < NVT_MAX_FINGERS; slot++) {
++				if (down[slot]) {
++					down[slot] = false;
++					liuqin_hid_touch(slot, 0, 0, 0);
++				}
++			}
+ 		} else if (tch_frame_valid(frame)) {
+ 			if (memcmp(frame, last, sizeof(frame)) != 0) {
+ 				if (!dumped) {

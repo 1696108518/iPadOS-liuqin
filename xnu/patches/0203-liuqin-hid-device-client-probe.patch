@@ -1,0 +1,80 @@
+--- a/iokit/Kernel/arm/hid/LiuqinHID.cpp
++++ b/iokit/Kernel/arm/hid/LiuqinHID.cpp
+@@ -523,13 +523,77 @@
+ 	IOLog("LIUQIN HID: IOHIDDevice stub started (0xff00/0xf)\n");
+ 	registerService();
+ 	return true;
++}
++
++/*
++ * Placesholder user client for the 'HID' connect type (0x00484944,
++ * kIOHIDLibUserClientConnectManager).  It answers every external method with
++ * kIOReturnUnsupported but logs the selector, so one boot tells us exactly the
++ * call sequence this userland's HID stack performs on a device.
++ */
++static const char *const kHIDLibSelectors[] = {
++	"deviceIsValid", "open", "close", "createQueue", "disposeQueue",
++	"addElementToQueue", "removeElementFromQueue", "queueHasElement",
++	"startQueue", "stopQueue", "updateElementValues", "postElementValues",
++	"getReport", "setReport", "getElementCount", "getElements",
++	"setQueueAsyncPort", "releaseReport", "resumeReports",
++};
++
++class LiuqinHIDDeviceUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(LiuqinHIDDeviceUserClient)
++
++public:
++	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(LiuqinHIDDeviceUserClient, IOUserClient)
++
++IOReturn
++LiuqinHIDDeviceUserClient::externalMethod(uint32_t selector,
++    IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
++    OSObject *target, void *reference)
++{
++	const char *name = (selector < (sizeof(kHIDLibSelectors) / sizeof(kHIDLibSelectors[0])))
++	    ? kHIDLibSelectors[selector] : "?";
++
++	IOLog("LIUQIN HID: device client sel %u (%s) sc=%u sci=%u out=%u scalar_out=%u\n",
++	    (unsigned)selector, name,
++	    (unsigned)args->scalarInputCount, (unsigned)args->structureInputSize,
++	    (unsigned)args->structureOutputSize, (unsigned)args->scalarOutputCount);
++	return kIOReturnUnsupported;
+ }
+ 
+ IOReturn
+ IOHIDDevice::newUserClient(task_t owningTask, void *securityID, UInt32 type,
+     OSDictionary *properties, IOUserClient **handler)
+ {
++	IOUserClient *client;
++
+ 	IOLog("LIUQIN HID: IOHIDDevice stub newUserClient type 0x%x\n", (unsigned)type);
++	if (type == 0x00484944 /* kIOHIDLibUserClientConnectManager */) {
++		client = OSTypeAlloc(LiuqinHIDDeviceUserClient);
++		if (client && !client->initWithTask(owningTask, securityID, type, properties)) {
++			client->release();
++			client = NULL;
++		}
++		if (client && !client->attach(this)) {
++			client->release();
++			client = NULL;
++		}
++		if (client && !client->start(this)) {
++			client->detach(this);
++			client->release();
++			client = NULL;
++		}
++		if (client) {
++			*handler = client;
++			IOLog("LIUQIN HID: IOHIDDevice stub gave out a logging client\n");
++			return kIOReturnSuccess;
++		}
++		return kIOReturnNoResources;
++	}
+ 	return super::newUserClient(owningTask, securityID, type, properties, handler);
+ }
+ 

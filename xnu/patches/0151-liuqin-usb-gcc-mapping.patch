@@ -1,0 +1,14 @@
+--- a/bsd/dev/liuqin_usb.c
++++ b/bsd/dev/liuqin_usb.c
+@@ -43,7 +43,10 @@
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ #define GCC_PA                  0x00100000
+-#define GCC_SIZE                0x00090000
++/* 1 MiB: the USB clockref branches sit at 0x9c00c/0x9c010, and a 0x90000
++ * window ends at 0x190000, so reading them faulted the boot (data abort at
++ * liuqin_usb_probe, right after the log thread started). */
++#define GCC_SIZE                0x00100000
+ /*
+  * SM8450 GCC offsets (Linux drivers/clk/qcom/gcc-sm8450.c).  The first version
+  * of this table was sdmmagpie's - sweet's numbers - and writing them here

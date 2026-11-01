@@ -1,0 +1,244 @@
+--- a/bsd/sys/liuqin_input.h
++++ b/bsd/sys/liuqin_input.h
+@@ -0,0 +1,46 @@
++/*
++ * /dev/liuqin-touch: touch samples on their way from the kernel touch driver to
++ * the program that turns them into HID events for the window server.
++ *
++ * iOS expects touches from Apple's multitouch driver through IOHIDFamily, which
++ * this port does not have.  Instead the touch driver posts samples here and code
++ * of ours injected into backboardd reads them and synthesizes the digitizer
++ * events (see host/liuqin_touch_inject.c).  Both sides use this record.
++ *
++ *   write(): one or more records (time is ignored; the kernel stamps them) - a
++ *            way to replay touches from user space
++ *   read():  blocks until there is at least one record, returns as many whole
++ *            ones as fit
++ */
++#ifndef _SYS_LIUQIN_INPUT_H_
++#define _SYS_LIUQIN_INPUT_H_
++
++#include <stdint.h>
++
++#define LIUQIN_TOUCH_DEVICE     "/dev/liuqin-touch"
++
++#define LIUQIN_TOUCH_DOWN       1       /* a finger has landed */
++#define LIUQIN_TOUCH_MOVE       2
++#define LIUQIN_TOUCH_UP         3       /* it has lifted (x, y: where it was last) */
++#define LIUQIN_BUTTON_DOWN      4       /* a hardware button; `finger` says which */
++#define LIUQIN_BUTTON_UP        5
++
++#define LIUQIN_BUTTON_LOCK      1
++#define LIUQIN_BUTTON_VOLUME_UP 2
++#define LIUQIN_BUTTON_VOLUME_DOWN 3
++#define LIUQIN_BUTTON_HOME      4
++
++struct liuqin_touch_sample {
++	uint64_t time;                  /* mach_absolute_time() when the sample was posted */
++	uint32_t type;                  /* LIUQIN_TOUCH_* or LIUQIN_BUTTON_* */
++	uint32_t finger;                /* which finger, from 0 (or which button) */
++	uint32_t x, y;                  /* display position: 0 = left/top edge, 65535 = right/bottom */
++};
++
++#ifdef KERNEL
++/* For drivers; not from interrupt context. */
++void liuqin_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
++void liuqin_input_init(void);
++#endif
++
++#endif /* _SYS_LIUQIN_INPUT_H_ */
+--- a/bsd/dev/liuqin_input.c
++++ b/bsd/dev/liuqin_input.c
+@@ -0,0 +1,123 @@
++/*
++ * /dev/liuqin-touch: a queue of touch samples (see sys/liuqin_input.h).
++ */
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <libkern/libkern.h>
++#include <miscfs/devfs/devfs.h>
++#include <sys/conf.h>
++#include <sys/errno.h>
++#include <sys/liuqin_input.h>
++#include <sys/proc.h>
++#include <sys/systm.h>
++#include <sys/uio.h>
++
++#define TOUCH_QUEUE     512             /* records; a power of two */
++
++static LCK_GRP_DECLARE(touch_lck_grp, "liuqin-touch");
++static LCK_MTX_DECLARE(touch_lock, &touch_lck_grp);
++static struct liuqin_touch_sample touch_queue[TOUCH_QUEUE];
++static uint32_t touch_head, touch_tail;        /* read from head, add at tail */
++
++static void
++touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
++{
++	struct liuqin_touch_sample *t;
++
++	lck_mtx_lock(&touch_lock);
++	if (touch_tail - touch_head == TOUCH_QUEUE) {
++		touch_head++;                   /* nobody reads: drop the oldest */
++	}
++	t = &touch_queue[touch_tail++ % TOUCH_QUEUE];
++	t->time = mach_absolute_time();
++	t->type = type;
++	t->finger = finger;
++	t->x = x > 65535 ? 65535 : x;
++	t->y = y > 65535 ? 65535 : y;
++	lck_mtx_unlock(&touch_lock);
++	wakeup(&touch_queue);
++}
++
++void
++liuqin_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
++{
++	touch_post(type, finger, x, y);
++}
++
++static int
++touch_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++touch_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++touch_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	struct liuqin_touch_sample t;
++	int error = 0, moved = 0;
++
++	lck_mtx_lock(&touch_lock);
++	while (touch_head == touch_tail) {
++		error = msleep(&touch_queue, &touch_lock, PZERO | PCATCH, "liuqin-touch", NULL);
++		if (error) {
++			lck_mtx_unlock(&touch_lock);
++			return error;
++		}
++	}
++	while (touch_head != touch_tail && uio_resid(uio) >= (user_ssize_t)sizeof(t)) {
++		t = touch_queue[touch_head++ % TOUCH_QUEUE];
++		lck_mtx_unlock(&touch_lock);
++		error = uiomove((caddr_t)&t, sizeof(t), uio);
++		lck_mtx_lock(&touch_lock);
++		if (error) {
++			break;
++		}
++		moved++;
++	}
++	lck_mtx_unlock(&touch_lock);
++	return moved ? 0 : error;
++}
++
++static int
++touch_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	struct liuqin_touch_sample t;
++	int error = 0;
++
++	while (uio_resid(uio) >= (user_ssize_t)sizeof(t)) {
++		error = uiomove((caddr_t)&t, sizeof(t), uio);
++		if (error) {
++			break;
++		}
++		if (t.type < LIUQIN_TOUCH_DOWN || t.type > LIUQIN_BUTTON_UP) {
++			return EINVAL;
++		}
++		touch_post(t.type, t.finger, t.x, t.y);
++	}
++	return error;
++}
++
++static const struct cdevsw touch_cdevsw = {
++	.d_open = touch_open, .d_close = touch_close, .d_read = touch_read, .d_write = touch_write,
++	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
++};
++
++void
++liuqin_input_init(void)
++{
++	int major = cdevsw_add(-1, &touch_cdevsw);
++
++	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666,
++	    "liuqin-touch") == NULL) {
++		printf("liuqin-touch: cannot create the device\n");
++	} else {
++		printf("liuqin-touch: /dev/liuqin-touch ready\n");
++	}
++}
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@
+ bsd/dev/liuqin_adreno.c			standard
+ bsd/dev/liuqin_sample.c			standard
+ bsd/dev/liuqin_touch.c			standard
++bsd/dev/liuqin_input.c			standard
+ bsd/dev/liuqin_usb.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+--- a/bsd/dev/liuqin_ufs.c
++++ b/bsd/dev/liuqin_ufs.c
+@@ -21,6 +21,7 @@
+ #if defined(ARM64_BOARD_CONFIG_LIUQIN)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/liuqin_input.h>
+ #include <sys/buf.h>
+ #include <sys/conf.h>
+ #include <sys/disk.h>
+@@ -1802,6 +1803,7 @@
+ 	liuqin_fw_load();
+ 	liuqin_boot_mark("firmware area loaded");
+ 	liuqin_adreno_init();
++	liuqin_input_init();
+ 	liuqin_boot_mark("gpu ladder done");
+ 	if (liuqin_adreno_services_start) {
+ 		liuqin_adreno_services_start();
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -35,6 +35,7 @@
+ #if defined(ARM64_BOARD_CONFIG_LIUQIN)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/liuqin_input.h>
+ #include <sys/kernel.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+@@ -2240,6 +2241,8 @@
+  * (id << 3 | event, x high, y high, x low nibble << 4 | y low nibble,
+  * weight, pressure).  Finger ids are 1-based and become HID slots 0..9.
+  * Returns how many fingers the frame reports. */
++static uint32_t tch_last_x[NVT_MAX_FINGERS], tch_last_y[NVT_MAX_FINGERS];
++
+ static int
+ tch_frame_decode(const uint8_t *frame, bool *down)
+ {
+@@ -2290,10 +2293,21 @@
+ 		}
+ 		mask |= 1u << (id - 1);
+ 		liuqin_hid_touch((int)id - 1, 1, (int)sx, (int)sy);
++		/* The userland injector wants display-normalised samples. */
++		{
++			uint32_t nx = (uint32_t)((uint64_t)sx * 65535u / (NVT_TOUCH_W - 1));
++			uint32_t ny = (uint32_t)((uint64_t)sy * 65535u / (NVT_TOUCH_H - 1));
++
++			liuqin_touch_post(down[id - 1] ? LIUQIN_TOUCH_MOVE : LIUQIN_TOUCH_DOWN,
++			    id - 1, nx, ny);
++			tch_last_x[id - 1] = nx;
++			tch_last_y[id - 1] = ny;
++		}
+ 	}
+ 	for (int slot = 0; slot < NVT_MAX_FINGERS; slot++) {
+ 		if (down[slot] && !(mask & (1u << slot))) {
+ 			liuqin_hid_touch(slot, 0, 0, 0);
++			liuqin_touch_post(LIUQIN_TOUCH_UP, slot, tch_last_x[slot], tch_last_y[slot]);
+ 		}
+ 		down[slot] = (mask & (1u << slot)) != 0;
+ 	}

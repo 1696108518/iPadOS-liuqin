@@ -1,0 +1,17 @@
+--- a/bsd/dev/liuqin_ufs.c
++++ b/bsd/dev/liuqin_ufs.c
+@@ -2005,9 +2005,13 @@
+ 	printf("LIUQIN LOG: console log to the last %u KiB of the partition (block 0x%llx)\n",
+ 	    LIUQIN_LOG_BLOCKS * UFS_BLOCK >> 10, base);
+ 	for (;;) {
+-		(void)tsleep(&liuqin_log_chan, PZERO, "liuqinlog", hz * (int)liuqin_log_secs);
+ 		uint64_t total = os_atomic_load(&liuqin_log_total, relaxed);
+ 		if (total == flushed) {
++			/* Nothing new: wait for the next period (the first pass
++			 * writes immediately, so a panic a second after the root
++			 * is up still leaves its console on the partition). */
++			(void)tsleep(&liuqin_log_chan, PZERO, "liuqinlog",
++			    hz * (int)liuqin_log_secs);
+ 			continue;
+ 		}
+ 		uint64_t pos = total - flushed >= LIUQIN_LOG_SIZE ? total - LIUQIN_LOG_SIZE : flushed;

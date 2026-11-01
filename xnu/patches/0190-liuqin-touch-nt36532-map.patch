@@ -1,0 +1,211 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -283,10 +283,10 @@
+  * nabu harness used; on this part it answers 0xff. */
+ #define NVT_CHIP_VER_TRIM_ADDR  0x1fb104u
+ #define NVT_CHIP_VER_TRIM_NABU  0x3f004u
+-#define NVT_EVENT_BUF_ADDR      0x2fe00u
++#define NVT_EVENT_BUF_ADDR      0x125800u      /* NT36532: vendor map[0] */
+ /* The vendor trim table lists the chip-info page at 0x1f64e for this part;
+  * 0x2fe78 was the nabu harness's event-buffer offset. */
+-#define NVT_FWINFO_ADDR         0x1f64eu
++#define NVT_FWINFO_ADDR         0x125878u      /* event buffer + 0x78 */
+ #define NVT_MAX_FINGERS         10
+ #define NVT_POINT_LEN           65             /* event byte + 10 x 6 + 4 */
+ #define NVT_BUF_MAX             176
+@@ -1170,21 +1170,34 @@
+  */
+ /* Cascade part: NT36523-family map.  The 0x1f1xx/0x1f6xx addresses belong to
+  * NT36525/NT36772 and never woke this chip. */
+-#define NVT_BOOT_RDY_ADDR       0x3f10du
+-#define NVT_TX_AUTO_COPY_EN     0x3f7e8u
+-#define NVT_SPI_DMA_TX_INFO     0x3f7f1u
+-#define NVT_EVENT_BASE          0x2fe00u        /* NT36523 map */
+-#define NVT_EVENT_BASE_N        0x2fd00u        /* NT36523N map - polled too */
+-#define NVT_BLD_ILM_DES         0x3f128u
+-#define NVT_BLD_DLM_DES         0x3f12cu
+-#define NVT_BLD_ILM_LEN         0x3f118u
+-#define NVT_BLD_DLM_LEN         0x3f130u
+-#define NVT_BLD_ILM_GCRC        0x3f100u
+-#define NVT_BLD_DLM_GCRC        0x3f104u
+-#define NVT_BLD_ILM_RCRC        0x3f120u        /* computed by the bootloader */
+-#define NVT_BLD_DLM_RCRC        0x3f124u
+-#define NVT_BLD_CRC_EN          0x3f30eu
+-#define NVT_BLD_CRC_FLAGS       0x3f133u        /* done | ilm | dlm */
++/*
++ * The NT36532 has its own map.  Everything in the 0x3Fxxx block that the
++ * NT36523 family uses (and that this driver used until touch41) does not exist
++ * here: the part answers 0xff for those addresses, which is exactly what the
++ * descriptor read-back showed.  These values come from the vendor module
++ * itself (TWRP device tree, nt36532_touch.ko, NT36532_cascade_memory_map) and
++ * were checked against the offsets the module's own code reads:
++ *   boot_ready reads map+132/+136, tx_auto_copy +140, check_spi_dma_tx_info
++ *   +144, the descriptor writer +164/+152/+172 and +168/+156/+176, and the crc
++ *   reader +192 and +172/+176/+180/+184.
++ */
++#define NVT_BOOT_RDY_ADDR       0x1fb50du      /* map+132 */
++#define NVT_TX_AUTO_COPY_EN     0x1fc925u      /* map+140 */
++#define NVT_TX_AUTO_COPY_VAL    0x56u           /* hw_crc == 2 in the vendor module */
++#define NVT_SPI_DMA_TX_INFO     0x1fc914u      /* map+144 */
++#define NVT_SW_RESET_ADDR       0x1fb43eu      /* swrst_sif, vendor dmesg */
++#define NVT_EVENT_BASE          0x125800u      /* map[0] */
++#define NVT_EVENT_RESET_STATE   (NVT_EVENT_BASE + 0x60u)
++#define NVT_EVENT_HOST_CMD      (NVT_EVENT_BASE + 0xd0u)
++#define NVT_BLD_ILM_DES         0x1fb528u      /* map+164 */
++#define NVT_BLD_DLM_DES         0x1fb52cu      /* map+168 */
++#define NVT_BLD_ILM_LEN         0x1fb518u      /* map+152 */
++#define NVT_BLD_DLM_LEN         0x1fb530u      /* map+156 */
++#define NVT_BLD_ILM_GCRC        0x1fb500u      /* map+172 */
++#define NVT_BLD_DLM_GCRC        0x1fb504u      /* map+176 */
++#define NVT_BLD_ILM_RCRC        0x1fb520u      /* map+180 */
++#define NVT_BLD_DLM_RCRC        0x1fb524u      /* map+184 */
++#define NVT_BLD_CRC_FLAGS       0x1fb533u      /* map+192: done | ilm | dlm */
+ #define NVT_FW_CHUNK            0xfc00u
+ 
+ static uint32_t
+@@ -1347,11 +1360,10 @@
+ static bool
+ tch_fw_state_ready(void)
+ {
+-	uint8_t a = 0, b = 0;
++	uint8_t a = 0;
+ 
+-	(void)tch_nvt_read(NVT_EVENT_BASE + 0x60, &a, 1);
+-	(void)tch_nvt_read(NVT_EVENT_BASE_N + 0x60, &b, 1);
+-	return (a >= 0xa0 && a <= 0xaf) || (b >= 0xa0 && b <= 0xaf);
++	(void)tch_nvt_read(NVT_EVENT_RESET_STATE, &a, 1);
++	return a >= 0xa0 && a <= 0xaf;
+ }
+ 
+ /* The decisive "did the data land" read from nvt_read_bld_hw_crc(): the
+@@ -1398,7 +1410,7 @@
+ 	uint32_t ilm_sram, ilm_len, ilm_crc, dlm_sram, dlm_len, dlm_crc;
+ 	uint32_t written = 0, chunks = 0;
+ 	uint32_t saved_pace, txinfo, polls, boot_polls, secs;
+-	uint8_t boot_a = 0, boot_b = 0;
++	uint8_t boot_a = 0;
+ 	bool cascade, spi_dma, have_header = false, ready = false;
+ 	unsigned sec_done = 0;
+ 	uint64_t t0;
+@@ -1435,10 +1447,11 @@
+ 	tch.bb_pace_us = 2;
+ 	t0 = mach_absolute_time();
+ 
+-	(void)tch_nvt_write8(0x00000, 0x69);            /* bootloader reset */
++	/* nvt_bootloader_reset(): 0x69 to the software-reset register (0x1fb43e on
++	 * this part, the vendor's swrst_sif address) - 0x00000, which the
++	 * NT36523-family flow uses, is not it. */
++	(void)tch_nvt_write8(NVT_SW_RESET_ADDR, 0x69);
+ 	delay(35 * 1000);
+-	/* cascade: nvt_tx_auto_copy_mode() before feeding the SRAM */
+-	(void)tch_nvt_write8(NVT_TX_AUTO_COPY_EN, 0x69);
+ 
+ 	/* nvt_set_bld_hw_crc(): the auto-copy engine needs destination, length and
+ 	 * golden checksum for ILM (part 0) and DLM (part 1). */
+@@ -1452,6 +1465,10 @@
+ 	    NVT_BLD_ILM_GCRC, ilm_crc);
+ 	tch_fw_bld_bank(NVT_BLD_DLM_DES, dlm_sram, NVT_BLD_DLM_LEN, dlm_len,
+ 	    NVT_BLD_DLM_GCRC, dlm_crc);
++	/* nvt_tx_auto_copy_mode(): after the descriptors, like the vendor module.
++	 * hw_crc == 2 on this part writes 0x56, not the 0x69 of the hw_crc == 1
++	 * parts. */
++	(void)tch_nvt_write8(NVT_TX_AUTO_COPY_EN, NVT_TX_AUTO_COPY_VAL);
+ 	/* The descriptor registers read back, so a broken register write path
+ 	 * shows up before the two-minute transfer instead of after it. */
+ 	printf("LIUQIN TOUCH: fw dl bld: ilm des 0x%06x len 0x%06x | dlm des 0x%06x len 0x%06x\n",
+@@ -1556,15 +1573,13 @@
+ 		tch_visible_mark(mark);
+ 	}
+ 
+-	/* nvt_bld_crc_enable(): read-modify-write bit 7 of BLD_CRC_EN */
+-	{
+-		uint8_t en = 0;
+-
+-		(void)tch_nvt_read(NVT_BLD_CRC_EN, &en, 1);
+-		en |= 0x80;
+-		tch_fw_reg_write(NVT_BLD_CRC_EN, NVT_BLD_CRC_EN, &en, 1);
+-	}
+ 	/*
++	 * No nvt_bld_crc_enable() here: the vendor's own NT36532 download path
++	 * never writes a BLD CRC enable register (its nvt_update_firmware only
++	 * touches the descriptor, length, checksum and flag registers), and the
++	 * NT36523 family's 0x3f30e is not implemented on this part.
++	 */
++	/*
+ 	 * nvt_fw_crc_enable(): clear the reset status, then send the host
+ 	 * command that enables the firmware CRC.  The cascade parts use 7- and
+ 	 * 3-byte writes (the reset status is a six-byte record); the older ones
+@@ -1577,14 +1592,14 @@
+ 		static const uint8_t crc_cmd1[1] = { 0xae };
+ 
+ 		if (cascade) {
+-			tch_fw_reg_write(NVT_EVENT_BASE, NVT_EVENT_BASE + 0x60,
++			tch_fw_reg_write(NVT_EVENT_BASE, NVT_EVENT_RESET_STATE,
+ 			    clr, sizeof(clr));
+-			tch_fw_reg_write(NVT_EVENT_BASE, NVT_EVENT_BASE + 0x50,
++			tch_fw_reg_write(NVT_EVENT_BASE, NVT_EVENT_HOST_CMD,
+ 			    crc_cmd, sizeof(crc_cmd));
+ 		} else {
+-			tch_fw_reg_write(NVT_EVENT_BASE, NVT_EVENT_BASE + 0x60,
++			tch_fw_reg_write(NVT_EVENT_BASE, NVT_EVENT_RESET_STATE,
+ 			    clr1, sizeof(clr1));
+-			tch_fw_reg_write(NVT_EVENT_BASE, NVT_EVENT_BASE + 0x50,
++			tch_fw_reg_write(NVT_EVENT_BASE, NVT_EVENT_HOST_CMD,
+ 			    crc_cmd1, sizeof(crc_cmd1));
+ 		}
+ 	}
+@@ -1597,18 +1612,14 @@
+ 	(void)tch_nvt_write8(NVT_BOOT_RDY_ADDR, 1);
+ 	delay(5 * 1000);
+ 
+-	/* nvt_check_fw_reset_state(RESET_STATE_INIT): 0xa0..0xaf at the reset
+-	 * status.  Both cascade event buffers are polled because the vendor map
+-	 * for this part is the one thing we never got from the TWRP dump. */
++	/* nvt_check_fw_reset_state(RESET_STATE_INIT): 0xa0..0xaf at
++	 * EVENT_BUF_ADDR | 0x60, which on this part is 0x125860. */
+ 	for (boot_polls = 0; boot_polls < 20; boot_polls++) {
+-		uint8_t a[2] = { 0 }, b[2] = { 0 };
++		uint8_t a[2] = { 0 };
+ 
+-		(void)tch_nvt_read(NVT_EVENT_BASE + 0x60, a, 1);
+-		(void)tch_nvt_read(NVT_EVENT_BASE_N + 0x60, b, 1);
++		(void)tch_nvt_read(NVT_EVENT_RESET_STATE, a, 1);
+ 		boot_a = a[0];
+-		boot_b = b[0];
+-		if ((boot_a >= 0xa0 && boot_a <= 0xaf) ||
+-		    (boot_b >= 0xa0 && boot_b <= 0xaf)) {
++		if (boot_a >= 0xa0 && boot_a <= 0xaf) {
+ 			ready = true;
+ 			break;
+ 		}
+@@ -1630,10 +1641,9 @@
+ 	 * the screen, where the muted console does not. */
+ 	tch_visible_mark(ready ? "touch fw BOOTED" : "touch fw did not boot");
+ 	printf("LIUQIN TOUCH: fw dl %s: %u B %u chunks %u s, txinfo 0x%02x@%u, "
+-	    "crc post 0x%02x ilm %08x dlm %08x, state 0x%02x@2fe60 0x%02x@2fd60 %u polls\n",
++	    "crc post 0x%02x ilm %08x dlm %08x, state 0x%02x@125860 %u polls\n",
+ 	    ready ? "BOOTED" : "did not boot", written, chunks, secs, txinfo, polls,
+-	    tch_fw_crc.flags, tch_fw_crc.ilm, tch_fw_crc.dlm, boot_a, boot_b,
+-	    boot_polls);
++	    tch_fw_crc.flags, tch_fw_crc.ilm, tch_fw_crc.dlm, boot_a, boot_polls);
+ 	return ready ? 0 : -1;
+ }
+ 
+@@ -1642,13 +1652,11 @@
+ static void
+ tch_fw_state(void)
+ {
+-	uint8_t a = 0, b = 0;
++	uint8_t a = 0;
+ 
+-	(void)tch_nvt_read(NVT_EVENT_BASE + 0x60, &a, 1);
+-	(void)tch_nvt_read(NVT_EVENT_BASE_N + 0x60, &b, 1);
+-	printf("LIUQIN TOUCH: fw state 0x%02x @0x2fe60, 0x%02x @0x2fd60 (%s)\n",
+-	    a, b, ((a >= 0xa0 && a <= 0xaf) || (b >= 0xa0 && b <= 0xaf)) ?
+-	    "running" : "not ready");
++	(void)tch_nvt_read(NVT_EVENT_RESET_STATE, &a, 1);
++	printf("LIUQIN TOUCH: fw state 0x%02x @0x125860 (%s)\n",
++	    a, (a >= 0xa0 && a <= 0xaf) ? "running" : "not ready");
+ }
+ 
+ static void

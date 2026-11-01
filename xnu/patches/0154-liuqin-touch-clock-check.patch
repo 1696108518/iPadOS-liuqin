@@ -1,0 +1,13 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -159,7 +159,9 @@
+ 	}
+ 
+ 	/* --- SE4: only when its clocks are up, otherwise the bus would hang. --- */
+-	const bool clocked = (cbcr & (QUP_CBCR_M_AHB | QUP_CBCR_CORE | QUP_CBCR_CORE_2X | QUP_CBCR_S4)) ==
++	/* Re-read: stage 2 may just have switched the engine on. */
++	const uint32_t now = tch_rd(gcc, GCC_QUPV3_WRAP0_CBCR);
++	const bool clocked = (now & (QUP_CBCR_M_AHB | QUP_CBCR_CORE | QUP_CBCR_CORE_2X | QUP_CBCR_S4)) ==
+ 	    (QUP_CBCR_M_AHB | QUP_CBCR_CORE | QUP_CBCR_CORE_2X | QUP_CBCR_S4);
+ 	if (!clocked) {
+ 		printf("LIUQIN TOUCH: SE4 not clocked, registers not read\n");

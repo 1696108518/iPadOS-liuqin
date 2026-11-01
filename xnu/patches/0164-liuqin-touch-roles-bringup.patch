@@ -1,0 +1,183 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -588,6 +588,7 @@
+ }
+ 
+ static int tch_xfer(const uint8_t *tx, uint8_t *rx, size_t len);
++static void tch_nvt_bringup(void);
+ static void liuqin_touch_reports_start(void);
+ 
+ /* liuqin_boot_mark() clears liuqin_console_force when it returns, so inside a
+@@ -964,54 +965,142 @@
+ static int
+ tch_bitbang_start(void)
+ {
+-	static const uint32_t data_pins[3] = { 16, 17, 18 };
++	static const uint32_t pads[4] = { 16, 17, 18, 19 };
+ 	static const uint8_t perm[6][3] = {
+ 		{ 0, 1, 2 }, { 0, 2, 1 }, { 1, 0, 2 },
+ 		{ 1, 2, 0 }, { 2, 0, 1 }, { 2, 1, 0 },
+ 	};
+-	uint8_t id[6];
++	unsigned combos = 0;
+ 
+ 	tch.bb_pace_us = 5;                             /* ~100 kHz, very forgiving */
+ 	(void)PE_parse_boot_argn("liuqintouchpace", &tch.bb_pace_us, sizeof(tch.bb_pace_us));
+ 	if (tch.bb_pace_us > 1000) {
+ 		tch.bb_pace_us = 1000;
+ 	}
+-	tch.pin_cs = 19;
+-	tch_bb_dir(tch.pin_cs, true, 1);                /* chip select deasserted */
+ 	tch.bitbang = true;
+ 	tch.cs_manual = true;
+ 	tch_bb_selftest();
+ 
+-	for (unsigned p = 0; p < 6; p++) {
+-		tch.pin_clk = data_pins[perm[p][0]];
+-		tch.pin_mosi = data_pins[perm[p][1]];
+-		tch.pin_miso = data_pins[perm[p][2]];
+-		tch_bb_dir(tch.pin_clk, true, 0);
+-		tch_bb_dir(tch.pin_mosi, true, 0);
+-		tch_bb_dir(tch.pin_miso, false, 0);
+-		memset(id, 0, sizeof(id));
+-		uint8_t fw[16] = { 0 };
+-		const int err = tch_nvt_read(NVT_CHIP_VER_TRIM_ADDR, id, sizeof(id));
+-		const int err2 = tch_nvt_read(NVT_FWINFO_ADDR, fw, sizeof(fw));
+-		const bool id_ok = err == 0 && id[3] == 0x65 && id[4] == 0x03;
+-		const bool fw_ok = err2 == 0 && (uint8_t)(fw[0] + fw[1]) == 0xff;
+-
+-		printf("LIUQIN TOUCH: bitbang %u: clk gpio%u mosi gpio%u miso gpio%u -> "
+-		    "%02x %02x %02x %02x %02x %02x | fw %02x %02x %02x %02x%s\n",
+-		    p, tch.pin_clk, tch.pin_mosi, tch.pin_miso,
+-		    id[0], id[1], id[2], id[3], id[4], id[5],
+-		    fw[0], fw[1], fw[2], fw[3],
+-		    (err != 0 || err2 != 0) ? " (read failed)" : "");
+-		if (id_ok || fw_ok) {
+-			printf("LIUQIN TOUCH: bit-banged SPI: clk gpio%u mosi gpio%u miso gpio%u cs gpio%u\n",
+-			    tch.pin_clk, tch.pin_mosi, tch.pin_miso, tch.pin_cs);
+-			return 0;
++	/*
++	 * Neither the device tree nor the SoC's pin list says which pad carries
++	 * which SPI signal, so try every role: each of the four pads can be the
++	 * chip select, and the other three take the six clk/mosi/miso orders.
++	 * 24 assignments, each a trim-id and FWINFO read at ~100 kHz.
++	 */
++	for (unsigned cs = 0; cs < 4; cs++) {
++		uint32_t data[3];
++		unsigned n = 0;
++
++		tch.pin_cs = pads[cs];
++		tch_bb_dir(tch.pin_cs, true, 1);            /* deasserted */
++		for (unsigned i = 0; i < 4; i++) {
++			if (i != cs) {
++				data[n++] = pads[i];
++			}
+ 		}
+-	}
+-	printf("LIUQIN TOUCH: no pad assignment answered with a Novatek id\n");
++		for (unsigned p = 0; p < 6; p++) {
++			uint8_t id[6] = { 0 };
++			uint8_t fw[16] = { 0 };
++
++			tch.pin_clk = data[perm[p][0]];
++			tch.pin_mosi = data[perm[p][1]];
++			tch.pin_miso = data[perm[p][2]];
++			tch_bb_dir(tch.pin_clk, true, 0);
++			tch_bb_dir(tch.pin_mosi, true, 0);
++			tch_bb_dir(tch.pin_miso, false, 0);
++			const int err = tch_nvt_read(NVT_CHIP_VER_TRIM_ADDR, id, sizeof(id));
++			const int err2 = tch_nvt_read(NVT_FWINFO_ADDR, fw, sizeof(fw));
++			const bool id_ok = err == 0 && id[3] == 0x65 && id[4] == 0x03;
++			const bool fw_ok = err2 == 0 && (uint8_t)(fw[0] + fw[1]) == 0xff;
++
++			combos++;
++			printf("LIUQIN TOUCH: bitbang %u: cs gpio%u clk gpio%u mosi gpio%u miso gpio%u -> "
++			    "%02x %02x %02x %02x %02x %02x | fw %02x %02x %02x %02x%s\n",
++			    combos, tch.pin_cs, tch.pin_clk, tch.pin_mosi, tch.pin_miso,
++			    id[0], id[1], id[2], id[3], id[4], id[5],
++			    fw[0], fw[1], fw[2], fw[3],
++			    (err != 0 || err2 != 0) ? " (read failed)" : "");
++			if (id_ok || fw_ok) {
++				printf("LIUQIN TOUCH: bit-banged SPI: cs gpio%u clk gpio%u mosi gpio%u miso gpio%u\n",
++				    tch.pin_cs, tch.pin_clk, tch.pin_mosi, tch.pin_miso);
++				return 0;
++			}
++		}
++	}
++	printf("LIUQIN TOUCH: none of the %u pad assignments answered with a Novatek id\n", combos);
++
++	/*
++	 * The controller may simply be sitting in whatever state the bootloader
++	 * left it in.  gpio16 is the one pad held low by something external, so
++	 * it is the likely MISO; clock on gpio17 and MOSI on gpio18 then.  Send
++	 * the vendor bring-up once and re-probe that assignment.
++	 */
++	printf("LIUQIN TOUCH: trying the vendor bring-up on cs19 clk17 mosi18 miso16\n");
++	tch.pin_cs = 19;
++	tch_bb_dir(tch.pin_cs, true, 1);
++	tch.pin_clk = 17;
++	tch.pin_mosi = 18;
++	tch.pin_miso = 16;
++	tch_bb_dir(tch.pin_clk, true, 0);
++	tch_bb_dir(tch.pin_mosi, true, 0);
++	tch_bb_dir(tch.pin_miso, false, 0);
++	tch_nvt_bringup();
++
++	uint8_t id[6] = { 0 };
++	uint8_t fw[16] = { 0 };
++	(void)tch_nvt_read(NVT_CHIP_VER_TRIM_ADDR, id, sizeof(id));
++	(void)tch_nvt_read(NVT_FWINFO_ADDR, fw, sizeof(fw));
++	printf("LIUQIN TOUCH: after bring-up: %02x %02x %02x %02x %02x %02x | fw %02x %02x %02x %02x\n",
++	    id[0], id[1], id[2], id[3], id[4], id[5], fw[0], fw[1], fw[2], fw[3]);
++	if ((id[3] == 0x65 && id[4] == 0x03) || (uint8_t)(fw[0] + fw[1]) == 0xff) {
++		printf("LIUQIN TOUCH: controller answered after the bring-up\n");
++		return 0;
++	}
++	printf("LIUQIN TOUCH: controller still silent after the bring-up\n");
+ 	return -1;
+ }
+ 
++/* Novatek write: page, then the address with bit 7 set and the data. */
++static int
++tch_nvt_write8(uint32_t addr, uint8_t val)
++{
++	uint8_t page[3];
++	uint8_t tx[2];
++	int err;
++
++	page[0] = 0xff;
++	page[1] = (uint8_t)((addr >> 15) & 0xff);
++	page[2] = (uint8_t)((addr >> 7) & 0xff);
++	tx[0] = (uint8_t)((addr & 0x7f) | 0x80);
++	tx[1] = val;
++	if (tch_cs(true) != 0) {
++		return -1;
++	}
++	err = tch_xfer(page, NULL, sizeof(page));
++	if (err == 0) {
++		err = tch_xfer(tx, NULL, sizeof(tx));
++	}
++	if (tch_cs(false) != 0) {
++		err = -1;
++	}
++	return err;
++}
++
++/* The vendor driver's bring-up, in its order: bootloader reset, software reset
++ * to idle, unlock.  It is what it does before trusting the bus when the id does
++ * not match, and the NT36532 answers it from ROM even when the RAM firmware is
++ * not running. */
++static void
++tch_nvt_bringup(void)
++{
++	(void)tch_nvt_write8(0x00000, 0x69);            /* bootloader reset */
++	delay(40 * 1000);
++	(void)tch_nvt_write8(0x00000, 0xa5);            /* software reset idle */
++	delay(20 * 1000);
++	(void)tch_nvt_write8(0x00000, 0x35);            /* unlock */
++	delay(20 * 1000);
++}
++
+ static const char *
+ tch_chip_name(const uint8_t id[6])
+ {

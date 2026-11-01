@@ -1,0 +1,155 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -2138,23 +2138,34 @@
+ 
+ 	uint8_t fw[16] = { 0 };
+ 	if (tch_nvt_read(NVT_FWINFO_ADDR, fw, sizeof(fw)) == 0) {
++		/*
++		 * This map puts the panel geometry somewhere other than fw[4..7]
++		 * (they read 0x4650/0x7800 here), but the version byte and its
++		 * complement and the 38/60 sensor counts are exactly where the
++		 * acceptance values in docs/TOUCH_FW_RE.md say they are, so that
++		 * is the validity test; the report space stays the panel size.
++		 */
+ 		const uint32_t max_x = ((uint32_t)fw[4] << 8) | fw[5];
+ 		const uint32_t max_y = ((uint32_t)fw[6] << 8) | fw[7];
+-		const bool sane = ((fw[0] + fw[1]) & 0xff) == 0xff &&
+-		    max_x > 0 && max_y > 0 && max_x <= 4096 && max_y <= 4096;
++		const bool ver_ok = ((fw[0] + fw[1]) & 0xff) == 0xff;
++		const bool geom_ok = max_x > 0 && max_y > 0 &&
++		    max_x <= 4096 && max_y <= 4096;
++		const bool num_ok = fw[2] > 0 && fw[2] < 200 && fw[3] > 0 && fw[3] < 200;
+ 
+-		if (sane) {
++		if (geom_ok) {
+ 			tch.max_x = max_x;
+ 			tch.max_y = max_y;
+ 		}
+-		valid = fw[0] != 0x00 && fw[0] != 0xff;
++		valid = ver_ok;
+ 		printf("LIUQIN TOUCH: fwinfo %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x "
+-		    "%02x %02x %02x %02x %02x %02x (%s)\n",
++		    "%02x %02x %02x %02x %02x %02x (ver 0x%02x%s, %ux%u sensors,%s geometry)\n",
+ 		    fw[0], fw[1], fw[2], fw[3], fw[4], fw[5], fw[6], fw[7],
+ 		    fw[8], fw[9], fw[10], fw[11], fw[12], fw[13], fw[14], fw[15],
+-		    sane ? "valid" : "broken, using the panel size");
+-		printf("LIUQIN TOUCH: report space %ux%u, %u fingers, %u buttons, chip 0x%02x\n",
+-		    tch.max_x, tch.max_y, fw[9], fw[10], fw[14]);
++		    fw[0], ver_ok ? " ok" : " MISMATCH", fw[2], fw[3],
++		    geom_ok ? " sane" : " using the panel size");
++		printf("LIUQIN TOUCH: report space %ux%u, %u fingers, chip 0x%02x (%s)\n",
++		    tch.max_x, tch.max_y, fw[9], fw[14],
++		    num_ok ? "sensor counts match the panel" : "sensor counts odd");
+ 	} else {
+ 		printf("LIUQIN TOUCH: fwinfo read failed, report space %ux%u\n",
+ 		    tch.max_x, tch.max_y);
+@@ -2288,6 +2299,12 @@
+ 			edge_logs++;
+ 			printf("LIUQIN TOUCH: gpio21 %s (level %u)\n",
+ 			    int_high ? "asserted" : "released", int_high ? 1 : 0);
++			if (edge_logs <= 6) {
++				char mark[24];
++
++				snprintf(mark, sizeof(mark), "touch int %u", int_high ? 1u : 0u);
++				tch_visible_mark(mark);
++			}
+ 		}
+ 		prev_high = int_high;
+ 		if (!saw_gpio) {
+@@ -2330,58 +2347,14 @@
+ 					    block[0], block[1], block[2], block[3],
+ 					    block[4], block[5], block[6], block[7],
+ 					    block[8], block[9], block[10], block[11]);
+-				}
+-			}
+-		}
+-		if ((polls % 10) == 0 && polls < 6000) {
+-			/* Which base holds the report block?  Sample a few
+-			 * candidates and log the first one whose bytes move. */
+-#define TCH_CAND 5
+-			static const uint32_t cand[TCH_CAND] = {
+-				0x1f01au, 0x1f64eu, 0x11a00u, 0x3f004u, 0x2fe00u,
+-			};
+-			static uint8_t prev[TCH_CAND][8];
+-			static bool prev_ok[TCH_CAND];
+-			static unsigned hunt_logs;
+-
+-			for (unsigned c = 0; c < TCH_CAND; c++) {
+-				uint8_t now[8] = { 0 };
+-
+-				if (tch_nvt_read(cand[c], now, sizeof(now)) != 0) {
+-					continue;
+-				}
+-				if (prev_ok[c] && memcmp(prev, now, sizeof(now)) != 0 &&
+-				    hunt_logs < 12) {
+-					hunt_logs++;
+-					printf("LIUQIN TOUCH: cand 0x%05x moved: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+-					    cand[c], now[0], now[1], now[2], now[3],
+-					    now[4], now[5], now[6], now[7]);
+-				}
+-				memcpy(prev[c], now, sizeof(now));
+-				prev_ok[c] = true;
+-			}
+-		}
+-		{
+-			static unsigned alt_logs;
+-			uint8_t alt[NVT_POINT_LEN] = { 0 };
+-
+-			if (tch_nvt_read(0x11a00u, alt, sizeof(alt)) == 0 && alt_logs < 8 &&
+-			    memcmp(alt, last, sizeof(alt)) != 0) {
+-				bool any = false;
+-
+-				for (size_t i = 0; i < sizeof(alt); i++) {
+-					if (alt[i] != 0xff && alt[i] != 0x00) {
+-						any = true;
+-					}
+-				}
+-				if (any) {
+-					alt_logs++;
+-					printf("LIUQIN TOUCH: evt@11a00 %02x %02x %02x %02x %02x %02x %02x %02x\n",
+-					    alt[0], alt[1], alt[2], alt[3],
+-					    alt[4], alt[5], alt[6], alt[7]);
+ 				}
+ 			}
+ 		}
++		/*
++		 * The candidate-address hunt and the 0x11a00 read that used to
++		 * live here were for the NT36523 map; the event buffer of this
++		 * part is 0x125800 (refs/novatek/nt36532_vendor_map.md).
++		 */
+ 		if (tch_nvt_read(NVT_EVENT_BUF_ADDR, frame, sizeof(frame)) != 0) {
+ 			if (errors++ < 4) {
+ 				printf("LIUQIN TOUCH: event read failed (irq 0x%08x dma tx 0x%08x rx 0x%08x)\n",
+@@ -2393,6 +2366,13 @@
+ 			printf("LIUQIN TOUCH: evt data %02x %02x %02x %02x %02x %02x %02x %02x (no record)\n",
+ 			    frame[0], frame[1], frame[2], frame[3],
+ 			    frame[4], frame[5], frame[6], frame[7]);
++			if (evt_logs <= 4) {
++				char mark[32];
++
++				snprintf(mark, sizeof(mark), "touch evt %02x%02x%02x%02x",
++				    frame[0], frame[1], frame[2], frame[3]);
++				tch_visible_mark(mark);
++			}
+ 			memcpy(last, frame, sizeof(frame));
+ 		} else if (tch_frame_valid(frame)) {
+ 			if (memcmp(frame, last, sizeof(frame)) != 0) {
+@@ -2403,6 +2383,18 @@
+ 				memcpy(last, frame, sizeof(frame));
+ 				const int fingers = tch_frame_decode(frame, down);
+ 
++				if (fingers > 0) {
++					static unsigned frame_marks;
++
++					if (frame_marks < 6) {
++						char mark[32];
++
++						frame_marks++;
++						snprintf(mark, sizeof(mark), "touch frame %d", fingers);
++						tch_visible_mark(mark);
++					}
++				}
++
+ 				if (health && !force_poll && fingers > 0) {
+ 					/* A touch arrived without the interrupt line
+ 					 * asserting: wrong pin read, wrong polarity or

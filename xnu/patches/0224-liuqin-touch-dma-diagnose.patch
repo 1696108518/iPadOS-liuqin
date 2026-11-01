@@ -1,0 +1,123 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -1755,8 +1755,105 @@
+ 	err = tch_nvt_read_locked(addr, out, len);
+ 	tch_spi_release();
+ 	return err;
++}
++
++/* gpio16..19 pad levels as a 4-bit mask (bit0 = gpio16).  A pad muxed to qup4
++ * still reports the pin level in TLMM GPIO_IN_OUT bit 0, which is the only way
++ * to see whether the engine's chip select actually reaches the panel. */
++static uint32_t
++tch_pads(void)
++{
++	uint32_t v = 0;
++
++	if (tch.tlmm == 0) {
++		return 0xffffffffu;
++	}
++	for (uint32_t pin = 16; pin <= 19; pin++) {
++		if (tch_rd(tch.tlmm, TLMM_CTL(pin) + TLMM_IN_OUT) & 1u) {
++			v |= 1u << (pin - 16);
++		}
++	}
++	return v;
+ }
++
++/*
++ * Before trusting any panel read, prove the engine's own data path and see
++ * where the chip select lands.  touches 129..153 never separated "the SE
++ * moves bytes correctly" from "the panel hears the SE": a DMA that completes
++ * with tx/rx DMA_DONE says nothing about the pads.  The ROM trim id is the
++ * reference ("20 00 00 32 65 03" on every bit-banged boot), so the last part
++ * walks the two orderings and three clock dividers and keeps the first that
++ * returns it.
++ */
++static void
++tch_dma_diag(void)
++{
++	static const uint8_t pat[4] = { 0x55, 0xaa, 0x0f, 0xf0 };
++	uint8_t got[4] = { 0, 0, 0, 0 };
++	uint32_t idle, cs_on, cs_off;
+ 
++	printf("LIUQIN TOUCH: SE cfg loopback 0x%08x inv 0x%08x trans 0x%08x\n",
++	    tch_rd(tch.se, SE_SPI_LOOPBACK), tch_rd(tch.se, SE_SPI_DEMUX_OUTPUT_INV),
++	    tch_rd(tch.se, SE_SPI_TRANS_CFG));
++	idle = tch_pads();
++	(void)tch_cs(true);
++	cs_on = tch_pads();
++	(void)tch_cs(false);
++	cs_off = tch_pads();
++	printf("LIUQIN TOUCH: pads 16..19 idle 0x%x assert 0x%x release 0x%x "
++	    "(bit0 16/miso, bit1 17/mosi, bit2 18/clk, bit3 19/cs)\n",
++	    idle, cs_on, cs_off);
++
++	tch_wr(tch.se, SE_SPI_LOOPBACK, 1);
++	if (tch_xfer(pat, got, sizeof(pat)) == 0) {
++		printf("LIUQIN TOUCH: SE loopback tx 55 aa 0f f0 rx %02x %02x %02x %02x "
++		    "(%s)\n", got[0], got[1], got[2], got[3],
++		    (got[0] == 0x55 && got[1] == 0xaa && got[2] == 0x0f && got[3] == 0xf0) ?
++		    "byte exact" : "MISMATCH");
++	} else {
++		printf("LIUQIN TOUCH: SE loopback transfer failed\n");
++	}
++	tch_wr(tch.se, SE_SPI_LOOPBACK, 0);
++
++	{
++		static const uint32_t divs[] = { 32, 128, 8 };
++		bool found = false;
++
++		for (unsigned d = 0; d < 3 && !found; d++) {
++			tch.div = divs[d];
++			tch_wr(tch.se, GENI_SER_M_CLK_CFG,
++			    ((tch.div & CLK_DIV_MSK) << CLK_DIV_SHFT) | SER_CLK_EN);
++			for (unsigned order = 0; order < 2 && !found; order++) {
++				uint8_t id[6] = { 0 };
++				const int err = tch_nvt_read(NVT_CHIP_VER_TRIM_ADDR, id,
++				    sizeof(id));
++
++				printf("LIUQIN TOUCH: trim id %s div %u: "
++				    "%02x %02x %02x %02x %02x %02x (%s)\n",
++				    order ? "cmd-first" : "desc-first", divs[d],
++				    id[0], id[1], id[2], id[3], id[4], id[5],
++				    err != 0 ? "read failed" :
++				    (id[4] == 0x65 && id[5] == 0x03) ? "MATCH" : "no match");
++				if (err == 0 && id[4] == 0x65 && id[5] == 0x03) {
++					tch_dma_order = (int)order;
++					found = true;
++				}
++			}
++		}
++		if (!found) {
++			tch.div = 32;
++			tch_wr(tch.se, GENI_SER_M_CLK_CFG,
++			    ((tch.div & CLK_DIV_MSK) << CLK_DIV_SHFT) | SER_CLK_EN);
++			printf("LIUQIN TOUCH: no ordering/clock combination returned the "
++			    "ROM trim id\n");
++		} else {
++			tch.spi_hz = SE_CLK_HZ / tch.div;
++			printf("LIUQIN TOUCH: keeping %s, div %u (%u kHz)\n",
++			    tch_dma_order ? "cmd-first" : "desc-first", tch.div, tch.spi_hz / 1000);
++		}
++	}
++}
++
+ /* Electrical check of the four pads before blaming the controller: drive each
+  * one and read its own pad back, then bias the three data pads — a pad the
+  * chip is driving does not follow the bias, a floating one does. */
+@@ -3133,6 +3230,14 @@
+ 		if (tch_dma_alloc() != 0) {
+ 			return -1;
+ 		}
++		/*
++		 * Only the pad path ever set these: the SE path inherited
++		 * dummy = 0 from the struct, so every read was one byte short and
++		 * one byte early - the framing the pad path needed a dummy byte for.
++		 */
++		tch.dummy = 1;
++		tch.page8 = false;
++		tch_dma_diag();
+ 		tch_visible_mark("touch bus probe");
+ 		if (tch_se_start() != 0) {
+ 			/*

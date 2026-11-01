@@ -1,0 +1,108 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -386,6 +386,8 @@
+  */
+ static unsigned tch_page_dly;           /* us between page write and read */
+ static unsigned tch_cs_dly;             /* us after CS assert before data */
++/* Set once touch165's diag proves the TX-DMA + CPU-RX-FIFO path works. */
++static int tch_rx_via_fifo;
+ 
+ static uint32_t
+ tch_rd(vm_offset_t base, uint32_t off)
+@@ -1459,8 +1461,65 @@
+  * the command first and arms the descriptor behind it.  The default is the
+  * upstream one; liuqintouchdmaorder=0 and the "desc-first" step of the probe
+  * walk select the other without a rebuild.
++ */
++/*
++ * touch164 settled it: with the RX DMA disarmed the RX FIFO fills (wc 2 for an
++ * 8-byte read) and the CPU can read its words, while the RX DMA writes
++ * "10 00 00 00 02 01 aa aa" no matter what.  So TX keeps going through the
++ * engine's DMA - which the wire capture proved byte exact - and the received
++ * bytes are pulled straight out of the FIFO while the command runs, the same
++ * way the FIFO-mode path does it.
+  */
+ static int
++tch_dma_fifo_xfer(const uint8_t *tx, uint8_t *rx, size_t len)
++{
++	const uint32_t cmd = (tx != NULL && rx != NULL) ? SPI_TX_RX :
++	    (tx != NULL ? SPI_TX_ONLY : SPI_RX_ONLY);
++	size_t got = 0;
++	uint32_t irq = 0;
++	unsigned i;
++
++	if (tch.dma == 0 || len == 0 || len > TCH_DMA_MAX) {
++		return -1;
++	}
++	if (tch_rx_via_fifo && rx != NULL) {
++		return tch_dma_fifo_xfer(tx, rx, len);
++	}
++	if (tx != NULL) {
++		tch_dma_put(TCH_DMA_TX_OFF, tx, len);
++	}
++	tch_wr(tch.se, SE_SPI_TX_TRANS_LEN, tx != NULL ? (uint32_t)len : 0);
++	tch_wr(tch.se, SE_SPI_RX_TRANS_LEN, rx != NULL ? (uint32_t)len : 0);
++	tch_dma_mode();
++	tch_wr(tch.se, SE_GENI_M_CMD0, (cmd << M_OPCODE_SHFT) | FRAGMENTATION);
++	/* RX deliberately not armed: the FIFO must keep the bytes. */
++	tch_dma_arm(tx != NULL, false, tch.dma_pa + TCH_DMA_TX_OFF, 0, len);
++
++	for (i = 0; i < 50 * 100; i++) {
++		if (rx != NULL) {
++			tch_drain_rx(rx, len, &got);
++		}
++		irq = tch_status();
++		if (irq & (M_CMD_DONE_EN | TCH_IRQ_ERRS)) {
++			break;
++		}
++		delay(10);
++	}
++	if (rx != NULL) {
++		tch_drain_rx(rx, len, &got);
++	}
++	tch_wr(tch.se, SE_GENI_M_IRQ_CLEAR, irq ? irq : 0xffffffff);
++	tch.last_irq = irq;
++	if ((irq & M_CMD_DONE_EN) == 0 || (irq & TCH_IRQ_ERRS) != 0) {
++		return -1;
++	}
++	if (rx != NULL && got < len) {
++		return -1;
++	}
++	return 0;
++}
++
++static int
+ tch_dma_xfer(const uint8_t *tx, uint8_t *rx, size_t len)
+ {
+ 	const uint64_t tx_pa = tch.dma_pa + TCH_DMA_TX_OFF;
+@@ -2140,6 +2199,30 @@
+ 					tch_wire_capture(false, "readcmd-wm1", cmd8, 8, 1);
+ 					tch_wire_capture(false, "readcmd-attr1", cmd8, 8, 2);
+ 					tch_rx_fifo_test();
++					/* The same read, now with the CPU draining the RX
++					 * FIFO instead of the RX DMA. */
++					{
++						uint8_t id[6] = { 0 };
++						int err;
++						bool hit;
++
++						tch_rx_via_fifo = 1;
++						tch.div = 32;
++						tch_wr(tch.se, GENI_SER_M_CLK_CFG,
++						    (32u << CLK_DIV_SHFT) | SER_CLK_EN);
++						tch_dma_order = 1;
++						err = tch_nvt_read(NVT_CHIP_VER_TRIM_ADDR, id,
++						    sizeof(id));
++						hit = err == 0 && id[4] == 0x65 && id[5] == 0x03;
++						printf("LIUQIN TOUCH: tx-dma + cpu rx fifo: %02x %02x "
++						    "%02x %02x %02x %02x (%s)\n", id[0], id[1],
++						    id[2], id[3], id[4], id[5],
++						    err != 0 ? "read failed" :
++						    hit ? "MATCH - keeping it" : "no match");
++						if (!hit) {
++							tch_rx_via_fifo = 0;
++						}
++					}
+ 				}
+ 				/* The delay matrix failed (all four groups), so the gap is
+ 				 * not the cause - what is left is the clock itself, or the

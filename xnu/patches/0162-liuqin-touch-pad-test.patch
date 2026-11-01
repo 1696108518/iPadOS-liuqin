@@ -1,0 +1,54 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -907,7 +907,43 @@
+ 	}
+ 	return err;
+ }
++
++/* Electrical check of the four pads before blaming the controller: drive each
++ * one and read its own pad back, then bias the three data pads — a pad the
++ * chip is driving does not follow the bias, a floating one does. */
++static void
++tch_bb_selftest(void)
++{
++	static const uint32_t pads[4] = { 16, 17, 18, 19 };
++
++	for (unsigned i = 0; i < 4; i++) {
++		tch_bb_dir(pads[i], true, 0);
++		const int lo = bb_get(pads[i]);
++		tch_bb_dir(pads[i], true, 1);
++		const int hi = bb_get(pads[i]);
+ 
++		printf("LIUQIN TOUCH: pad gpio%u out: drive0 reads %d, drive1 reads %d%s (ctl 0x%08x)\n",
++		    pads[i], lo, hi, (lo == 0 && hi == 1) ? "" : "  <-- does not follow",
++		    tch_rd(tch.tlmm, TLMM_CTL(pads[i])));
++	}
++	for (unsigned i = 0; i < 4; i++) {
++		tch_wr(tch.tlmm, TLMM_CTL(pads[i]), (0u << 2) | (1u << 0) | (2u << 6));  /* pull-down */
++		bb_pace();
++		const int pd = bb_get(pads[i]);
++		tch_wr(tch.tlmm, TLMM_CTL(pads[i]), (0u << 2) | (3u << 0) | (2u << 6));  /* pull-up */
++		bb_pace();
++		const int pu = bb_get(pads[i]);
++
++		printf("LIUQIN TOUCH: pad gpio%u in: pull-down reads %d, pull-up reads %d (%s)\n",
++		    pads[i], pd, pu, (pd == 0 && pu == 1) ? "floating" : "driven");
++	}
++	/* The INT pad is driven by the controller and known to read 0 at rest;
++	 * it is the reference that the input path itself works. */
++	printf("LIUQIN TOUCH: pad gpio21 in: %d (INT, expect 0) io 0x%08x ctl 0x%08x\n",
++	    bb_get(21), tch_rd(tch.tlmm, TLMM_CTL(21) + TLMM_IN_OUT),
++	    tch_rd(tch.tlmm, TLMM_CTL(21)));
++}
++
+ /* Find which pad is the clock, which is MOSI and which is MISO: nothing in the
+  * device tree names the roles, so try the six assignments and keep the one
+  * that answers with a Novatek trim id.  gpio19 is the chip select (the DT's
+@@ -926,6 +962,7 @@
+ 	tch_bb_dir(tch.pin_cs, true, 1);                /* chip select deasserted */
+ 	tch.bitbang = true;
+ 	tch.cs_manual = true;
++	tch_bb_selftest();
+ 
+ 	for (unsigned p = 0; p < 6; p++) {
+ 		tch.pin_clk = data_pins[perm[p][0]];

@@ -1,0 +1,198 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -227,13 +227,19 @@
+ #define M_OPCODE_SHFT           27
+ #define M_PARAMS_MSK            0x07ffffffu
+ 
+-/* GENI_M_CMD0 / M_CMD_CTRL opcodes and params for SPI.  Linux builds the
+- * duplex opcode by OR-ing the two single-direction ones (3), but 3 is not an
+- * opcode in the GENI command table: Qualcomm's own U-Boot GENI SPI driver
+- * sends 7 for a full-duplex FIFO transfer, and so does this driver. */
++/* GENI_M_CMD0 / M_CMD_CTRL opcodes and params for SPI.
++ *
++ * touch166 settled the duplex opcode: Linux's 3 (SPI_TX_ONLY | SPI_RX_ONLY) is
++ * the one this SE accepts - "rx route A1 opcode 3: 20 00 00 32 65 03 (MATCH)"
++ * against "opcode 7: 00 00 02 01 aa aa (no match)" in the same walk, same
++ * clock, same buffers.  Opcode 7 clocks the bytes out correctly (the wire
++ * capture has always matched) but the receive side reports garbage, which is
++ * why twenty rounds blamed the RX DMA, the packing and the pads.  The U-Boot
++ * driver this port copied 7 from is not the firmware in this SE. */
+ #define SPI_TX_ONLY             1u
+ #define SPI_RX_ONLY             2u
+-#define SPI_TX_RX               7u
++#define SPI_DUPLEX              3u
++#define SPI_TX_RX               7u      /* what the vendor firmware wants; wrong here */
+ #define SPI_CS_ASSERT           8u
+ #define SPI_CS_DEASSERT         9u
+ #define FRAGMENTATION           (1u << 2)
+@@ -388,10 +394,10 @@
+ static unsigned tch_cs_dly;             /* us after CS assert before data */
+ /* Set once touch165's diag proves the TX-DMA + CPU-RX-FIFO path works. */
+ static int tch_rx_via_fifo;
+-/* touch166: the opcode used for a duplex transfer.  7 is what the vendor
+- * firmware in this SE was flashed for and what the wire capture saw clock
+- * data out under; 3 is what spi-geni-qcom builds (SPI_TX_ONLY | SPI_RX_ONLY).
+- * Zero selects the default, 7. */
++/* touch166: the opcode used for a duplex transfer.  Zero selects the default,
++ * SPI_DUPLEX (3): touch166's log has the same read returning the ROM trim id
++ * with 3 and garbage with 7.  liuqintouchopcode=7 selects the vendor opcode
++ * again for a comparison boot. */
+ static int tch_opcode;
+ /* True once any engine-side receive route returns the ROM trim id. */
+ static bool tch_rx_ok;
+@@ -399,7 +405,7 @@
+ static uint32_t
+ tch_duplex_opcode(void)
+ {
+-	return (tch_opcode != 0) ? (uint32_t)tch_opcode : SPI_TX_RX;
++	return (tch_opcode != 0) ? (uint32_t)tch_opcode : SPI_DUPLEX;
+ }
+ 
+ static uint32_t
+@@ -2090,7 +2096,7 @@
+ static bool
+ tch_rx_route_test(void)
+ {
+-	static const unsigned opcodes[2] = { 7, 3 };
++	static const unsigned opcodes[2] = { 3, 7 };
+ 	static const uint8_t pat[4] = { 0xde, 0xad, 0xbe, 0xef };
+ 	uint8_t id[6];
+ 	bool ok = false;
+@@ -2113,8 +2119,10 @@
+ 	}
+ 
+ 	/* B: internal loopback.  The engine shifts its own MOSI back in, so the
+-	 * answer is known exactly - 0xde 0xad 0xbe 0xef out, the same back. */
+-	tch_opcode = (int)SPI_TX_RX;
++	 * answer is known exactly - 0xde 0xad 0xbe 0xef out, the same back.
++	 * Only meaningful with a duplex opcode that receives, which is why
++	 * touch166 ran it with 7 and learned nothing: 3 is the default now. */
++	tch_opcode = (int)SPI_DUPLEX;
+ 	tch_wr(tch.se, SE_SPI_LOOPBACK, 1);
+ 	{
+ 		uint8_t rb[4] = { 0 };
+@@ -3887,19 +3895,77 @@
+ 		 */
+ 		tch.dummy = 1;
+ 		tch.page8 = false;
+-		tch_dma_diag();
+-		tch_visible_mark("touch bus probe");
+-		if (!tch_rx_ok) {
++		/*
++		 * touch167: the walk is off by default.  It costs about 78 s of
++		 * boot time and every step of it leaves the sequencer and the panel
++		 * somewhere this driver then has to recover from - touch166 found
++		 * the answer (duplex opcode 3) late in the walk, and the very next
++		 * read still came back ff because the state was gone.  The answer
++		 * is baked in now, so a normal boot is: reset the panel, read the
++		 * trim id, done.  liuqintouchdiag=1 brings the walk back.
++		 */
++		{
++			int diag = 0;
++			int opcode = 0;
++
++			(void)PE_parse_boot_argn("liuqintouchdiag", &diag, sizeof(diag));
++			(void)PE_parse_boot_argn("liuqintouchopcode", &opcode, sizeof(opcode));
++			if (opcode == (int)SPI_TX_RX || opcode == (int)SPI_DUPLEX) {
++				tch_opcode = opcode;
++				printf("LIUQIN TOUCH: liuqintouchopcode=%d, duplex opcode %u\n",
++				    opcode, tch_duplex_opcode());
++			}
++			if (diag) {
++				tch_dma_diag();
++				tch_visible_mark("touch bus probe");
++			}
++		}
++		/* A clean engine and a clean panel: this is the read that decides
++		 * the boot.  The engine is left exactly as the DMA commands want it
++		 * (opcode 3, command before descriptor, 600 kHz) and the panel gets
++		 * the same bring-up sequence the pads path has always used. */
++		tch.cs_manual = true;
++		tch_dma_order = 1;
++		tch.div = 32;
++		tch_wr(tch.se, GENI_SER_M_CLK_CFG,
++		    ((32u & CLK_DIV_MSK) << CLK_DIV_SHFT) | SER_CLK_EN);
++		tch_irq_clear();
++		tch_nvt_bringup();
++		for (unsigned try = 1; try <= 3; try++) {
++			uint8_t id[6] = { 0 };
++
++			tch_rx_ok = tch_nvt_read(NVT_CHIP_VER_TRIM_ADDR, id, sizeof(id)) == 0 &&
++			    id[4] == 0x65 && id[5] == 0x03;
++			printf("LIUQIN TOUCH: engine bring-up %u: %02x %02x %02x %02x %02x %02x "
++			    "(%s, opcode %u)\n", try, id[0], id[1], id[2], id[3], id[4],
++			    id[5], tch_rx_ok ? "panel answered" : "no answer",
++			    tch_duplex_opcode());
++			if (tch_rx_ok) {
++				break;
++			}
++			/* One more reset before giving up on the engine: a panel left
++			 * mid-transfer by the bootloader answers nothing until its
++			 * reset line has been pulsed again. */
++			tch_nvt_bringup();
++			delay(20 * 1000);
++		}
++		if (tch_rx_ok) {
++			printf("LIUQIN TOUCH: SE4 receive is live (duplex opcode %u, "
++			    "div %u, %u kHz)\n", tch_duplex_opcode(), tch.div,
++			    (SE_CLK_HZ / tch.div) / 1000);
++			printf("LIUQIN TOUCH: SE4 running, chip select %s\n",
++			    tch.cs_manual ? "by hand" : "driven by the engine");
++			return 0;
++		}
++		{
+ 			/*
+ 			 * touch166: no engine-side receive route returns the ROM
+-			 * trim id - not the vendor duplex opcode, not Linux's, not
+-			 * the engine's own loopback - while the pads carry the
+-			 * panel's answer byte for byte.  Rather than spend another
+-			 * boot on the receive half, run the whole stack on the pads:
+-			 * the trim id, the firmware download and the frame reads are
+-			 * all proven there, and the upload is the only thing that
+-			 * ever needed the engine's speed.  The pads are selected here
+-			 * and stay selected for the rest of the boot.
++			 * trim id while the pads carry the panel's answer byte for
++			 * byte.  Rather than spend another boot on the receive half,
++			 * run the whole stack on the pads: the trim id, the firmware
++			 * download and the frame reads are all proven there, and the
++			 * upload is the only thing that ever needed the engine's
++			 * speed.  The pads are selected here and stay selected.
+ 			 */
+ 			printf("LIUQIN TOUCH: no engine receive route works, running the "
+ 			    "whole stack on the pads (bit-bang)\n");
+@@ -3931,35 +3997,6 @@
+ 			tch_visible_mark("touch pads rise");
+ 			return 0;
+ 		}
+-		if (tch_se_start() != 0) {
+-			/*
+-			 * The SE may still have a FIFO interface even though the
+-			 * bootloader's RO bit says otherwise - Linux falls back to
+-			 * FIFO in exactly this case when it cannot get a GPI
+-			 * channel.  The DMA attempts above may have wedged the
+-			 * sequencer, so a failure here proves nothing about a clean
+-			 * engine; a success would hand the panel a hardware-timed
+-			 * bus without any DMA at all.
+-			 */
+-			printf("LIUQIN TOUCH: SE DMA path did not start, trying the FIFO "
+-			    "engine once\n");
+-			tch.use_dma = false;
+-			tch.fifo_capable = true;
+-			if (tch_probe_bus("fifo fallback") == 0) {
+-				printf("LIUQIN TOUCH: SE4 FIFO engine works, if_disable was "
+-				    "not the whole story\n");
+-				return 0;
+-			}
+-			tch.fifo_capable = false;
+-			/* The low page did not fix it: keep the boot usable by going
+-			 * back to the pads, and leave the log line that says so. */
+-			printf("LIUQIN TOUCH: SE DMA path did not start, falling back to bit-bang\n");
+-			tch.dma = 0;
+-			return tch_bitbang_start();
+-		}
+-		printf("LIUQIN TOUCH: SE4 running, chip select %s\n",
+-		    tch.cs_manual ? "by hand" : "driven by the engine");
+-		return 0;
+ 	}
+ 
+ 	tch_visible_mark("touch bus probe");

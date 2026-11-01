@@ -1,0 +1,68 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -929,15 +929,37 @@
+ 		page[1] = (uint8_t)((addr >> 15) & 0xff);
+ 		page[2] = (uint8_t)((addr >> 7) & 0xff);
+ 	}
+-	if (tch_xfer(page, NULL, sizeof(page)) == 0) {
+-		memset(tx, 0, len + overhead);
+-		memset(rx, 0, len + overhead);
+-		tx[0] = (uint8_t)(addr & 0x7f);         /* address, read */
+-		if (tch_xfer(tx, rx, len + overhead) == 0) {
+-			memcpy(out, rx + overhead, len);
+-			err = 0;
+-		}
++	/*
++	 * The vendor does this as two SPI messages: nvt_set_page() goes out as
++	 * its own CTP_SPI_WRITE (chip select asserted and released around the
++	 * three bytes) and only then does CTP_SPI_READ send the address.  Keeping
++	 * the page write inside the read's chip-select window leaves the page
++	 * unlatched, and every read then comes from the default page.
++	 */
++	if (tch_cs(true) != 0) {
++		return -1;
++	}
++	err = tch_xfer(page, NULL, sizeof(page));
++	if (tch_cs(false) != 0) {
++		err = -1;
++	}
++	if (err != 0) {
++		return -1;
++	}
++
++	if (tch_cs(true) != 0) {
++		return -1;
++	}
++	memset(tx, 0, len + overhead);
++	memset(rx, 0, len + overhead);
++	tx[0] = (uint8_t)(addr & 0x7f);                 /* address, read */
++	err = tch_xfer(tx, rx, len + overhead);
++	if (tch_cs(false) != 0) {
++		err = -1;
+ 	}
++	if (err == 0) {
++		memcpy(out, rx + overhead, len);
++	}
+ 	if (tch.cs_manual && tch_cs(false) != 0) {
+ 		err = -1;
+ 	}
+@@ -1327,9 +1349,17 @@
+ 		return -1;
+ 	}
+ 	err = tch_xfer(page, NULL, sizeof(page));
+-	if (err == 0) {
+-		err = tch_xfer(tx, NULL, sizeof(tx));
++	if (tch_cs(false) != 0) {
++		err = -1;
++	}
++	if (err != 0) {
++		return -1;
++	}
++
++	if (tch_cs(true) != 0) {
++		return -1;
+ 	}
++	err = tch_xfer(tx, NULL, sizeof(tx));
+ 	if (tch_cs(false) != 0) {
+ 		err = -1;
+ 	}

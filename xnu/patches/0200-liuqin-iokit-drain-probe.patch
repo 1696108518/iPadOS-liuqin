@@ -1,0 +1,19 @@
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -1035,6 +1035,16 @@
+ 	}
+ 
+ 	IOLockUnlock(&lock);
++
++#if defined(ARM64_BOARD_CONFIG_LIUQIN)
++	{
++		IOService *svc = OSDynamicCast(IOService, result);
++
++		IOLog("LIUQIN IOK: notification drain -> %s%s (armed %d)\n",
++		    result ? result->getMetaClass()->getClassName() : "empty",
++		    svc ? svc->getName() : "", armed ? 1 : 0);
++	}
++#endif
+ 
+ 	return result;
+ }

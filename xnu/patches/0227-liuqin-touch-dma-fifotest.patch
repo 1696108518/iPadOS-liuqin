@@ -1,0 +1,83 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -1810,33 +1810,10 @@
+ 	    "(bit0 16/miso, bit1 17/mosi, bit2 18/clk, bit3 19/cs)\n",
+ 	    idle, cs_on, cs_off);
+ 
++	tch_wr(tch.se, SE_SPI_LOOPBACK, 1);
+ 	tch_wr(tch.se, SE_SPI_LOOPBACK, 1);
+ 	printf("LIUQIN TOUCH: loopback reg written 1, reads 0x%08x\n",
+ 	    tch_rd(tch.se, SE_SPI_LOOPBACK));
+-	{
+-		static const uint8_t pat8[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+-		uint8_t got8[8] = { 0 };
+-
+-		if (tch_xfer(pat8, got8, sizeof(pat8)) == 0) {
+-			printf("LIUQIN TOUCH: SE loopback8 tx 01..08 rx %02x %02x %02x %02x "
+-			    "%02x %02x %02x %02x\n", got8[0], got8[1], got8[2], got8[3],
+-			    got8[4], got8[5], got8[6], got8[7]);
+-		} else {
+-			printf("LIUQIN TOUCH: SE loopback8 transfer failed\n");
+-		}
+-	}
+-	/* The same loop through the FIFO path: if this is byte exact and the
+-	 * DMA one is not, the DMA->FIFO delivery (or its start timing) is the
+-	 * fault; if both fail, loopback itself is dead on this engine and only
+-	 * the panel's answers remain as evidence. */
+-	{
+-		uint8_t txb[4] = { 0x11, 0x22, 0x33, 0x44 };
+-		uint8_t rxb[4] = { 0 };
+-		const int ferr = tch_fifo_xfer(txb, rxb, 4);
+-
+-		printf("LIUQIN TOUCH: FIFO loopback %s rx %02x %02x %02x %02x\n",
+-		    ferr == 0 ? "ok" : "failed", rxb[0], rxb[1], rxb[2], rxb[3]);
+-	}
+ 	tch_wr(tch.se, SE_SPI_LOOPBACK, 0);
+ 
+ 	/* CS trace across one full read: the page write and the read are two
+@@ -1903,6 +1880,45 @@
+ 				tch.div = 32;
+ 				tch_wr(tch.se, GENI_SER_M_CLK_CFG,
+ 				    ((tch.div & CLK_DIV_MSK) << CLK_DIV_SHFT) | SER_CLK_EN);
++				/* The FIFO interface feeds the same shift register
++				 * without the DMA engine: if the panel answers this
++				 * path correctly, the shift/clock/CS path is fine and
++				 * the fault is the DMA->FIFO delivery; if it answers
++				 * wrongly too, the shift path itself is broken. */
++				tch.fifo_capable = true;
++				{
++					uint8_t fid[6] = { 0 };
++					const int ferr = tch_nvt_read(NVT_CHIP_VER_TRIM_ADDR,
++					    fid, sizeof(fid));
++
++					printf("LIUQIN TOUCH: FIFO-path trim id %02x %02x %02x "
++					    "%02x %02x %02x (%s)\n", fid[0], fid[1], fid[2],
++					    fid[3], fid[4], fid[5],
++					    ferr != 0 ? "read failed" :
++					    (fid[4] == 0x65 && fid[5] == 0x03) ?
++					    "MATCH" : "no match");
++				}
++				tch.fifo_capable = false;
++				/* Does the page write survive?  Reading with an explicit
++				 * page-0 write vs the real page: if both return the same,
++				 * the TX-only page write is being lost and every read hits
++				 * the default page. */
++				{
++					uint8_t p0[3] = { 0xff, 0x00, 0x00 };
++					uint8_t tx8[8] = { 0 };
++					uint8_t rr[8] = { 0 };
++
++					tx8[0] = (uint8_t)(NVT_CHIP_VER_TRIM_ADDR & 0x7f);
++					(void)tch_cs(true);
++					(void)tch_xfer(p0, NULL, 3);
++					(void)tch_cs(false);
++					(void)tch_cs(true);
++					(void)tch_xfer(tx8, rr, 8);
++					(void)tch_cs(false);
++					printf("LIUQIN TOUCH: page-0 read rx %02x %02x %02x %02x "
++					    "%02x %02x %02x %02x\n", rr[0], rr[1], rr[2], rr[3],
++					    rr[4], rr[5], rr[6], rr[7]);
++				}
+ 				/* Before switching the mux, one raw look at what the
+ 				 * engine captures: the whole RX of an 8-byte read
+ 				 * (skip nothing) and of a 9-byte double-address read -

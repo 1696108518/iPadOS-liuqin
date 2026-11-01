@@ -1,0 +1,58 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -315,6 +315,7 @@
+ 	.cs_manual = true,
+ };
+ static void *liuqin_touch_chan;
++static unsigned tch_dma_count;
+ 
+ static uint32_t
+ tch_rd(vm_offset_t base, uint32_t off)
+@@ -511,6 +512,15 @@
+ 
+ static int tch_xfer(const uint8_t *tx, uint8_t *rx, size_t len);
+ static void liuqin_touch_reports_start(void);
++
++/* liuqin_boot_mark() clears liuqin_console_force when it returns, so inside a
++ * section that wants its lines drawn the flag has to be put back. */
++static void
++tch_visible_mark(const char *what)
++{
++	liuqin_boot_mark(what);
++	liuqin_console_force = 1;
++}
+ 
+ /* What the bootloader left in the engine, and what it looks like after every
+  * step: the first touch4 boot could only tell us "irq 0x2", which is not
+@@ -707,6 +717,13 @@
+ 	}
+ 	tch_wr(tch.se, SE_SPI_TX_TRANS_LEN, tx != NULL ? (uint32_t)len : 0);
+ 	tch_wr(tch.se, SE_SPI_RX_TRANS_LEN, rx != NULL ? (uint32_t)len : 0);
++	if (tch_dma_count < 4) {
++		tch_dma_count++;
++		printf("LIUQIN TOUCH: DMA #%u %s len %u tx 0x%llx rx 0x%llx mode 0x%08x\n",
++		    tch_dma_count, cmd == SPI_TX_RX ? "tx+rx" : (tx != NULL ? "tx" : "rx"),
++		    (unsigned)len, tx != NULL ? tx_pa : 0, rx != NULL ? rx_pa : 0,
++		    tch_rd(tch.se, SE_GENI_DMA_MODE_EN));
++	}
+ 	tch_dma_mode();
+ 	tch_wr(tch.se, SE_GENI_M_CMD0, (cmd << M_OPCODE_SHFT) | FRAGMENTATION);
+ 	if (rx != NULL) {
+@@ -910,7 +927,7 @@
+ 	    "fifo %u byte/word, trans_cfg 0x%08x slave_en 0x%08x\n",
+ 	    tch.spi_hz / 1000, tch.div, tch.bytes_per_fifo_word,
+ 	    tch_rd(tch.se, SE_SPI_TRANS_CFG), tch_rd(tch.se, SE_SPI_SLAVE_EN));
+-	liuqin_boot_mark("touch spi cfg");
++	tch_visible_mark("touch spi cfg");
+ 	tch.fifo_capable = (tch_rd(tch.se, GENI_IF_DISABLE_RO) & FIFO_IF_DISABLE) == 0;
+ 	if (!tch.fifo_capable && tch_dma_alloc() != 0) {
+ 		printf("LIUQIN TOUCH: FIFO interface is disabled (if_disable 0x%08x) "
+@@ -922,7 +939,7 @@
+ 	    tch_rd(tch.se, GENI_IF_DISABLE_RO),
+ 	    tch.fifo_capable ? "the FIFOs" : "SE DMA");
+ 	tch_dump_state("after init");
+-	liuqin_boot_mark("touch bus probe");
++	tch_visible_mark("touch bus probe");
+ 	if (tch_se_start() != 0) {
+ 		return -1;
+ 	}

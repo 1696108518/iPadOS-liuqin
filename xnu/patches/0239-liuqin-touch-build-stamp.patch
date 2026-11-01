@@ -1,0 +1,22 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -314,6 +314,11 @@
+ #define TCH_DMA_RX_OFF          0x4000
+ #define TCH_DMA_MAX             0x3f00
+ #define TCH_DMA_SIZE            (TCH_DMA_RX_OFF + TCH_DMA_MAX)
++
++/* Printed once, before anything else this driver does.  Every log line that
++ * follows can then be attributed to a build without guessing: a log whose
++ * stamp is missing or old is a log from an older image, not a new failure. */
++#define TCH_BUILD               "touch169 dma-late-status+16k-chunks"
+ 
+ /* Novatek NT36xxx SPI protocol (vendor nt36xxx driver, SPI variant). */
+ /* The vendor driver (TWRP's nt36532_touch.ko) reads the trim id at 0x1fb104
+@@ -4777,6 +4782,7 @@
+ 	if (delay_s > 120) {
+ 		delay_s = 120;
+ 	}
++	printf("LIUQIN TOUCH: driver %s\n", TCH_BUILD);
+ 	printf("LIUQIN TOUCH: SPI bring-up in %d s\n", delay_s);
+ 	(void)tsleep(&liuqin_touch_chan, PZERO, "liuqintspi", hz * delay_s);
+ 

@@ -1,0 +1,216 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -388,8 +388,21 @@
+ static unsigned tch_cs_dly;             /* us after CS assert before data */
+ /* Set once touch165's diag proves the TX-DMA + CPU-RX-FIFO path works. */
+ static int tch_rx_via_fifo;
++/* touch166: the opcode used for a duplex transfer.  7 is what the vendor
++ * firmware in this SE was flashed for and what the wire capture saw clock
++ * data out under; 3 is what spi-geni-qcom builds (SPI_TX_ONLY | SPI_RX_ONLY).
++ * Zero selects the default, 7. */
++static int tch_opcode;
++/* True once any engine-side receive route returns the ROM trim id. */
++static bool tch_rx_ok;
+ 
+ static uint32_t
++tch_duplex_opcode(void)
++{
++	return (tch_opcode != 0) ? (uint32_t)tch_opcode : SPI_TX_RX;
++}
++
++static uint32_t
+ tch_rd(vm_offset_t base, uint32_t off)
+ {
+ 	uint32_t v = *(volatile uint32_t *)(base + off);
+@@ -1359,16 +1372,22 @@
+  * SE_GSI_EVENT_EN = 0xf in place, i.e. the sequencer stayed in GSI mode and
+  * handed the command to the GSI block, which has no TRE ring here.
+  *
+- * SE_IRQ_EN stays 0: this port installs no handler for the QUP interrupt line,
+- * and the transfer is polled through SE_DMA_*_IRQ_STAT, LEN_IN and GENI_STATUS,
+- * so routing an interrupt to the CPU can only hurt. */
++ * touch166: SE_IRQ_EN is no longer zero.  spi_geni_init() reaches
++ * geni_se_select_mode(GENI_SE_DMA), and geni_se_select_dma_mode() starts with
++ * geni_se_irq_clear(), which writes 0xffffffff to SE_IRQ_EN and never touches
++ * it again - a Linux SE-DMA transfer therefore runs with every SE interrupt
++ * enable set, DMA_RX_IRQ_EN (bit 0) included.  This port polls and the QUP
++ * line is not enabled at the GIC, so nothing reaches the CPU either way, but
++ * those bits are the engine's own DMA event enables: a receive that moves
++ * bytes while SE_DMA_RX_IRQ_STAT stays 0 is what a cleared DMA_RX_IRQ_EN looks
++ * like from the outside. */
+ static void
+ tch_dma_mode(void)
+ {
+ 	uint32_t v;
+ 
+ 	tch_irq_clear();
+-	tch_wr(tch.se, SE_IRQ_EN, 0);
++	tch_wr(tch.se, SE_IRQ_EN, 0xffffffffu);
+ 	v = tch_rd(tch.se, SE_GENI_M_IRQ_EN);
+ 	tch_wr(tch.se, SE_GENI_M_IRQ_EN, v & ~(M_CMD_DONE_EN |
+ 	    M_TX_FIFO_WATERMARK_EN | M_RX_FIFO_WATERMARK_EN | M_RX_FIFO_LAST_EN));
+@@ -1473,7 +1492,7 @@
+ static int
+ tch_dma_fifo_xfer(const uint8_t *tx, uint8_t *rx, size_t len)
+ {
+-	const uint32_t cmd = (tx != NULL && rx != NULL) ? SPI_TX_RX :
++	const uint32_t cmd = (tx != NULL && rx != NULL) ? tch_duplex_opcode() :
+ 	    (tx != NULL ? SPI_TX_ONLY : SPI_RX_ONLY);
+ 	size_t got = 0;
+ 	uint32_t irq = 0;
+@@ -1524,7 +1543,7 @@
+ {
+ 	const uint64_t tx_pa = tch.dma_pa + TCH_DMA_TX_OFF;
+ 	const uint64_t rx_pa = tch.dma_pa + TCH_DMA_RX_OFF;
+-	const uint32_t cmd = (tx != NULL && rx != NULL) ? SPI_TX_RX :
++	const uint32_t cmd = (tx != NULL && rx != NULL) ? tch_duplex_opcode() :
+ 	    (tx != NULL ? SPI_TX_ONLY : SPI_RX_ONLY);
+ 	uint32_t txst = 0, rxst = 0, irq = 0;
+ 	uint32_t txin = 0, rxin = 0, dbg_mid = 0, txin_mid = 0, rxin_mid = 0;
+@@ -2034,11 +2053,85 @@
+ 		printf("LIUQIN TOUCH: rx fifo word %u = 0x%08x\n", i,
+ 		    tch_rd(tch.se, SE_GENI_RX_FIFOn));
+ 	}
++	/* touch166: the word count after the reads separates "the shifter really
++	 * received zeros" from "the CPU cannot read this FIFO at all".  With
++	 * SE_FIFO_IF_DISABLE set (the bootloader flashed this SE for GSI) the
++	 * FIFO reads return 0 and the count never moves. */
++	wc = tch_rd(tch.se, SE_GENI_RX_FIFO_STATUS) & RX_FIFO_WC_MSK;
++	printf("LIUQIN TOUCH: rx fifo wc after draining: %u (%s)\n", wc,
++	    wc == 0 ? "the words above were the real FIFO contents" :
++	    "the reads drained nothing - CPU FIFO access is disabled");
+ 	(void)tch_cs(false);
+ 	tch_wr(tch.se, SE_GENI_M_IRQ_CLEAR, 0xffffffff);
+ 
+ 	tch.div = 32;
+ 	tch_wr(tch.se, GENI_SER_M_CLK_CFG, ((32u & CLK_DIV_MSK) << CLK_DIV_SHFT) | SER_CLK_EN);
++}
++
++/*
++ * touch166: one place that answers "can this engine receive at all".
++ *
++ * touch165 proved the receive side is the only broken half: the transmit DMA
++ * is byte exact on the wire, the panel answers, and yet every byte the engine
++ * reports as received is zero.  Two things can still be wrong - the pad is not
++ * the serial input the SPI firmware samples, or the engine's receive block is
++ * not enabled - and each has a different test:
++ *
++ *  A. duplex opcode 3 (what spi-geni-qcom builds) instead of 7 (what the
++ *     vendor firmware in this SE was flashed for);
++ *  B. SE_SPI_LOOPBACK, which feeds the engine's own MOSI straight back into
++ *     the receiver and bypasses the pad entirely: if loopback returns our
++ *     pattern, the receive path is good and only the pad is in the way;
++ *  C. the FIFO word count after a drain, printed by tch_rx_fifo_test().
++ *
++ * Returns true when a route returned the ROM trim id, and leaves that route
++ * selected for the rest of the boot.
++ */
++static bool
++tch_rx_route_test(void)
++{
++	static const unsigned opcodes[2] = { 7, 3 };
++	static const uint8_t pat[4] = { 0xde, 0xad, 0xbe, 0xef };
++	uint8_t id[6];
++	bool ok = false;
++	unsigned keep = 0;
++
++	tch_rx_via_fifo = 0;
++	for (unsigned i = 0; i < 2; i++) {
++		memset(id, 0, sizeof(id));
++		tch_opcode = (int)opcodes[i];
++		const int err = tch_nvt_read(NVT_CHIP_VER_TRIM_ADDR, id, sizeof(id));
++
++		printf("LIUQIN TOUCH: rx route A%u opcode %u: %02x %02x %02x %02x %02x %02x "
++		    "(%s)\n", i, opcodes[i], id[0], id[1], id[2], id[3], id[4], id[5],
++		    err != 0 ? "read failed" :
++		    (id[4] == 0x65 && id[5] == 0x03) ? "MATCH" : "no match");
++		if (err == 0 && id[4] == 0x65 && id[5] == 0x03 && !ok) {
++			ok = true;
++			keep = opcodes[i];
++		}
++	}
++
++	/* B: internal loopback.  The engine shifts its own MOSI back in, so the
++	 * answer is known exactly - 0xde 0xad 0xbe 0xef out, the same back. */
++	tch_opcode = (int)SPI_TX_RX;
++	tch_wr(tch.se, SE_SPI_LOOPBACK, 1);
++	{
++		uint8_t rb[4] = { 0 };
++		const int err = tch_dma_xfer(pat, rb, sizeof(pat));
++		const uint32_t irq = tch_rd(tch.se, SE_DMA_RX_IRQ_STAT);
++
++		printf("LIUQIN TOUCH: rx route B loopback tx de ad be ef -> rx %02x %02x %02x "
++		    "%02x (err %d, rx dma irq 0x%08x len_in %u fifo 0x%08x)\n",
++		    rb[0], rb[1], rb[2], rb[3], err, irq,
++		    tch_rd(tch.se, SE_DMA_RX_LEN_IN),
++		    tch_rd(tch.se, SE_GENI_RX_FIFO_STATUS));
++	}
++	tch_wr(tch.se, SE_SPI_LOOPBACK, 0);
++
++	tch_opcode = ok ? (int)keep : 0;
++	tch_rx_ok = ok;
++	return ok;
+ }
+ 
+ /*
+@@ -2073,6 +2166,11 @@
+ 	    tch_rd(tch.se, SE_SPI_LOOPBACK));
+ 	tch_wr(tch.se, SE_SPI_LOOPBACK, 0);
+ 
++	/* touch166: the three-way receive test runs first, because its answer
++	 * decides whether the rest of this walk is worth anything - and because
++	 * it is the only step that can still change the outcome of the boot. */
++	(void)tch_rx_route_test();
++
+ 	/* CS trace across one full read: the page write and the read are two
+ 	 * commands and FRAGMENTATION has to hold the line between them, the way
+ 	 * the pads path keeps CS asserted for the whole window. */
+@@ -3791,6 +3889,48 @@
+ 		tch.page8 = false;
+ 		tch_dma_diag();
+ 		tch_visible_mark("touch bus probe");
++		if (!tch_rx_ok) {
++			/*
++			 * touch166: no engine-side receive route returns the ROM
++			 * trim id - not the vendor duplex opcode, not Linux's, not
++			 * the engine's own loopback - while the pads carry the
++			 * panel's answer byte for byte.  Rather than spend another
++			 * boot on the receive half, run the whole stack on the pads:
++			 * the trim id, the firmware download and the frame reads are
++			 * all proven there, and the upload is the only thing that
++			 * ever needed the engine's speed.  The pads are selected here
++			 * and stay selected for the rest of the boot.
++			 */
++			printf("LIUQIN TOUCH: no engine receive route works, running the "
++			    "whole stack on the pads (bit-bang)\n");
++			tch.dma = 0;
++			tch.use_dma = false;
++			tch.fifo_capable = false;
++			tch.bitbang = true;
++			tch.cs_manual = true;
++			tch.cs_high = false;
++			tch.bb_pace_us = 5;
++			tch.bb_cpol = 0;
++			tch.bb_cpha = 0;
++			tch.dummy = 1;
++			tch.page8 = false;
++			tch.pin_cs = 19;
++			tch.pin_clk = 18;
++			tch.pin_mosi = 17;
++			tch.pin_miso = 16;
++			bb_calibrate();
++			for (uint32_t pin = 16; pin <= 19; pin++) {
++				tch_wr(tch.tlmm, TLMM_CTL(pin),
++				    (0u << 2) | (0u << 0) | (2u << 6));
++			}
++			tch_bb_dir(19, true, 1);
++			tch_bb_dir(18, true, 0);
++			tch_bb_dir(17, true, 0);
++			tch_bb_dir(16, false, 0);
++			tch.div = 32;
++			tch_visible_mark("touch pads rise");
++			return 0;
++		}
+ 		if (tch_se_start() != 0) {
+ 			/*
+ 			 * The SE may still have a FIFO interface even though the

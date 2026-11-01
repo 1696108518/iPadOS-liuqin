@@ -1,0 +1,111 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -1241,7 +1241,59 @@
+ 	}
+ 	return 0;
+ }
++
++/* Register write in the bootloader: page command then [reg | 0x80, data...],
++ * each as its own chip-select transaction (nvt_set_bld_crc_bank and friends). */
++static void
++tch_fw_reg_write(uint32_t page_addr, uint32_t reg_addr, const uint8_t *data, size_t len)
++{
++	uint8_t page[3];
++	uint8_t buf[6];
+ 
++	page[0] = 0xff;
++	page[1] = (uint8_t)((page_addr >> 15) & 0xff);
++	page[2] = (uint8_t)((page_addr >> 7) & 0xff);
++	buf[0] = (uint8_t)((reg_addr & 0x7f) | 0x80);
++	memcpy(buf + 1, data, len);
++	if (tch_cs(true) != 0) {
++		return;
++	}
++	(void)tch_xfer(page, NULL, sizeof(page));
++	if (tch_cs(false) != 0) {
++		return;
++	}
++	if (tch_cs(true) != 0) {
++		return;
++	}
++	(void)tch_xfer(buf, NULL, len + 1);
++	(void)tch_cs(false);
++}
++
++/* ILM/DLM descriptors the cascade auto-copy engine needs before it will move
++ * the image: destination, length and golden checksum per section. */
++static void
++tch_fw_bld_bank(uint32_t des_addr, uint32_t sram, uint32_t len_addr,
++    uint32_t size, uint32_t cksum_addr, uint32_t crc)
++{
++	uint8_t v[4];
++
++	v[0] = (uint8_t)(sram & 0xff);
++	v[1] = (uint8_t)((sram >> 8) & 0xff);
++	v[2] = (uint8_t)((sram >> 16) & 0xff);
++	tch_fw_reg_write(des_addr, des_addr, v, 3);
++
++	v[0] = (uint8_t)(size & 0xff);
++	v[1] = (uint8_t)((size >> 8) & 0xff);
++	v[2] = (uint8_t)((size >> 16) & 0x01);
++	tch_fw_reg_write(des_addr, len_addr, v, 3);
++
++	v[0] = (uint8_t)(crc & 0xff);
++	v[1] = (uint8_t)((crc >> 8) & 0xff);
++	v[2] = (uint8_t)((crc >> 16) & 0xff);
++	v[3] = (uint8_t)((crc >> 24) & 0xff);
++	tch_fw_reg_write(des_addr, cksum_addr, v, 4);
++}
++
+ static bool
+ tch_fw_state_ready(void)
+ {
+@@ -1280,6 +1332,25 @@
+ 	(void)tch_nvt_write8(NVT_TX_AUTO_COPY_EN, 0x69);
+ 	printf("LIUQIN TOUCH: tx auto copy mode enabled\n");
+ 
++	/* descriptors for ILM (part 0) and DLM (part 1) */
++	{
++		const uint32_t ilm_bin = tch_le32(fw + 0);
++		const uint32_t ilm_sram = tch_le32(fw + 4);
++		const uint32_t ilm_len = tch_le32(fw + 8);
++		const uint32_t ilm_crc = tch_le32(fw + 0x18);
++		const uint32_t dlm_bin = tch_le32(fw + 12);
++		const uint32_t dlm_sram = tch_le32(fw + 16);
++		const uint32_t dlm_len = tch_le32(fw + 20);
++		const uint32_t dlm_crc = tch_le32(fw + 0x1c);
++
++		(void)ilm_bin;
++		(void)dlm_bin;
++		tch_fw_bld_bank(0x3f128u, ilm_sram, 0x3f118u, ilm_len, 0x3f100u, ilm_crc);
++		tch_fw_bld_bank(0x3f12cu, dlm_sram, 0x3f130u, dlm_len, 0x3f104u, dlm_crc);
++		printf("LIUQIN TOUCH: bld descriptors set (ilm 0x%x/0x%x crc 0x%08x, dlm 0x%x/0x%x crc 0x%08x)\n",
++		    ilm_sram, ilm_len, ilm_crc, dlm_sram, dlm_len, dlm_crc);
++	}
++
+ 	for (uint32_t i = 0; i < parts; i++) {
+ 		uint32_t bin, sram, len;
+ 
+@@ -1321,6 +1392,22 @@
+ 		}
+ 		delay(1000);
+ 	}
++	/* enable the bootloader CRC (read-modify-write bit 7) */
++	{
++		uint8_t en[2] = { 0 };
++
++		(void)tch_nvt_read(0x3f30eu, en, sizeof(en));
++		en[1] = en[0] | 0x80;
++		tch_fw_reg_write(0x3f30eu, 0x3f30eu, &en[1], 1);
++	}
++	/* clear the reset status and tell the host command to enable fw crc */
++	{
++		uint8_t zero = 0x00;
++		uint8_t crc_cmd = 0xae;
++
++		tch_fw_reg_write(NVT_EVENT_BASE, NVT_EVENT_BASE + 0x60, &zero, 1);
++		tch_fw_reg_write(NVT_EVENT_BASE, NVT_EVENT_BASE + 0x50, &crc_cmd, 1);
++	}
+ 	(void)tch_nvt_write8(NVT_BOOT_RDY_ADDR, 1);
+ 	delay(5 * 1000);
+ 	(void)tch_nvt_write8(NVT_BOOT_RDY_ADDR, 0);

@@ -1,0 +1,17 @@
+--- a/iokit/NativeAdreno/NativeAdrenoPublish.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoPublish.cpp
+@@ -713,6 +713,14 @@
+ }
+ extern "C" void native_adreno_note_property_read(const char *key)
+ {
++    /* The original Metal discovery reads these two from the accelerator; log
++     * the reader so a log without any such line proves discovery never reached
++     * the accelerator (rather than the bundle failing to load). */
++    if(key && (!strcmp(key,"MetalPluginName") || !strcmp(key,"MetalPluginClassName"))) {
++        char reader[20]={};
++        proc_selfname(reader,sizeof reader);
++        IOLog("NativeAdreno: %s read by %s\n",key,reader);
++    }
+     if(key && !strcmp(key,"MetalPluginName")) {
+         proc_selfname(native_adreno_metal_diag.name_reader,17);
+         native_adreno_metal_diag.name_reads=native_adreno_metal_diag.name_reads+1;

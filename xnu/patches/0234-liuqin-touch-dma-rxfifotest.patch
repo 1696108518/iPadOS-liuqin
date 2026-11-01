@@ -1,0 +1,75 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -1922,7 +1922,64 @@
+ 		    tch_rd(tch.se, SE_GENI_RX_PACKING_CFG0),
+ 		    tch_rd(tch.se, SE_GENI_RX_PACKING_CFG1),
+ 		    tch_rd(tch.se, SE_GENI_RX_FIFO_STATUS));
++	}
++}
++
++/*
++ * Does the engine's RX FIFO receive anything at all?  Clock the real read
++ * command with the TX DMA armed but the RX DMA *not* armed: nothing drains the
++ * FIFO, so RX_FIFO_STATUS and the FIFO registers themselves answer the
++ * question that the DMA cannot - if the words are there, the RX data path is
++ * good and only the DMA read side is broken (and the CPU could read the FIFO
++ * directly); if the FIFO stays empty, RX never reaches it and the engine's
++ * data path really is GSI-only.
++ */
++static void
++tch_rx_fifo_test(void)
++{
++	uint8_t tx[8] = { 0 };
++	uint32_t prev, v, wc, i;
++	size_t nbits = 0;
++	unsigned spins = 0;
++
++	if (tch.tlmm == 0) {
++		return;
++	}
++	tx[0] = (uint8_t)(NVT_CHIP_VER_TRIM_ADDR & 0x7f);
++	tch.div = 4095;
++	tch_wr(tch.se, GENI_SER_M_CLK_CFG, (4095u << CLK_DIV_SHFT) | SER_CLK_EN);
++
++	tch_dma_put(TCH_DMA_TX_OFF, tx, sizeof(tx));
++	(void)tch_cs(true);
++	tch_dma_mode();
++	tch_wr(tch.se, SE_SPI_TX_TRANS_LEN, (uint32_t)sizeof(tx));
++	tch_wr(tch.se, SE_SPI_RX_TRANS_LEN, (uint32_t)sizeof(tx));
++	tch_wr(tch.se, SE_GENI_M_CMD0, (SPI_TX_RX << M_OPCODE_SHFT) | FRAGMENTATION);
++	/* RX DMA deliberately not armed: tch_dma_arm(tx, rx=false, ...) */
++	tch_dma_arm(true, false, tch.dma_pa + TCH_DMA_TX_OFF, 0, sizeof(tx));
++
++	prev = tch_pads();
++	while (spins++ < 200000u) {
++		v = tch_pads();
++		if (!(prev & 0x4u) && (v & 0x4u) && nbits < sizeof(tx) * 8) {
++			nbits++;
++		}
++		prev = v;
++	}
++	/* FIFO status before anything can drain it (the RX DMA never ran). */
++	wc = tch_rd(tch.se, SE_GENI_RX_FIFO_STATUS);
++	printf("LIUQIN TOUCH: rx fifo after clocking (no rx dma): stat 0x%08x wc %u "
++	    "(%u bits on the wire)\n", wc, wc & RX_FIFO_WC_MSK, (unsigned)nbits);
++	wc &= RX_FIFO_WC_MSK;
++	for (i = 0; i < wc && i < 8u; i++) {
++		printf("LIUQIN TOUCH: rx fifo word %u = 0x%08x\n", i,
++		    tch_rd(tch.se, SE_GENI_RX_FIFOn));
+ 	}
++	(void)tch_cs(false);
++	tch_wr(tch.se, SE_GENI_M_IRQ_CLEAR, 0xffffffff);
++
++	tch.div = 32;
++	tch_wr(tch.se, GENI_SER_M_CLK_CFG, ((32u & CLK_DIV_MSK) << CLK_DIV_SHFT) | SER_CLK_EN);
+ }
+ 
+ /*
+@@ -2082,6 +2139,7 @@
+ 					tch_wire_capture(false, "readcmd", cmd8, 8, 0);
+ 					tch_wire_capture(false, "readcmd-wm1", cmd8, 8, 1);
+ 					tch_wire_capture(false, "readcmd-attr1", cmd8, 8, 2);
++					tch_rx_fifo_test();
+ 				}
+ 				/* The delay matrix failed (all four groups), so the gap is
+ 				 * not the cause - what is left is the clock itself, or the

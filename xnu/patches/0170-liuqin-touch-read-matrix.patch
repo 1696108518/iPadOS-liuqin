@@ -1,0 +1,110 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -299,6 +299,7 @@
+ 	bool        bitbang;            /* drive gpio16..19 as a software SPI */
+ 	bool        cs_high;            /* chip select is active high */
+ 	bool        page8;              /* page bytes as addr>>16 / addr>>8 */
++	uint32_t    dummy;              /* dummy bytes before the data (1) */
+ 	uint32_t    pin_clk, pin_mosi, pin_miso, pin_cs;
+ 	uint32_t    pin_reset;          /* gpio20, active low */
+ 	uint32_t    bb_pace_us;         /* half clock period, default 5 us */
+@@ -892,8 +893,9 @@
+ 	uint8_t tx[NVT_BUF_MAX];
+ 	uint8_t rx[NVT_BUF_MAX];
+ 	int err = -1;
++	const size_t overhead = 1 + tch.dummy;         /* address + dummies */
+ 
+-	if (len + 2 > sizeof(tx) || len == 0) {
++	if (len + overhead > sizeof(tx) || len == 0) {
+ 		return -1;
+ 	}
+ 	if (tch.cs_manual && tch_cs(true) != 0) {
+@@ -910,11 +912,11 @@
+ 		page[2] = (uint8_t)((addr >> 7) & 0xff);
+ 	}
+ 	if (tch_xfer(page, NULL, sizeof(page)) == 0) {
+-		memset(tx, 0, len + 2);
+-		memset(rx, 0, len + 2);
++		memset(tx, 0, len + overhead);
++		memset(rx, 0, len + overhead);
+ 		tx[0] = (uint8_t)(addr & 0x7f);         /* address, read */
+-		if (tch_xfer(tx, rx, len + 2) == 0) {
+-			memcpy(out, rx + 2, len);
++		if (tch_xfer(tx, rx, len + overhead) == 0) {
++			memcpy(out, rx + overhead, len);
+ 			err = 0;
+ 		}
+ 	}
+@@ -1062,6 +1064,54 @@
+ 		}
+ 	}
+ 	return -1;
++}
++
++static void
++tch_read_id_line(const char *what)
++{
++	uint8_t id[6] = { 0 };
++
++	(void)tch_nvt_read(NVT_CHIP_VER_TRIM_ADDR, id, sizeof(id));
++	printf("LIUQIN TOUCH: %s: %02x %02x %02x %02x %02x %02x%s\n",
++	    what, id[0], id[1], id[2], id[3], id[4], id[5],
++	    (id[3] == 0x65 && id[4] == 0x03) ? "  <-- ANSWER" : "");
++}
++
++/* On the discovered pins the controller answers, but the bytes are not stable
++ * between boots (83 80 3a 4f bb 9d then 83 81 3a 47 bb 9c) and one direct
++ * attempt read ff - a marginal read rather than a protocol mismatch.  Measure
++ * the knobs one at a time, all on cs17/clk18/mosi19/miso16, 15/7 page split. */
++static void
++tch_diag_matrix(void)
++{
++	tch_roles(17, 18, 19, 16);
++	tch.page8 = false;
++	tch.dummy = 1;
++	tch.bb_pace_us = 5;
++	tch_bb_dir(16, false, 0);                       /* MISO, no bias */
++
++	tch_nvt_bringup();
++	tch_read_id_line("baseline: 5 us half period, one dummy byte");
++
++	tch.bb_pace_us = 25;
++	tch_nvt_bringup();
++	tch_read_id_line("slow: 25 us half period");
++	tch.bb_pace_us = 5;
++
++	/* A line the controller drives ignores a pull-up; a floating one reads 1 */
++	tch_wr(tch.tlmm, TLMM_CTL(16), (0u << 2) | (3u << 0) | (2u << 6));
++	delay(2000);
++	tch_nvt_bringup();
++	tch_read_id_line("MISO with pull-up");
++	tch_bb_dir(16, false, 0);
++
++	tch.dummy = 0;
++	tch_nvt_bringup();
++	tch_read_id_line("no dummy byte");
++	tch.dummy = 2;
++	tch_nvt_bringup();
++	tch_read_id_line("two dummy bytes");
++	tch.dummy = 1;
+ }
+ 
+ static int
+@@ -1128,8 +1178,6 @@
+ 		return 0;
+ 	}
+ 
+-	tch_bb_selftest();
+-
+ 	/*
+ 	 * touch17's sweep found exactly one assignment that answers:
+ 	 * cs gpio17, clk gpio18, mosi gpio19, miso gpio16.  Start from it and
+@@ -1148,6 +1196,8 @@
+ 		}
+ 	}
+ 	tch.page8 = false;
++	tch_bb_selftest();
++	tch_diag_matrix();
+ 
+ 	if (tch_sweep(false, &combos) == 0) {
+ 		return 0;

@@ -1,0 +1,43 @@
+--- a/iokit/Kernel/arm/hid/LiuqinHID.cpp
++++ b/iokit/Kernel/arm/hid/LiuqinHID.cpp
+@@ -613,11 +613,27 @@
+ 	return kIOReturnUnsupported;
+ }
+ 
++static const char *
++liuqin_current_proc_name(char *buf, size_t len)
++{
++	proc_t proc = (proc_t)get_bsdtask_info(current_task());
++
++	if (proc) {
++		proc_name(proc_pid(proc), buf, (int)len);
++	} else {
++		snprintf(buf, len, "kernel");
++	}
++	return buf;
++}
++
+ OSObject *
+ IOHIDDevice::getProperty(const OSSymbol *aKey) const
+ {
+ 	if (aKey) {
+-		IOLog("LIUQIN HID: IOHIDDevice property get %s\n", aKey->getCStringNoCopy());
++		char pname[64];
++
++		IOLog("LIUQIN HID: IOHIDDevice property get %s by %s\n",
++		    aKey->getCStringNoCopy(), liuqin_current_proc_name(pname, sizeof(pname)));
+ 	}
+ 	return super::getProperty(aKey);
+ }
+@@ -625,7 +641,10 @@
+ OSObject *
+ IOHIDDevice::getProperty(const char *aKey) const
+ {
+-	IOLog("LIUQIN HID: IOHIDDevice property get %s\n", aKey ? aKey : "?");
++	char pname[64];
++
++	IOLog("LIUQIN HID: IOHIDDevice property get %s by %s\n", aKey ? aKey : "?",
++	    liuqin_current_proc_name(pname, sizeof(pname)));
+ 	return super::getProperty(aKey);
+ }
+ 

@@ -1,0 +1,83 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -1785,6 +1785,71 @@
+ }
+ 
+ /*
++ * A poor man's logic analyser.  The engine's loopback is dead on this SE
++ * (FIFO interface disabled: both the DMA and the FIFO loopback return zeros)
++ * and the panel only answers - wrongly - so the last witness is the wire
++ * itself.  With the SPI clock at its slowest (19.2 MHz / 4095 = 4.7 kHz,
++ * 213 us per bit) the CPU can sample the pads while the engine shifts and
++ * rebuild what actually went out on MOSI and came back on MISO.
++ */
++static void
++tch_wire_capture(void)
++{
++	static const uint8_t pat[8] = { 0xa5, 0x5a, 0x3c, 0xc3, 0x0f, 0xf0, 0x11, 0x88 };
++	uint8_t txb[8] = { 0 }, rxb[8] = { 0 };
++	const size_t maxbits = sizeof(pat) * 8;
++	size_t nbits = 0;
++	uint32_t prev, v;
++	unsigned spins = 0;
++
++	if (tch.tlmm == 0) {
++		return;
++	}
++	tch.div = 4095;
++	tch_wr(tch.se, GENI_SER_M_CLK_CFG, (4095u << CLK_DIV_SHFT) | SER_CLK_EN);
++	printf("LIUQIN TOUCH: wire capture at %u Hz, tx a5 5a 3c c3 0f f0 11 88\n",
++	    SE_CLK_HZ / 4095);
++
++	tch_dma_put(TCH_DMA_TX_OFF, pat, sizeof(pat));
++	tch_dma_clear(TCH_DMA_RX_OFF, sizeof(pat));
++	(void)tch_cs(true);
++	tch_dma_mode();
++	tch_wr(tch.se, SE_SPI_TX_TRANS_LEN, (uint32_t)sizeof(pat));
++	tch_wr(tch.se, SE_SPI_RX_TRANS_LEN, (uint32_t)sizeof(pat));
++	tch_wr(tch.se, SE_GENI_M_CMD0, (SPI_TX_RX << M_OPCODE_SHFT) | FRAGMENTATION);
++	tch_dma_arm(true, true, tch.dma_pa + TCH_DMA_TX_OFF,
++	    tch.dma_pa + TCH_DMA_RX_OFF, sizeof(pat));
++
++	prev = tch_pads();
++	/* ~200k samples at ~2 us each covers the 13.6 ms transfer many times
++	 * over; a hung engine costs at most a fifth of a second. */
++	while (spins++ < 200000u) {
++		v = tch_pads();
++		/* rising CLK edge is the mode-0 sample point for both lines */
++		if (!(prev & 0x4u) && (v & 0x4u) && nbits < maxbits) {
++			if (v & 0x2u) {
++				txb[nbits >> 3] |= (uint8_t)(1u << (7 - (nbits & 7)));
++			}
++			if (v & 0x1u) {
++				rxb[nbits >> 3] |= (uint8_t)(1u << (7 - (nbits & 7)));
++			}
++			nbits++;
++		}
++		prev = v;
++	}
++	(void)tch_cs(false);
++	tch_wr(tch.se, SE_GENI_M_IRQ_CLEAR, 0xffffffff);
++	printf("LIUQIN TOUCH: wire tx %02x %02x %02x %02x %02x %02x %02x %02x (%u bits)\n",
++	    txb[0], txb[1], txb[2], txb[3], txb[4], txb[5], txb[6], txb[7],
++	    (unsigned)nbits);
++	printf("LIUQIN TOUCH: wire rx %02x %02x %02x %02x %02x %02x %02x %02x\n",
++	    rxb[0], rxb[1], rxb[2], rxb[3], rxb[4], rxb[5], rxb[6], rxb[7]);
++
++	tch.div = 32;
++	tch_wr(tch.se, GENI_SER_M_CLK_CFG, ((32u & CLK_DIV_MSK) << CLK_DIV_SHFT) | SER_CLK_EN);
++}
++
++/*
+  * Before trusting any panel read, prove the engine's own data path and see
+  * where the chip select lands.  touches 129..153 never separated "the SE
+  * moves bytes correctly" from "the panel hears the SE": a DMA that completes
+@@ -1919,6 +1984,8 @@
+ 					    "%02x %02x %02x %02x\n", rr[0], rr[1], rr[2], rr[3],
+ 					    rr[4], rr[5], rr[6], rr[7]);
+ 				}
++				/* Last witness: what the pins actually carry. */
++				tch_wire_capture();
+ 				/* Before switching the mux, one raw look at what the
+ 				 * engine captures: the whole RX of an 8-byte read
+ 				 * (skip nothing) and of a 9-byte double-address read -

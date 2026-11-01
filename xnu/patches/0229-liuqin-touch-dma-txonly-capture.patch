@@ -1,0 +1,106 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -1793,35 +1793,33 @@
+  * rebuild what actually went out on MOSI and came back on MISO.
+  */
+ static void
+-tch_wire_capture(void)
++tch_wire_capture(bool tx_only, const char *what, const uint8_t *pat, size_t len)
+ {
+-	static const uint8_t pat[8] = { 0xa5, 0x5a, 0x3c, 0xc3, 0x0f, 0xf0, 0x11, 0x88 };
+ 	uint8_t txb[8] = { 0 }, rxb[8] = { 0 };
+-	const size_t maxbits = sizeof(pat) * 8;
++	const size_t maxbits = len * 8;
+ 	size_t nbits = 0;
+ 	uint32_t prev, v;
+ 	unsigned spins = 0;
+ 
+-	if (tch.tlmm == 0) {
++	if (tch.tlmm == 0 || len == 0 || len > sizeof(txb)) {
+ 		return;
+ 	}
+ 	tch.div = 4095;
+ 	tch_wr(tch.se, GENI_SER_M_CLK_CFG, (4095u << CLK_DIV_SHFT) | SER_CLK_EN);
+-	printf("LIUQIN TOUCH: wire capture at %u Hz, tx a5 5a 3c c3 0f f0 11 88\n",
+-	    SE_CLK_HZ / 4095);
+ 
+-	tch_dma_put(TCH_DMA_TX_OFF, pat, sizeof(pat));
+-	tch_dma_clear(TCH_DMA_RX_OFF, sizeof(pat));
++	tch_dma_put(TCH_DMA_TX_OFF, pat, len);
++	tch_dma_clear(TCH_DMA_RX_OFF, len);
+ 	(void)tch_cs(true);
+ 	tch_dma_mode();
+-	tch_wr(tch.se, SE_SPI_TX_TRANS_LEN, (uint32_t)sizeof(pat));
+-	tch_wr(tch.se, SE_SPI_RX_TRANS_LEN, (uint32_t)sizeof(pat));
+-	tch_wr(tch.se, SE_GENI_M_CMD0, (SPI_TX_RX << M_OPCODE_SHFT) | FRAGMENTATION);
+-	tch_dma_arm(true, true, tch.dma_pa + TCH_DMA_TX_OFF,
+-	    tch.dma_pa + TCH_DMA_RX_OFF, sizeof(pat));
++	tch_wr(tch.se, SE_SPI_TX_TRANS_LEN, (uint32_t)len);
++	tch_wr(tch.se, SE_SPI_RX_TRANS_LEN, tx_only ? 0u : (uint32_t)len);
++	tch_wr(tch.se, SE_GENI_M_CMD0,
++	    ((tx_only ? SPI_TX_ONLY : SPI_TX_RX) << M_OPCODE_SHFT) | FRAGMENTATION);
++	tch_dma_arm(true, !tx_only, tch.dma_pa + TCH_DMA_TX_OFF,
++	    tch.dma_pa + TCH_DMA_RX_OFF, len);
+ 
+ 	prev = tch_pads();
+-	/* ~200k samples at ~2 us each covers the 13.6 ms transfer many times
++	/* ~200k samples at ~2 us each covers a 13.6 ms transfer many times
+ 	 * over; a hung engine costs at most a fifth of a second. */
+ 	while (spins++ < 200000u) {
+ 		v = tch_pads();
+@@ -1839,12 +1837,20 @@
+ 	}
+ 	(void)tch_cs(false);
+ 	tch_wr(tch.se, SE_GENI_M_IRQ_CLEAR, 0xffffffff);
+-	printf("LIUQIN TOUCH: wire tx %02x %02x %02x %02x %02x %02x %02x %02x (%u bits)\n",
+-	    txb[0], txb[1], txb[2], txb[3], txb[4], txb[5], txb[6], txb[7],
+-	    (unsigned)nbits);
+-	printf("LIUQIN TOUCH: wire rx %02x %02x %02x %02x %02x %02x %02x %02x\n",
+-	    rxb[0], rxb[1], rxb[2], rxb[3], rxb[4], rxb[5], rxb[6], rxb[7]);
+ 
++	printf("LIUQIN TOUCH: wire %s tx", what);
++	for (size_t i = 0; i < len; i++) {
++		printf(" %02x", txb[i]);
++	}
++	printf(" (%u bits)\n", (unsigned)nbits);
++	if (!tx_only) {
++		printf("LIUQIN TOUCH: wire %s rx", what);
++		for (size_t i = 0; i < len; i++) {
++			printf(" %02x", rxb[i]);
++		}
++		printf("\n");
++	}
++
+ 	tch.div = 32;
+ 	tch_wr(tch.se, GENI_SER_M_CLK_CFG, ((32u & CLK_DIV_MSK) << CLK_DIV_SHFT) | SER_CLK_EN);
+ }
+@@ -1984,8 +1990,27 @@
+ 					    "%02x %02x %02x %02x\n", rr[0], rr[1], rr[2], rr[3],
+ 					    rr[4], rr[5], rr[6], rr[7]);
+ 				}
+-				/* Last witness: what the pins actually carry. */
+-				tch_wire_capture();
++				/* Last witness: what the pins actually carry.  touch158
++				 * proved the duplex path is byte exact on the wire
++				 * (a5 5a 3c c3 0f f0 11 88); what is left is whether
++				 * a TX-only command - the page write - shifts its bytes
++				 * at all, and what the panel really says back to the
++				 * real read command. */
++				{
++					static const uint8_t pat8[8] = { 0xa5, 0x5a, 0x3c,
++						0xc3, 0x0f, 0xf0, 0x11, 0x88 };
++					uint8_t page3[3] = { 0xff, 0, 0 };
++					uint8_t cmd8[8] = { 0 };
++
++					page3[1] = (uint8_t)((NVT_CHIP_VER_TRIM_ADDR >> 15) & 0xff);
++					page3[2] = (uint8_t)((NVT_CHIP_VER_TRIM_ADDR >> 7) & 0xff);
++					cmd8[0] = (uint8_t)(NVT_CHIP_VER_TRIM_ADDR & 0x7f);
++					printf("LIUQIN TOUCH: wire capture at %u Hz\n",
++					    SE_CLK_HZ / 4095);
++					tch_wire_capture(false, "duplex", pat8, 8);
++					tch_wire_capture(true, "txonly", page3, 3);
++					tch_wire_capture(false, "readcmd", cmd8, 8);
++				}
+ 				/* Before switching the mux, one raw look at what the
+ 				 * engine captures: the whole RX of an 8-byte read
+ 				 * (skip nothing) and of a 9-byte double-address read -

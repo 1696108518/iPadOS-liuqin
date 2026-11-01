@@ -1,0 +1,58 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -1138,6 +1138,42 @@
+ 		    fw[0], fw[1], fw[2], fw[3], fw[4], fw[5], fw[6], fw[7], fw[8],
+ 		    fw[1], fw[2],
+ 		    (uint8_t)(fw[1] + fw[2]) == 0xff ? "valid" : "unusable");
++	}
++}
++
++/* The firmware area (ADT memory map LIUQINFW, built by tools/mkfwarea.py from
++ * ~/liuqin-root/fw) carries novatek_nt36532_m81_fw_csot.bin now, the same
++ * 245760 bytes the vendor driver downloads after every handover. */
++extern const void *liuqin_fw_get(const char *name, uint32_t *size);
++
++static const uint8_t *
++tch_fw_image(uint32_t *size)
++{
++	const uint8_t *fw = liuqin_fw_get("novatek_nt36532_m81_fw_csot.bin", size);
++
++	if (fw == NULL) {
++		printf("LIUQIN TOUCH: touch firmware missing from the firmware area\n");
++		return NULL;
++	}
++	printf("LIUQIN TOUCH: touch firmware %u bytes at %p (%02x %02x %02x %02x %02x %02x)\n",
++	    *size, fw, fw[0], fw[1], fw[2], fw[3], fw[4], fw[5]);
++	return fw;
++}
++
++/* Read the firmware state register (event 0x60) at both candidate bases; the
++ * vendor expects 0xa0..0xaf once the application firmware runs. */
++static void
++tch_fw_state(void)
++{
++	static const uint32_t bases[] = { 0x11a00u, 0x1f64eu };
++
++	for (unsigned i = 0; i < 2; i++) {
++		uint8_t st[4] = { 0 };
++
++		(void)tch_nvt_read(bases[i] + 0x60, st, sizeof(st));
++		printf("LIUQIN TOUCH: fw state @0x%05x: %02x %02x %02x %02x (%s)\n",
++		    bases[i] + 0x60, st[0], st[1], st[2], st[3],
++		    st[0] >= 0xa0 && st[0] <= 0xaf ? "running" : "not ready");
+ 	}
+ }
+ 
+@@ -1594,6 +1630,12 @@
+ 	}
+ 	const char *name = have_id ? tch_chip_name(id) : NULL;
+ 
++	{
++		uint32_t fw_size = 0;
++
++		(void)tch_fw_image(&fw_size);
++		tch_fw_state();
++	}
+ 	tch_dump_chip_state();
+ 	printf("LIUQIN TOUCH: Novatek trim id %02x %02x %02x %02x %02x %02x (%s) irq 0x%08x\n",
+ 	    id[0], id[1], id[2], id[3], id[4], id[5],

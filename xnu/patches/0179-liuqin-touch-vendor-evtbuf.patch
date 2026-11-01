@@ -1,0 +1,71 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -1116,7 +1116,32 @@
+ 	return -1;
+ }
+ 
++/* The vendor memory map puts the event buffer at 0x11a00 for this family
++ * (mainline nt36xxx: evtbuf 0x11a00, pipe0 0x10000, pipe1 0x12000,
++ * flash_csum 0x14000, flash_data 0x14002).  The state register is 0x60 in that
++ * page and reads 0xa0..0xaf when the firmware is running; FWINFO is 0x78.
++ * Read both that base and the old nabu one so the log shows which answers. */
+ static void
++tch_dump_chip_state(void)
++{
++	static const uint32_t bases[] = { 0x11a00, 0x2fe00 };
++
++	for (unsigned i = 0; i < 2; i++) {
++		uint8_t st[4] = { 0 };
++		uint8_t fw[17] = { 0 };
++
++		(void)tch_nvt_read(bases[i] + 0x60, st, sizeof(st));
++		(void)tch_nvt_read(bases[i] + 0x78, fw, sizeof(fw));
++		printf("LIUQIN TOUCH: @0x%05x state %02x %02x %02x %02x | fw %02x %02x %02x %02x %02x "
++		    "%02x %02x %02x %02x (ver %02x/~%02x %s)\n",
++		    bases[i], st[0], st[1], st[2], st[3],
++		    fw[0], fw[1], fw[2], fw[3], fw[4], fw[5], fw[6], fw[7], fw[8],
++		    fw[1], fw[2],
++		    (uint8_t)(fw[1] + fw[2]) == 0xff ? "valid" : "unusable");
++	}
++}
++
++static void
+ tch_read_id_line(const char *what)
+ {
+ 	uint8_t id[6] = { 0 };
+@@ -1569,6 +1594,7 @@
+ 	}
+ 	const char *name = have_id ? tch_chip_name(id) : NULL;
+ 
++	tch_dump_chip_state();
+ 	printf("LIUQIN TOUCH: Novatek trim id %02x %02x %02x %02x %02x %02x (%s) irq 0x%08x\n",
+ 	    id[0], id[1], id[2], id[3], id[4], id[5],
+ 	    have_id ? (name != NULL ? name : "unknown id") : "read failed",
+@@ -1773,6 +1799,27 @@
+ 				}
+ 			}
+ 		}
++		{
++			static unsigned alt_logs;
++			uint8_t alt[NVT_POINT_LEN] = { 0 };
++
++			if (tch_nvt_read(0x11a00u, alt, sizeof(alt)) == 0 && alt_logs < 8 &&
++			    memcmp(alt, last, sizeof(alt)) != 0) {
++				bool any = false;
++
++				for (size_t i = 0; i < sizeof(alt); i++) {
++					if (alt[i] != 0xff && alt[i] != 0x00) {
++						any = true;
++					}
++				}
++				if (any) {
++					alt_logs++;
++					printf("LIUQIN TOUCH: evt@11a00 %02x %02x %02x %02x %02x %02x %02x %02x\n",
++					    alt[0], alt[1], alt[2], alt[3],
++					    alt[4], alt[5], alt[6], alt[7]);
++				}
++			}
++		}
+ 		if (tch_nvt_read(NVT_EVENT_BUF_ADDR, frame, sizeof(frame)) != 0) {
+ 			if (errors++ < 4) {
+ 				printf("LIUQIN TOUCH: event read failed (irq 0x%08x dma tx 0x%08x rx 0x%08x)\n",

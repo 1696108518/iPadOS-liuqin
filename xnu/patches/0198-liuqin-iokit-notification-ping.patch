@@ -1,0 +1,14 @@
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -963,6 +963,11 @@
+ 	}
+ 
+ 	if (sendPing) {
++#if defined(ARM64_BOARD_CONFIG_LIUQIN)
++		IOLog("LIUQIN IOK: notification ping type 0x%x for %s id 0x%llx\n",
++		    msgType, newService ? newService->getName() : "?",
++		    newService ? (unsigned long long)newService->getRegistryEntryID() : 0ULL);
++#endif
+ 		port = iokit_port_for_object( this, IKOT_IOKIT_OBJECT );
+ 
+ 		payloadSize = sizeof(PingMsgUdata) - sizeof(OSAsyncReference64) + msgReferenceSize;

@@ -1,0 +1,29 @@
+--- a/iokit/Kernel/arm/hid/LiuqinHID.cpp
++++ b/iokit/Kernel/arm/hid/LiuqinHID.cpp
+@@ -812,6 +812,18 @@
+ 
+ 		if (dev && dev->init() && dev->attach(nub) && dev->start(nub)) {
+ 			IOLog("LIUQIN HID: multitouch device relaunched\n");
++			/*
++			 * On a real device the event service is the driver that hangs
++			 * off the IOHIDDevice (IOHIDEventDriver sitting on the nub), so
++			 * publish ours under the device instead of under IOResources.
++			 */
++			touch = OSTypeAlloc(LiuqinHIDTouch);
++			if (touch && touch->init() && touch->attach(dev) && touch->start(dev)) {
++				IOLog("LIUQIN HID: touch relaunched under the device\n");
++			} else if (touch) {
++				touch->release();
++			}
++			goto done;
+ 		} else if (dev) {
+ 			dev->release();
+ 		}
+@@ -823,6 +835,7 @@
+ 	} else if (touch) {
+ 		touch->release();
+ 	}
++done:
+ 	gLiuqinHidImmediate = false;
+ }
+ 

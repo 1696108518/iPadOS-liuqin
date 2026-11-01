@@ -1,0 +1,284 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -836,10 +836,11 @@
+  * logging each one, and stop at the first that works.
+  *
+  * The first step is not a register poke: it is the other legal ordering of a
+- * DMA command (M_CMD0 first, descriptor registers behind it, which is what
+- * upstream spi-geni-qcom does today) and it goes first because every failed
+- * transfer leaves the sequencer wedged, so it wants the cleanest state the
+- * walk can offer.  reg == 0 means "no register write". */
++ * DMA command (descriptor registers first, then M_CMD0, the order every
++ * release up to the 2024 rework used; the default attempt now runs the
++ * upstream one, command first).  It goes first among the pokes because every
++ * failed transfer leaves the sequencer wedged, so it wants the cleanest state
++ * the walk can offer.  reg == 0 means "no register write". */
+ static int
+ tch_se_start(void)
+ {
+@@ -848,7 +849,7 @@
+ 		int order;              /* -1: keep, else force the DMA ordering */
+ 		const char *what;
+ 	} fixes[] = {
+-		{ 0, 0, 1, "cmd-first" },
++		{ 0, 0, 0, "desc-first" },
+ 		{ SE_GENI_M_CMD_CTRL_REG, M_GENI_CMD_CANCEL, -1, "cancel" },
+ 		{ SE_GENI_M_CMD_CTRL_REG, M_GENI_CMD_ABORT, -1, "abort" },
+ 		{ SE_GENI_M_CMD_CTRL_REG, 0, -1, "clear-disable" },
+@@ -920,34 +921,49 @@
+ }
+ 
+ /*
+- * The engine's DMA interface.  A QUPv3 serial engine is loaded with its
+- * protocol firmware and its transfer mode by the bootloader (geni_load_se_fw:
+- * SE_DMA_IF_EN, SE_FIFO_IF_DISABLE), after which GENI_IF_DISABLE_RO@0x64 reads
+- * 1 for a DMA/GSI engine.  If that single enable never made it, the sequencer
+- * accepts a data command, cannot fetch the descriptor's bytes, and holds
+- * GENI_STATUS.M_GENI_CMD_ACTIVE forever without raising one interrupt - which
+- * is precisely the touch150 log.  Read the whole block, set the bit if it is
+- * clear, read it back.  liuqintouchdmaif=0 only reports.
++ * The engine-side question touch150 left open.  A QUPv3 serial engine that its
++ * bootloader strapped for DMA (GENI_IF_DISABLE_RO@0x64 = 1) has no FIFO
++ * interface; what it does with a data command is decided by
++ * SE_GENI_DMA_MODE_EN@0x258 and the event registers next to it.
++ *
++ * touch151 tried to force the "DMA interface enable" (SE_DMA_IF_EN@0x2004,
++ * geni_load_se_fw()) and touch151's first boot died on it: this wrapper reports
++ * QUP hw 3.0, which has no 0x2000 block at all, so that read is a synchronous
++ * external abort (esr 0x96000010, far = SE+0x2004), not a register.  The only
++ * mirror left is the one the same header documents as read-only,
++ * DMA_IF_EN_RO@0xe20, plus the two registers that actually select the data
++ * path: SE_GSI_EVENT_EN@0xe18 (GSI owns the engine) and SE_IRQ_EN@0xe1c.
++ *
++ * So: read them, prove whether SE_GSI_EVENT_EN can be cleared at all, and leave
++ * it cleared.  A write that does not stick means the SE is owned by the GSI
++ * block and no amount of SE-DMA programming can move a byte.
++ * liuqintouchdmaif=0 only reports.
+  */
+ static void
+ tch_se_dma_if(void)
+ {
+ 	int on = 1;
+-	uint32_t before, after;
++	uint32_t ro, gsi0, gsi1, seirq;
+ 
+ 	(void)PE_parse_boot_argn("liuqintouchdmaif", &on, sizeof(on));
+-	before = tch_rd(tch.se, SE_DMA_IF_EN);
+-	printf("LIUQIN TOUCH: SE4 clk_ctrl 0x%08x dma_if_en 0x%08x (ro 0x%08x) "
+-	    "fifo_if_disable 0x%08x gsi_ev 0x%08x\n", tch_rd(tch.se, SE_GENI_CLK_CTRL),
+-	    before, tch_rd(tch.se, DMA_IF_EN_RO), tch_rd(tch.se, SE_FIFO_IF_DISABLE),
+-	    tch_rd(tch.se, SE_GSI_EVENT_EN));
+-	if (on <= 0 || (before & DMA_IF_EN)) {
++	ro = tch_rd(tch.se, DMA_IF_EN_RO);
++	gsi0 = tch_rd(tch.se, SE_GSI_EVENT_EN);
++	seirq = tch_rd(tch.se, SE_IRQ_EN);
++	if (on <= 0) {
++		printf("LIUQIN TOUCH: SE4 dma_if_en_ro 0x%08x gsi 0x%08x seirq 0x%08x "
++		    "(left alone)\n", ro, gsi0, seirq);
+ 		return;
+ 	}
+-	tch_wr(tch.se, SE_DMA_IF_EN, before | DMA_IF_EN);
+-	after = tch_rd(tch.se, SE_DMA_IF_EN);
+-	printf("LIUQIN TOUCH: SE4 dma_if_en 0x%08x -> 0x%08x (%s)\n", before, after,
+-	    (after & DMA_IF_EN) ? "set" : "write ignored");
++	tch_wr(tch.se, SE_GSI_EVENT_EN, 0);
++	gsi1 = tch_rd(tch.se, SE_GSI_EVENT_EN);
++	printf("LIUQIN TOUCH: SE4 dma_if_en_ro 0x%08x gsi 0x%08x -> 0x%08x (write %s) "
++	    "seirq 0x%08x ifdis 0x%08x\n", ro, gsi0, gsi1,
++	    gsi1 == 0 ? "took" : "IGNORED", seirq,
++	    tch_rd(tch.se, GENI_IF_DISABLE_RO));
++	if (gsi1 != 0) {
++		printf("LIUQIN TOUCH: SE4 GSI event enables do not clear: the engine "
++		    "belongs to the GSI block, SE DMA cannot be selected\n");
++	}
+ }
+ 
+ /* One page of staging memory for the SE DMA, physically contiguous because the
+@@ -1314,11 +1330,28 @@
+ 	}
+ }
+ 
+-/* geni_se_select_mode(GENI_SE_DMA): the SE moves the data itself. */
++/* geni_se_select_mode(GENI_SE_DMA): the SE moves the data itself.
++ *
++ * The mode switch is more than the one bit: geni_se_irq_clear() writes 0 to
++ * SE_GSI_EVENT_EN in every mode change, geni_se_select_dma_mode() drops the
++ * FIFO watermark enables, and only then does GENI_DMA_MODE_EN come on.  Every
++ * attempt up to touch150 set the bit and left the bootloader's
++ * SE_GSI_EVENT_EN = 0xf in place, i.e. the sequencer stayed in GSI mode and
++ * handed the command to the GSI block, which has no TRE ring here.
++ *
++ * SE_IRQ_EN stays 0: this port installs no handler for the QUP interrupt line,
++ * and the transfer is polled through SE_DMA_*_IRQ_STAT, LEN_IN and GENI_STATUS,
++ * so routing an interrupt to the CPU can only hurt. */
+ static void
+ tch_dma_mode(void)
+ {
++	uint32_t v;
++
+ 	tch_irq_clear();
++	tch_wr(tch.se, SE_IRQ_EN, 0);
++	v = tch_rd(tch.se, SE_GENI_M_IRQ_EN);
++	tch_wr(tch.se, SE_GENI_M_IRQ_EN, v & ~(M_CMD_DONE_EN |
++	    M_TX_FIFO_WATERMARK_EN | M_RX_FIFO_WATERMARK_EN | M_RX_FIFO_LAST_EN));
+ 	tch_wr(tch.se, SE_GENI_DMA_MODE_EN,
+ 	    tch_rd(tch.se, SE_GENI_DMA_MODE_EN) | GENI_DMA_MODE_EN);
+ }
+@@ -1405,9 +1438,9 @@
+  * FIFO_IF_DISABLE set needs (geni_se_tx/rx_init_dma and the command).  Both
+  * orderings are in Linux: every release up to the 2024 rework arms the
+  * descriptor registers and then writes SE_GENI_M_CMD0, while upstream writes
+- * the command first and arms the descriptor behind it.  touch129..150 only
+- * ever tried the first, so liuqintouchdmaorder=1 - and the "cmd-first" step of
+- * the probe walk - tries the second without a rebuild.
++ * the command first and arms the descriptor behind it.  The default is the
++ * upstream one; liuqintouchdmaorder=0 and the "desc-first" step of the probe
++ * walk select the other without a rebuild.
+  */
+ static int
+ tch_dma_xfer(const uint8_t *tx, uint8_t *rx, size_t len)
+@@ -1417,6 +1450,7 @@
+ 	const uint32_t cmd = (tx != NULL && rx != NULL) ? SPI_TX_RX :
+ 	    (tx != NULL ? SPI_TX_ONLY : SPI_RX_ONLY);
+ 	uint32_t txst = 0, rxst = 0, irq = 0;
++	uint32_t txin = 0, rxin = 0, dbg_mid = 0, txin_mid = 0, rxin_mid = 0;
+ 	bool ok;
+ 	unsigned i;
+ 
+@@ -1433,18 +1467,21 @@
+ 	tch_wr(tch.se, SE_SPI_RX_TRANS_LEN, rx != NULL ? (uint32_t)len : 0);
+ 
+ 	/* geni_se_select_mode(GENI_SE_DMA): the mode is not part of the command
+-	 * and has to be in place before either ordering starts. */
+-	tch_wr(tch.se, SE_GENI_DMA_MODE_EN,
+-	    tch_rd(tch.se, SE_GENI_DMA_MODE_EN) | GENI_DMA_MODE_EN);
++	 * and has to be in place before either ordering starts.  tch_dma_mode()
++	 * is also what takes the engine out of the bootloader's GSI event mode
++	 * and proves, in the line below, whether that write stuck. */
++	tch_dma_mode();
+ 	if (tch_dma_order == 0) {
+ 		tch_dma_arm(tx != NULL, rx != NULL, tx_pa, rx_pa, len);
+ 	}
+ 	if (tch_dma_count < 8) {
+ 		tch_dma_count++;
+-		printf("LIUQIN TOUCH: DMA #%u %s len %u tx 0x%llx rx 0x%llx mode 0x%08x\n",
++		printf("LIUQIN TOUCH: DMA #%u %s len %u tx 0x%llx rx 0x%llx dma_mode "
++		    "0x%08x gsi 0x%08x seirq 0x%08x\n",
+ 		    tch_dma_count, cmd == SPI_TX_RX ? "tx+rx" : (tx != NULL ? "tx" : "rx"),
+ 		    (unsigned)len, tx != NULL ? tx_pa : 0, rx != NULL ? rx_pa : 0,
+-		    tch_rd(tch.se, SE_GENI_DMA_MODE_EN));
++		    tch_rd(tch.se, SE_GENI_DMA_MODE_EN), tch_rd(tch.se, SE_GSI_EVENT_EN),
++		    tch_rd(tch.se, SE_IRQ_EN));
+ 	}
+ 
+ 	if (tch_dma_count <= 8) {
+@@ -1479,29 +1516,42 @@
+ 	for (i = 0; i < 50 * 20; i++) {
+ 		txst = tx != NULL ? tch_rd(tch.se, SE_DMA_TX_IRQ_STAT) : 0;
+ 		rxst = rx != NULL ? tch_rd(tch.se, SE_DMA_RX_IRQ_STAT) : 0;
++		txin = tx != NULL ? tch_rd(tch.se, SE_DMA_TX_LEN_IN) : 0;
++		rxin = rx != NULL ? tch_rd(tch.se, SE_DMA_RX_LEN_IN) : 0;
+ 		irq = tch_status();
+ 		if (i == 0) {
+ 			tch.first_irq = irq;
+ 		}
++		if (i == 20) {
++			/* 1 ms in: did the engine's data path start at all, before
++			 * any timeout cleanup can hide it? */
++			dbg_mid = tch_rd(tch.se, SE_DMA_DEBUG_REG0);
++			txin_mid = txin;
++			rxin_mid = rxin;
++		}
+ 		if (irq & TCH_IRQ_ERRS) {
+ 			break;
+ 		}
+-		if ((tx == NULL || (txst & TX_DMA_DONE)) &&
+-		    (rx == NULL || (rxst & RX_DMA_DONE))) {
++		/* Complete when the DMA says so *or* when the byte counters say the
++		 * engine moved everything: SE_IRQ_EN is 0 here, so the status bits
++		 * are a bonus, not the only witness. */
++		if ((tx == NULL || (txst & TX_DMA_DONE) || txin == (uint32_t)len) &&
++		    (rx == NULL || (rxst & RX_DMA_DONE) || rxin == (uint32_t)len)) {
+ 			break;
+ 		}
+ 		delay(50);
+ 	}
+ 	if (tch_dma_count <= 8) {
+ 		printf("LIUQIN TOUCH: DMA #%u came back: status 0x%08x irq 0x%08x tx 0x%08x "
+-		    "rx 0x%08x after %u polls\n", tch_dma_count,
+-		    tch_rd(tch.se, SE_GENI_STATUS), irq, txst, rxst, i);
++		    "rx 0x%08x len_in tx %u rx %u after %u polls\n", tch_dma_count,
++		    tch_rd(tch.se, SE_GENI_STATUS), irq, txst, rxst, txin, rxin, i);
+ 	}
+ 	tch.dma_tx_status = txst;
+ 	tch.dma_rx_status = rxst;
+ 	tch.last_irq = irq;
+-	ok = (tx == NULL || (txst & TX_DMA_DONE)) &&
+-	    (rx == NULL || (rxst & RX_DMA_DONE)) && (irq & TCH_IRQ_ERRS) == 0;
++	ok = (tx == NULL || (txst & TX_DMA_DONE) || txin == (uint32_t)len) &&
++	    (rx == NULL || (rxst & RX_DMA_DONE) || rxin == (uint32_t)len) &&
++	    (irq & TCH_IRQ_ERRS) == 0;
+ 	if (tx != NULL && txst != 0) {
+ 		tch_wr(tch.se, SE_DMA_TX_IRQ_CLR, txst);
+ 	}
+@@ -1542,6 +1592,14 @@
+ 			    tch_rd(tch.se, SE_DMA_RX_LEN_IN),
+ 			    tch_rd(tch.se, SE_DMA_TX_IRQ_EN),
+ 			    tch_rd(tch.se, SE_DMA_RX_IRQ_EN));
++			printf("LIUQIN TOUCH: DMA #%u at 1 ms: debug 0x%08x len_in tx %u "
++			    "rx %u\n", tch_dma_count, dbg_mid, txin_mid, rxin_mid);
++			if (dbg_mid == 0 && txin_mid == 0 && rxin_mid == 0) {
++				printf("LIUQIN TOUCH: DMA #%u never started: gsi 0x%08x "
++				    "dma_mode 0x%08x - the sequencer is not taking SE DMA\n",
++				    tch_dma_count, tch_rd(tch.se, SE_GSI_EVENT_EN),
++				    tch_rd(tch.se, SE_GENI_DMA_MODE_EN));
++			}
+ 			printf("LIUQIN TOUCH: DMA #%u staging: tx %02x %02x %02x %02x "
+ 			    "rx %02x %02x %02x %02x\n", tch_dma_count,
+ 			    txb[0], txb[1], txb[2], txb[3],
+@@ -3036,10 +3094,12 @@
+ 		}
+ 		printf("LIUQIN TOUCH: liuqintouchdma=1, trying SE DMA again\n");
+ 		/* Only reachable when the pads are the only way in, so the engine's
+-		 * data path is the thing under test: the ordering is selectable for
+-		 * a run that wants the upstream one. */
++		 * data path is the thing under test.  The default is what upstream
++		 * spi-geni-qcom does today (M_CMD0 first, descriptor behind it);
++		 * liuqintouchdmaorder=0 selects the older descriptor-first order,
++		 * and the probe walk flips it if the first attempt moves nothing. */
+ 		{
+-			int order = 0;
++			int order = 1;
+ 
+ 			(void)PE_parse_boot_argn("liuqintouchdmaorder", &order, sizeof(order));
+ 			tch_dma_order = (order != 0);
+@@ -3067,10 +3127,28 @@
+ 		}
+ 		tch_visible_mark("touch bus probe");
+ 		if (tch_se_start() != 0) {
++			/*
++			 * The SE may still have a FIFO interface even though the
++			 * bootloader's RO bit says otherwise - Linux falls back to
++			 * FIFO in exactly this case when it cannot get a GPI
++			 * channel.  The DMA attempts above may have wedged the
++			 * sequencer, so a failure here proves nothing about a clean
++			 * engine; a success would hand the panel a hardware-timed
++			 * bus without any DMA at all.
++			 */
++			printf("LIUQIN TOUCH: SE DMA path did not start, trying the FIFO "
++			    "engine once\n");
++			tch.use_dma = false;
++			tch.fifo_capable = true;
++			if (tch_probe_bus("fifo fallback") == 0) {
++				printf("LIUQIN TOUCH: SE4 FIFO engine works, if_disable was "
++				    "not the whole story\n");
++				return 0;
++			}
++			tch.fifo_capable = false;
+ 			/* The low page did not fix it: keep the boot usable by going
+ 			 * back to the pads, and leave the log line that says so. */
+ 			printf("LIUQIN TOUCH: SE DMA path did not start, falling back to bit-bang\n");
+-			tch.use_dma = false;
+ 			tch.dma = 0;
+ 			return tch_bitbang_start();
+ 		}

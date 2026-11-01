@@ -1,0 +1,41 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -1820,6 +1820,7 @@
+ tch_wire_capture(bool tx_only, const char *what, const uint8_t *pat, size_t len)
+ {
+ 	uint8_t txb[8] = { 0 }, rxb[8] = { 0 };
++	uint8_t fill[24], se_rx[24];
+ 	const size_t maxbits = len * 8;
+ 	size_t nbits = 0;
+ 	uint32_t prev, v;
+@@ -1831,8 +1832,11 @@
+ 	tch.div = 4095;
+ 	tch_wr(tch.se, GENI_SER_M_CLK_CFG, (4095u << CLK_DIV_SHFT) | SER_CLK_EN);
+ 
++	memset(fill, 0xee, sizeof(fill));
+ 	tch_dma_put(TCH_DMA_TX_OFF, pat, len);
+-	tch_dma_clear(TCH_DMA_RX_OFF, len);
++	/* 0xee instead of zeros: if the engine's RX DMA lands on a different
++	 * offset than the one we read, the untouched 0xee bytes show it. */
++	tch_dma_put(TCH_DMA_RX_OFF, fill, sizeof(fill));
+ 	(void)tch_cs(true);
+ 	tch_dma_mode();
+ 	tch_wr(tch.se, SE_SPI_TX_TRANS_LEN, (uint32_t)len);
+@@ -1873,6 +1877,17 @@
+ 			printf(" %02x", rxb[i]);
+ 		}
+ 		printf("\n");
++		/* The same transfer as the engine's RX DMA saw it.  If these two
++		 * lines differ, the wire is right and the engine's capture is
++		 * wrong - which is exactly what touch161's speed sweep says. */
++		tch_dma_get(TCH_DMA_RX_OFF, se_rx, sizeof(se_rx));
++		printf("LIUQIN TOUCH: dma  %s rx", what);
++		for (size_t i = 0; i < sizeof(se_rx); i++) {
++			printf(" %02x", se_rx[i]);
++		}
++		printf(" (len_in %u irq 0x%08x)\n",
++		    tch_rd(tch.se, SE_DMA_RX_LEN_IN),
++		    tch_rd(tch.se, SE_DMA_RX_IRQ_STAT));
+ 	}
+ 
+ 	tch.div = 32;

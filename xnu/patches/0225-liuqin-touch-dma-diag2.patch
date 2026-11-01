@@ -1,0 +1,164 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -1482,6 +1482,14 @@
+ 		    (unsigned)len, tx != NULL ? tx_pa : 0, rx != NULL ? rx_pa : 0,
+ 		    tch_rd(tch.se, SE_GENI_DMA_MODE_EN), tch_rd(tch.se, SE_GSI_EVENT_EN),
+ 		    tch_rd(tch.se, SE_IRQ_EN));
++		if (tch_dma_count <= 3 && tx != NULL) {
++			uint8_t t[8] = { 0 };
++
++			tch_dma_get(TCH_DMA_TX_OFF, t, sizeof(t));
++			printf("LIUQIN TOUCH: DMA #%u TX page %02x %02x %02x %02x "
++			    "%02x %02x %02x %02x\n", tch_dma_count, t[0], t[1], t[2],
++			    t[3], t[4], t[5], t[6], t[7]);
++		}
+ 	}
+ 
+ 	if (tch_dma_count <= 8) {
+@@ -1805,6 +1813,8 @@
+ 	    idle, cs_on, cs_off);
+ 
+ 	tch_wr(tch.se, SE_SPI_LOOPBACK, 1);
++	printf("LIUQIN TOUCH: loopback reg written 1, reads 0x%08x\n",
++	    tch_rd(tch.se, SE_SPI_LOOPBACK));
+ 	if (tch_xfer(pat, got, sizeof(pat)) == 0) {
+ 		printf("LIUQIN TOUCH: SE loopback tx 55 aa 0f f0 rx %02x %02x %02x %02x "
+ 		    "(%s)\n", got[0], got[1], got[2], got[3],
+@@ -1815,7 +1825,34 @@
+ 	}
+ 	tch_wr(tch.se, SE_SPI_LOOPBACK, 0);
+ 
++	/* CS trace across one full read: the page write and the read are two
++	 * commands and FRAGMENTATION has to hold the line between them, the way
++	 * the pads path keeps CS asserted for the whole window. */
+ 	{
++		uint8_t page[3], tx[8], rx[8] = { 0 };
++		uint32_t p[5];
++
++		p[0] = tch_pads();
++		(void)tch_cs(true);
++		p[1] = tch_pads();
++		page[0] = 0xff;
++		page[1] = (uint8_t)((NVT_CHIP_VER_TRIM_ADDR >> 15) & 0xff);
++		page[2] = (uint8_t)((NVT_CHIP_VER_TRIM_ADDR >> 7) & 0xff);
++		(void)tch_xfer(page, NULL, 3);
++		p[2] = tch_pads();
++		memset(tx, 0, sizeof(tx));
++		tx[0] = (uint8_t)(NVT_CHIP_VER_TRIM_ADDR & 0x7f);
++		(void)tch_xfer(tx, rx, sizeof(rx));
++		p[3] = tch_pads();
++		(void)tch_cs(false);
++		p[4] = tch_pads();
++		printf("LIUQIN TOUCH: CS trace idle 0x%x assert 0x%x after-page 0x%x "
++		    "after-read 0x%x release 0x%x rx %02x %02x %02x %02x %02x %02x\n",
++		    p[0], p[1], p[2], p[3], p[4],
++		    rx[2], rx[3], rx[4], rx[5], rx[6], rx[7]);
++	}
++
++	{
+ 		static const uint32_t divs[] = { 32, 128, 8 };
+ 		bool found = false;
+ 
+@@ -1825,9 +1862,10 @@
+ 			    ((tch.div & CLK_DIV_MSK) << CLK_DIV_SHFT) | SER_CLK_EN);
+ 			for (unsigned order = 0; order < 2 && !found; order++) {
+ 				uint8_t id[6] = { 0 };
+-				const int err = tch_nvt_read(NVT_CHIP_VER_TRIM_ADDR, id,
+-				    sizeof(id));
++				int err;
+ 
++				tch_dma_order = (int)order;
++				err = tch_nvt_read(NVT_CHIP_VER_TRIM_ADDR, id, sizeof(id));
+ 				printf("LIUQIN TOUCH: trim id %s div %u: "
+ 				    "%02x %02x %02x %02x %02x %02x (%s)\n",
+ 				    order ? "cmd-first" : "desc-first", divs[d],
+@@ -1835,8 +1873,71 @@
+ 				    err != 0 ? "read failed" :
+ 				    (id[4] == 0x65 && id[5] == 0x03) ? "MATCH" : "no match");
+ 				if (err == 0 && id[4] == 0x65 && id[5] == 0x03) {
+-					tch_dma_order = (int)order;
+ 					found = true;
++				}
++			}
++		}
++		if (!found) {
++			/* Ground truth on the pads: does the panel still answer the
++			 * bit-banged path the way it has for months?  If not, the
++			 * engine's transfers wedged it and the reset below matters;
++			 * if yes, the fault is inside the engine's data path. */
++			if (tch.tlmm != 0) {
++				uint8_t id[6] = { 0 };
++
++				bb_calibrate();
++				for (unsigned pin = 16; pin <= 19; pin++) {
++					tch_wr(tch.tlmm, TLMM_CTL(pin),
++					    (0u << 2) | (0u << 0) | (2u << 6));
++				}
++				tch.bitbang = true;
++				tch.cs_manual = true;
++				tch.bb_pace_us = 5;
++				tch.pin_cs = 19;
++				tch.pin_clk = 18;
++				tch.pin_mosi = 17;
++				tch.pin_miso = 16;
++				tch_bb_dir(19, true, 1);
++				tch_bb_dir(18, true, 0);
++				tch_bb_dir(17, true, 0);
++				tch_bb_dir(16, false, 0);
++				(void)tch_nvt_read(NVT_CHIP_VER_TRIM_ADDR, id, sizeof(id));
++				printf("LIUQIN TOUCH: pad-path trim id %02x %02x %02x %02x "
++				    "%02x %02x (%s)\n", id[0], id[1], id[2], id[3], id[4],
++				    id[5], id[4] == 0x65 && id[5] == 0x03 ?
++				    "panel alive" : "no answer");
++				tch.bitbang = false;
++				for (unsigned pin = 16; pin <= 19; pin++) {
++					tch_wr(tch.tlmm, TLMM_CTL(pin),
++					    (1u << 2) | (0u << 0) | (2u << 6));
++				}
++				/* A clean slate: the same reset the pads path does, then
++				 * ask through the engine once more. */
++				tch_bb_dir(20, true, 0);
++				delay(100 * 1000);
++				tch_bb_dir(20, true, 1);
++				delay(200 * 1000);
++				printf("LIUQIN TOUCH: gpio20 reset pulse done\n");
++				tch.div = 32;
++				tch_wr(tch.se, GENI_SER_M_CLK_CFG,
++				    ((tch.div & CLK_DIV_MSK) << CLK_DIV_SHFT) | SER_CLK_EN);
++				for (unsigned order = 0; order < 2 && !found; order++) {
++					uint8_t id2[6] = { 0 };
++					int err;
++
++					tch_dma_order = (int)order;
++					err = tch_nvt_read(NVT_CHIP_VER_TRIM_ADDR,
++					    id2, sizeof(id2));
++					printf("LIUQIN TOUCH: reset retry trim id %s div 32: "
++					    "%02x %02x %02x %02x %02x %02x (%s)\n",
++					    order ? "cmd-first" : "desc-first",
++					    id2[0], id2[1], id2[2], id2[3], id2[4], id2[5],
++					    err != 0 ? "read failed" :
++					    (id2[4] == 0x65 && id2[5] == 0x03) ?
++					    "MATCH" : "no match");
++					if (err == 0 && id2[4] == 0x65 && id2[5] == 0x03) {
++						found = true;
++					}
+ 				}
+ 			}
+ 		}
+@@ -1844,12 +1945,13 @@
+ 			tch.div = 32;
+ 			tch_wr(tch.se, GENI_SER_M_CLK_CFG,
+ 			    ((tch.div & CLK_DIV_MSK) << CLK_DIV_SHFT) | SER_CLK_EN);
+-			printf("LIUQIN TOUCH: no ordering/clock combination returned the "
+-			    "ROM trim id\n");
++			printf("LIUQIN TOUCH: no ordering/clock/reset combination returned "
++			    "the ROM trim id\n");
+ 		} else {
+ 			tch.spi_hz = SE_CLK_HZ / tch.div;
+ 			printf("LIUQIN TOUCH: keeping %s, div %u (%u kHz)\n",
+-			    tch_dma_order ? "cmd-first" : "desc-first", tch.div, tch.spi_hz / 1000);
++			    tch_dma_order ? "cmd-first" : "desc-first", tch.div,
++			    tch.spi_hz / 1000);
+ 		}
+ 	}
+ }

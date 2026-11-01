@@ -1,0 +1,25 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7425,6 +7425,22 @@
+ 				char mark[64];
+ 				snprintf(mark, sizeof(mark), "exec %s", p->p_name);
+ 				liuqin_boot_mark(mark);
++			}
++			/*
++			 * Did the environment the parent passed actually reach this
++			 * exec?  Say the DYLD_* variables it carries, so an injection
++			 * that never happens can be told from one dyld pruned.
++			 */
++			{
++				char *e = imgp->ip_endargv;
++				char *end = imgp->ip_endenvv;
++
++				while (e != NULL && end != NULL && e < end && *e != '\0') {
++					if (strncmp(e, "DYLD_", 5) == 0 && strlen(e) < 120) {
++						printf("EXECENV %s: %s\n", p->p_name, e);
++					}
++					e += strlen(e) + 1;
++				}
+ 			}
+ #else
+ 			printf("Allowing spawn of iOS binary %s since it has "

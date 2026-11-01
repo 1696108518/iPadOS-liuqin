@@ -1,0 +1,35 @@
+--- a/iokit/Kernel/arm/hid/IOHIDEventService.h
++++ b/iokit/Kernel/arm/hid/IOHIDEventService.h
+@@ -53,6 +53,7 @@
+ 
+ protected:
+ 	virtual bool            handleOpen(IOService *client, IOOptionBits options, void *argument) APPLE_KEXT_OVERRIDE;
++	virtual bool            matchPropertyTable(OSDictionary *table, SInt32 *score) APPLE_KEXT_OVERRIDE;
+ 	virtual void            handleClose(IOService *client, IOOptionBits options) APPLE_KEXT_OVERRIDE;
+ 	virtual bool            handleIsOpen(const IOService *client) const APPLE_KEXT_OVERRIDE;
+ 
+--- a/iokit/Kernel/arm/hid/LiuqinHID.cpp
++++ b/iokit/Kernel/arm/hid/LiuqinHID.cpp
+@@ -138,7 +138,22 @@
+ 	super::close(forClient, options);
+ }
+ 
++/*
++ * Probe: every user-space match is evaluated through here, so a line per match
++ * says whether backboardd's HIDServiceSupport match ever reaches this service
++ * at all (as opposed to reaching it and deciding not to open it).
++ */
+ bool
++IOHIDEventService::matchPropertyTable(OSDictionary *table, SInt32 *score)
++{
++	bool ok = super::matchPropertyTable(table, score);
++
++	IOLog("LIUQIN HID: %s matchPropertyTable -> %d (score %d)\n",
++	    getName(), ok, score ? (int)*score : -1);
++	return ok;
++}
++
++bool
+ IOHIDEventService::handleOpen(IOService *client, IOOptionBits options __unused, void *argument)
+ {
+ 	IOHIDEventServiceClient *data = OSDynamicCast(IOHIDEventServiceClient, (OSObject *)argument);

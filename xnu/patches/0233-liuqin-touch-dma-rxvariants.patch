@@ -1,0 +1,77 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -1817,7 +1817,8 @@
+  * rebuild what actually went out on MOSI and came back on MISO.
+  */
+ static void
+-tch_wire_capture(bool tx_only, const char *what, const uint8_t *pat, size_t len)
++tch_wire_capture(bool tx_only, const char *what, const uint8_t *pat, size_t len,
++    int variant)
+ {
+ 	uint8_t txb[8] = { 0 }, rxb[8] = { 0 };
+ 	uint8_t fill[24], se_rx[24];
+@@ -1841,10 +1842,27 @@
+ 	tch_dma_mode();
+ 	tch_wr(tch.se, SE_SPI_TX_TRANS_LEN, (uint32_t)len);
+ 	tch_wr(tch.se, SE_SPI_RX_TRANS_LEN, tx_only ? 0u : (uint32_t)len);
++	if (variant == 1) {
++		/* FIFO-mode watermarks (13/14 of a 16-deep FIFO) may be what stops
++		 * the RX DMA from triggering on a short read: drop them to 1. */
++		tch_wr(tch.se, SE_GENI_RX_WATERMARK_REG, 1);
++		tch_wr(tch.se, SE_GENI_RX_RFR_WATERMARK_REG, 1);
++	}
+ 	tch_wr(tch.se, SE_GENI_M_CMD0,
+ 	    ((tx_only ? SPI_TX_ONLY : SPI_TX_RX) << M_OPCODE_SHFT) | FRAGMENTATION);
+ 	tch_dma_arm(true, !tx_only, tch.dma_pa + TCH_DMA_TX_OFF,
+ 	    tch.dma_pa + TCH_DMA_RX_OFF, len);
++	if (variant == 2) {
++		/* EOT on the RX buffer (Linux leaves it 0, but so is everything
++		 * here that turned out to be a guess). */
++		tch_wr(tch.se, SE_DMA_RX_ATTR, GENI_SE_DMA_EOT_BUF);
++	}
++	if (variant != 0) {
++		printf("LIUQIN TOUCH: capture variant %d: wm %u/%u attr 0x%08x\n",
++		    variant, tch_rd(tch.se, SE_GENI_RX_WATERMARK_REG),
++		    tch_rd(tch.se, SE_GENI_RX_RFR_WATERMARK_REG),
++		    tch_rd(tch.se, SE_DMA_RX_ATTR));
++	}
+ 
+ 	prev = tch_pads();
+ 	/* ~200k samples at ~2 us each covers a 13.6 ms transfer many times
+@@ -1890,8 +1908,21 @@
+ 		    tch_rd(tch.se, SE_DMA_RX_IRQ_STAT));
+ 	}
+ 
++	if (variant == 1) {
++		tch_wr(tch.se, SE_GENI_RX_WATERMARK_REG, tch.tx_fifo_depth - 3);
++		tch_wr(tch.se, SE_GENI_RX_RFR_WATERMARK_REG, tch.tx_fifo_depth - 2);
++	}
+ 	tch.div = 32;
+ 	tch_wr(tch.se, GENI_SER_M_CLK_CFG, ((32u & CLK_DIV_MSK) << CLK_DIV_SHFT) | SER_CLK_EN);
++	if (variant == 0) {
++		printf("LIUQIN TOUCH: rx cfg len %u attr 0x%08x gran %u pack0 0x%08x "
++		    "pack1 0x%08x fifo_stat 0x%08x\n",
++		    tch_rd(tch.se, SE_DMA_RX_LEN), tch_rd(tch.se, SE_DMA_RX_ATTR),
++		    tch_rd(tch.se, SE_GENI_BYTE_GRAN),
++		    tch_rd(tch.se, SE_GENI_RX_PACKING_CFG0),
++		    tch_rd(tch.se, SE_GENI_RX_PACKING_CFG1),
++		    tch_rd(tch.se, SE_GENI_RX_FIFO_STATUS));
++	}
+ }
+ 
+ /*
+@@ -2046,9 +2077,11 @@
+ 					cmd8[0] = (uint8_t)(NVT_CHIP_VER_TRIM_ADDR & 0x7f);
+ 					printf("LIUQIN TOUCH: wire capture at %u Hz\n",
+ 					    SE_CLK_HZ / 4095);
+-					tch_wire_capture(false, "duplex", pat8, 8);
+-					tch_wire_capture(true, "txonly", page3, 3);
+-					tch_wire_capture(false, "readcmd", cmd8, 8);
++					tch_wire_capture(false, "duplex", pat8, 8, 0);
++					tch_wire_capture(true, "txonly", page3, 3, 0);
++					tch_wire_capture(false, "readcmd", cmd8, 8, 0);
++					tch_wire_capture(false, "readcmd-wm1", cmd8, 8, 1);
++					tch_wire_capture(false, "readcmd-attr1", cmd8, 8, 2);
+ 				}
+ 				/* The delay matrix failed (all four groups), so the gap is
+ 				 * not the cause - what is left is the clock itself, or the

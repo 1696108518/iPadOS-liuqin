@@ -1,0 +1,49 @@
+--- a/iokit/Kernel/arm/hid/LiuqinHID.cpp
++++ b/iokit/Kernel/arm/hid/LiuqinHID.cpp
+@@ -531,6 +531,33 @@
+ }
+ 
+ /*
++ * Apple's digitizer on iOS is an IOHIDDevice subclass called
++ * AppleMultitouchDevice (vendor usage page 0xff00 / usage 0xf).  Matching only
++ * "IOHIDDevice" is not enough for backboardd's HID stack, so the stub is
++ * published under that class name - one boot shows whether the class name is
++ * what the digitizer client waits for.
++ */
++class AppleMultitouchDevice : public IOHIDDevice
++{
++	OSDeclareDefaultStructors(AppleMultitouchDevice)
++
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleMultitouchDevice, IOHIDDevice)
++
++bool
++AppleMultitouchDevice::start(IOService *provider)
++{
++	if (!IOHIDDevice::start(provider)) {
++		return false;
++	}
++	IOLog("LIUQIN HID: AppleMultitouchDevice started (0xff00/0xf)\n");
++	return true;
++}
++
++/*
+  * Placesholder user client for the 'HID' connect type (0x00484944,
+  * kIOHIDLibUserClientConnectManager).  It answers every external method with
+  * kIOReturnUnsupported but logs the selector, so one boot tells us exactly the
+@@ -672,10 +699,10 @@
+ 	}
+ 
+ 	{
+-		IOHIDDevice *dev = OSTypeAlloc(IOHIDDevice);
++		AppleMultitouchDevice *dev = OSTypeAlloc(AppleMultitouchDevice);
+ 
+ 		if (dev && dev->init() && dev->attach(nub) && dev->start(nub)) {
+-			IOLog("LIUQIN HID: IOHIDDevice stub relaunched\n");
++			IOLog("LIUQIN HID: multitouch device relaunched\n");
+ 		} else if (dev) {
+ 			dev->release();
+ 		}

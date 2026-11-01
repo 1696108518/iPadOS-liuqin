@@ -1,0 +1,162 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -107,6 +107,7 @@
+ bsd/dev/liuqin_ufs.c			standard
+ bsd/dev/liuqin_adreno.c			standard
+ bsd/dev/liuqin_sample.c			standard
++bsd/dev/liuqin_touch.c			standard
+ bsd/dev/liuqin_usb.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+--- a/bsd/dev/liuqin_ufs.c
++++ b/bsd/dev/liuqin_ufs.c
+@@ -95,6 +95,7 @@
+ extern void liuqin_adreno_services_start(void) __attribute__((weak));
+ extern void liuqin_sample_start(void);
+ extern void liuqin_usb_probe(void);
++extern void liuqin_touch_probe(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_AHIT        0x18    /* auto-hibernate idle timer */
+@@ -1809,6 +1810,7 @@
+ 	liuqin_log_start();
+ 	liuqin_boot_mark("log thread started");
+ 	liuqin_sample_start();
++	liuqin_touch_probe();
+ 	/* gated by liuqinusb (0 off, 1 report, 2 device); the QUSB2 PHY address is sweet's
+ 	 * and does not exist here, so liuqin_usb.c skips it unless asked. */
+ 	liuqin_usb_probe();
+--- /dev/null
++++ b/bsd/dev/liuqin_touch.c
+@@ -0,0 +1,131 @@
++/*
++ * LIUQIN touchscreen: step 1 - read-only state audit.
++ *
++ * The panel's touch controller is a Novatek NT36532 on GENI SPI4 (QUPv3
++ * wrapper 0, serial engine 4, spi@0x990000), chip select 0, with its
++ * interrupt on TLMM gpio21 and the data/clock pins on gpio16..gpio19 in
++ * function "qup4".  Facts from the mainline tree this port follows
++ * (yzddmr6/linux-sm8450-liuqin, branch liuqin-6.17, sm8475-xiaomi-liuqin.dts
++ * and sm8450.dtsi, which in turn quotes the vendor bootloader's FDT).
++ *
++ * Nothing here writes a register: the point is to learn what `fastboot boot`
++ * leaves behind - whether ABL already clocked the wrapper and muxed the pins
++ * (it may have, since the vendor chain drives the same controller), and to
++ * validate the base addresses before a single write is made.  Serial engine
++ * registers are only touched when the GCC side says the engine's clocks are
++ * running: an access to a gated QUP block hangs the bus.
++ *
++ * Boot arg liuqintouch: 0 off (default), 1 audit, higher values will add the
++ * clock/pin programming and the SPI transfers.
++ */
++#if defined(ARM64_BOARD_CONFIG_LIUQIN)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define GCC_PA          0x00100000
++#define GCC_SIZE        0x00100000
++#define TLMM_PA         0x0f100000
++#define TLMM_SIZE       0x00200000
++#define SE4_PA          0x00990000
++#define SE4_SIZE        0x00004000
++
++/* QUPv3 wrapper 0 branch enables: one register, one bit per clock. */
++#define GCC_QUPV3_WRAP0_CBCR    0x62008
++#define QUP_CBCR_M_AHB          (1u << 6)
++#define QUP_CBCR_S_AHB          (1u << 7)
++#define QUP_CBCR_CORE           (1u << 8)
++#define QUP_CBCR_CORE_2X        (1u << 9)
++#define QUP_CBCR_S4             (1u << 14)
++#define CBCR_CLK_OFF            (1u << 31)
++
++/* gcc_qupv3_wrap0_s4_clk_src, clk-rcg2 layout. */
++#define GCC_S4_CMD_RCGR         0x274e4
++#define GCC_S4_CFG_RCGR         0x274e8
++#define GCC_S4_M                0x274f0
++#define GCC_S4_N                0x274f4
++#define GCC_S4_D                0x274f8
++#define GCC_S4_CBCR             0x274dc          /* halt status: BRANCH_HALT_VOTED */
++
++/* TLMM: one 0x1000 block per pin (pinctrl-sm8450.c PINGROUP). */
++#define TLMM_CTL(pin)           (0x1000u * (pin))
++#define TLMM_MUX(v)             (((v) >> 2) & 7u)
++#define TLMM_PULL(v)            ((v) & 3u)
++#define TLMM_DRIVE(v)           (((v) >> 6) & 7u)
++
++/* GENI SE registers (include/linux/soc/qcom/geni-se.h). */
++#define SE_GENI_STATUS          0x40
++#define GENI_FW_REVISION_RO     0x68
++#define SE_GENI_S_CMD0          0x630
++#define SE_GENI_S_IRQ_STATUS    0x640
++
++static uint32_t
++tch_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++void
++liuqin_touch_probe(void)
++{
++	int level = 0;
++	(void)PE_parse_boot_argn("liuqintouch", &level, sizeof(level));
++	if (level <= 0) {
++		return;
++	}
++	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	vm_offset_t tlmm = ml_io_map(TLMM_PA, TLMM_SIZE);
++	if (gcc == 0 || tlmm == 0) {
++		printf("LIUQIN TOUCH: map failed (gcc %d tlmm %d)\n", gcc != 0, tlmm != 0);
++		return;
++	}
++
++	/* --- GCC: is the wrapper clocked at all? --- */
++	const uint32_t cbcr = tch_rd(gcc, GCC_QUPV3_WRAP0_CBCR);
++	printf("LIUQIN TOUCH: GCC QUPV3_WRAP0_CBCR 0x%08x [m_ahb %d s_ahb %d core %d core2x %d s4 %d]\n",
++	    cbcr,
++	    (cbcr & QUP_CBCR_M_AHB) != 0, (cbcr & QUP_CBCR_S_AHB) != 0,
++	    (cbcr & QUP_CBCR_CORE) != 0, (cbcr & QUP_CBCR_CORE_2X) != 0,
++	    (cbcr & QUP_CBCR_S4) != 0);
++	const uint32_t s4_halt = tch_rd(gcc, GCC_S4_CBCR);
++	const uint32_t cmd = tch_rd(gcc, GCC_S4_CMD_RCGR);
++	const uint32_t cfg = tch_rd(gcc, GCC_S4_CFG_RCGR);
++	const uint32_t m = tch_rd(gcc, GCC_S4_M);
++	const uint32_t n = tch_rd(gcc, GCC_S4_N);
++	const uint32_t d = tch_rd(gcc, GCC_S4_D);
++	printf("LIUQIN TOUCH: GCC S4 halt 0x%08x cmd 0x%08x cfg 0x%08x m %u n %u d %u (%s)\n",
++	    s4_halt, cmd, cfg, m, n, d,
++	    (s4_halt & CBCR_CLK_OFF) ? "off" : "running");
++
++	/* --- TLMM: what function do the five pins carry? --- */
++	const uint32_t pins[5] = { 16, 17, 18, 19, 21 };
++	for (unsigned i = 0; i < 5; i++) {
++		const uint32_t ctl = tch_rd(tlmm, TLMM_CTL(pins[i]));
++		printf("LIUQIN TOUCH: gpio%u ctl 0x%08x mux %u pull %u drive %u %s\n",
++		    pins[i], ctl, TLMM_MUX(ctl), TLMM_PULL(ctl), TLMM_DRIVE(ctl),
++		    TLMM_MUX(ctl) == 1 ? "(qup4)" : "(not qup4)");
++	}
++
++	/* --- SE4: only when its clocks are up, otherwise the bus would hang. --- */
++	const bool clocked = (cbcr & (QUP_CBCR_M_AHB | QUP_CBCR_CORE | QUP_CBCR_CORE_2X | QUP_CBCR_S4)) ==
++	    (QUP_CBCR_M_AHB | QUP_CBCR_CORE | QUP_CBCR_CORE_2X | QUP_CBCR_S4);
++	if (!clocked) {
++		printf("LIUQIN TOUCH: SE4 not clocked, registers not read\n");
++		return;
++	}
++	vm_offset_t se = ml_io_map(SE4_PA, SE4_SIZE);
++	if (se == 0) {
++		printf("LIUQIN TOUCH: SE4 map failed\n");
++		return;
++	}
++	printf("LIUQIN TOUCH: SE4 status 0x%08x fwrev 0x%08x s_cmd 0x%08x s_irq 0x%08x\n",
++	    tch_rd(se, SE_GENI_STATUS), tch_rd(se, GENI_FW_REVISION_RO),
++	    tch_rd(se, SE_GENI_S_CMD0), tch_rd(se, SE_GENI_S_IRQ_STATUS));
++}
++#endif /* ARM64_BOARD_CONFIG_LIUQIN */

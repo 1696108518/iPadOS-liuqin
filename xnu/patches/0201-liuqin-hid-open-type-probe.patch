@@ -1,0 +1,22 @@
+--- a/iokit/Kernel/arm/hid/LiuqinHID.cpp
++++ b/iokit/Kernel/arm/hid/LiuqinHID.cpp
+@@ -310,7 +310,10 @@
+ {
+ 	IOUserClient *client;
+ 
+-	if (type != kIOHIDEventServiceUserClientType) {
++	/* Log every open attempt with its type: the interesting question is what
++	 * type user space asks for (0x65737563 is 'esuc', Apple's own constant). */
++	IOLog("LIUQIN HID: %s newUserClient type 0x%x\n", getName(), (unsigned)type);
++	if (type != kIOHIDEventServiceUserClientType && type != 0 && type != 1) {
+ 		IOLog("LIUQIN HID: %s user client type 0x%x unsupported\n", getName(), (unsigned)type);
+ 		return super::newUserClient(owningTask, securityID, type, properties, handler);
+ 	}
+@@ -333,6 +336,7 @@
+ 		return kIOReturnUnsupported;
+ 	}
+ 	*handler = client;
++	IOLog("LIUQIN HID: %s user client created type 0x%x\n", getName(), (unsigned)type);
+ 	return kIOReturnSuccess;
+ }
+ 

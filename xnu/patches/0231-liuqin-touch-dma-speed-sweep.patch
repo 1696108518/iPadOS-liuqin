@@ -1,0 +1,109 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -2035,51 +2035,76 @@
+ 					tch_wire_capture(true, "txonly", page3, 3);
+ 					tch_wire_capture(false, "readcmd", cmd8, 8);
+ 				}
+-				/* The wire says the data path is perfect at 4.7 kHz and
+-				 * the panel answers the real read with the real trim id;
+-				 * at 600 kHz the same read is garbage.  That leaves the
+-				 * two gaps the driver keeps short and the capture keeps
+-				 * long: page write -> read, and CS assert -> first clock.
+-				 * Walk them and keep the first combination that answers
+-				 * correctly, so the rest of the session uses it. */
++				/* The delay matrix failed (all four groups), so the gap is
++				 * not the cause - what is left is the clock itself, or the
++				 * first byte's delivery at speed.  Two tests, both decisive:
++				 * (a) the engine's own read at slower clocks: if it answers
++				 * correctly at 4.7 kHz, the SE path is sound and only the rate
++				 * is in the way; (b) the same read with the descriptors armed
++				 * *before* the command (desc-first) and the page write sent as
++				 * duplex (opcode 7), which pre-arms TX - the thing that makes
++				 * the first byte reliable at speed - without the TX-only
++				 * desc-first hang. */
+ 				{
+-					static const unsigned dlys[4][2] = {
+-						{ 0, 0 }, { 1000, 0 }, { 1000, 50 },
+-						{ 5000, 50 }
+-					};
++					static const uint32_t divs2[] = { 4095, 512, 128, 32 };
+ 					bool kept = false;
+ 
+-					tch.div = 32;
+-					tch_wr(tch.se, GENI_SER_M_CLK_CFG,
+-					    (32u << CLK_DIV_SHFT) | SER_CLK_EN);
++					tch_page_dly = 0;
++					tch_cs_dly = 0;
+ 					tch_dma_order = 1;
+ 					for (unsigned i = 0; i < 4 && !kept; i++) {
+ 						uint8_t id[6] = { 0 };
+ 						int err;
+ 
+-						tch_page_dly = dlys[i][0];
+-						tch_cs_dly = dlys[i][1];
+-						err = tch_nvt_read(NVT_CHIP_VER_TRIM_ADDR, id,
+-						    sizeof(id));
+-						printf("LIUQIN TOUCH: page delay %u us, cs delay "
+-						    "%u us: %02x %02x %02x %02x %02x %02x (%s)\n",
+-						    dlys[i][0], dlys[i][1], id[0], id[1], id[2],
+-						    id[3], id[4], id[5],
++						tch.div = divs2[i];
++						tch_wr(tch.se, GENI_SER_M_CLK_CFG,
++						    ((tch.div & CLK_DIV_MSK) << CLK_DIV_SHFT) | SER_CLK_EN);
++						err = tch_nvt_read(NVT_CHIP_VER_TRIM_ADDR, id, sizeof(id));
++						printf("LIUQIN TOUCH: se read div %u (%u Hz): %02x %02x %02x "
++						    "%02x %02x %02x (%s)\n", tch.div, SE_CLK_HZ / tch.div,
++						    id[0], id[1], id[2], id[3], id[4], id[5],
+ 						    err != 0 ? "read failed" :
+-						    (id[4] == 0x65 && id[5] == 0x03) ?
+-						    "MATCH" : "no match");
++						    (id[4] == 0x65 && id[5] == 0x03) ? "MATCH" : "no match");
+ 						if (err == 0 && id[4] == 0x65 && id[5] == 0x03) {
+ 							kept = true;
+-							printf("LIUQIN TOUCH: keeping page delay "
+-							    "%u us, cs delay %u us\n", dlys[i][0],
+-							    dlys[i][1]);
+ 						}
+ 					}
+-					if (!kept) {
+-						tch_page_dly = 0;
+-						tch_cs_dly = 0;
++					if (kept) {
++						tch.spi_hz = SE_CLK_HZ / tch.div;
++						printf("LIUQIN TOUCH: keeping div %u (%u Hz)\n",
++						    tch.div, tch.spi_hz);
++					} else {
++						tch.div = 32;
++						tch_wr(tch.se, GENI_SER_M_CLK_CFG,
++						    ((tch.div & CLK_DIV_MSK) << CLK_DIV_SHFT) | SER_CLK_EN);
+ 					}
+ 				}
++				/* (b) descriptor-first duplex at 600 kHz. */
++				{
++					uint8_t page[3], tx[8] = { 0 }, rx[8] = { 0 }, scr[3] = { 0 };
++					int err;
++
++					page[0] = 0xff;
++					page[1] = (uint8_t)((NVT_CHIP_VER_TRIM_ADDR >> 15) & 0xff);
++					page[2] = (uint8_t)((NVT_CHIP_VER_TRIM_ADDR >> 7) & 0xff);
++					tx[0] = (uint8_t)(NVT_CHIP_VER_TRIM_ADDR & 0x7f);
++					tch.div = 32;
++					tch_wr(tch.se, GENI_SER_M_CLK_CFG,
++					    ((32u & CLK_DIV_MSK) << CLK_DIV_SHFT) | SER_CLK_EN);
++					tch_dma_order = 0;
++					(void)tch_cs(true);
++					(void)tch_xfer(page, scr, 3);
++					(void)tch_cs(false);
++					(void)tch_cs(true);
++					err = tch_xfer(tx, rx, 8);
++					(void)tch_cs(false);
++					printf("LIUQIN TOUCH: desc-first duplex: %02x %02x %02x %02x %02x "
++					    "%02x %02x %02x (%s)\n", rx[0], rx[1], rx[2], rx[3], rx[4],
++					    rx[5], rx[6], rx[7],
++					    err != 0 ? "xfer failed" :
++					    (rx[6] == 0x65 && rx[7] == 0x03) ? "MATCH at rx[6..7]" : "no match");
++					tch_dma_order = 1;
++				}
+ 				/* Before switching the mux, one raw look at what the
+ 				 * engine captures: the whole RX of an 8-byte read
+ 				 * (skip nothing) and of a 9-byte double-address read -

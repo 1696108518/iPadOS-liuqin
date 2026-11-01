@@ -1,0 +1,45 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -1295,7 +1295,10 @@
+ tch_fw_reg_write(uint32_t page_addr, uint32_t reg_addr, const uint8_t *data, size_t len)
+ {
+ 	uint8_t page[3];
+-	uint8_t buf[6];
++	/* register byte plus up to 6 data bytes (the cascade reset-status clear
++	 * is a seven-byte write); the fortified memcpy panics on a five-byte
++	 * buffer, which is exactly what touch40 did. */
++	uint8_t buf[8];
+ 
+ 	page[0] = 0xff;
+ 	page[1] = (uint8_t)((page_addr >> 15) & 0xff);
+@@ -1379,7 +1382,7 @@
+ tch_fw_crc_line(uint32_t txinfo, unsigned polls, uint32_t ilm_exp, uint32_t dlm_exp)
+ {
+ 	tch_fw_read_crc();
+-	printf("LIUQIN TOUCH: fw dl crc: txinfo 0x%02x@%u done %u ilm %u dlm %u | "
++	printf("LIUQIN TOUCH: fw dl crc pre: txinfo 0x%02x@%u done %u ilm %u dlm %u | "
+ 	    "ilm exp %08x got %08x | dlm exp %08x got %08x\n",
+ 	    txinfo, polls, (tch_fw_crc.flags >> 2) & 1u, tch_fw_crc.flags & 1u,
+ 	    (tch_fw_crc.flags >> 1) & 1u, ilm_exp, tch_fw_crc.ilm,
+@@ -1614,12 +1617,20 @@
+ 	secs = tch_ms_since(t0) / 1000;
+ 	tch.bb_pace_us = saved_pace;
+ 
++	/*
++	 * The vendor reads the BLD CRC registers only after a failed boot attempt
++	 * (nvt_download_firmware_hw_crc -> fail -> nvt_read_bld_hw_crc): the
++	 * bootloader fills ILM/DLM CRC flags and the R_ checksums when it tries to
++	 * start, so a read before boot_ready proves nothing.  Read them again here.
++	 */
++	tch_fw_read_crc();
++
+ 	/* One verdict line that repeats what matters, because earlier lines can
+ 	 * be lost to console interleaving; the boot mark carries the answer to
+ 	 * the screen, where the muted console does not. */
+ 	tch_visible_mark(ready ? "touch fw BOOTED" : "touch fw did not boot");
+ 	printf("LIUQIN TOUCH: fw dl %s: %u B %u chunks %u s, txinfo 0x%02x@%u, "
+-	    "crc 0x%02x ilm %08x dlm %08x, state 0x%02x@2fe60 0x%02x@2fd60 %u polls\n",
++	    "crc post 0x%02x ilm %08x dlm %08x, state 0x%02x@2fe60 0x%02x@2fd60 %u polls\n",
+ 	    ready ? "BOOTED" : "did not boot", written, chunks, secs, txinfo, polls,
+ 	    tch_fw_crc.flags, tch_fw_crc.ilm, tch_fw_crc.dlm, boot_a, boot_b,
+ 	    boot_polls);

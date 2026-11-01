@@ -1,0 +1,98 @@
+--- a/iokit/Kernel/arm/hid/LiuqinHID.cpp
++++ b/iokit/Kernel/arm/hid/LiuqinHID.cpp
+@@ -461,8 +461,78 @@
+ 	OSSafeReleaseNULL(match);
+ 	OSSafeReleaseNULL(props);
+ 	OSSafeReleaseNULL(cls);
++}
++
++/*
++ * Probe: does the userland's HID stack open IOHIDDevice services at all?
++ *
++ * backboardd arms three matches of the form `IOProviderClass = IOHIDDevice`
++ * (one of them PrimaryUsagePage 0xff00 / PrimaryUsage 0xf, the vendor
++ * multitouch usage Apple's digitizers publish) and one `IOService +
++ * HIDServiceSupport` match.  Our IOHIDEventServices satisfy only the latter and
++ * are never opened, so this stub answers the question "would an IOHIDDevice be
++ * opened?" - it is deliberately named IOHIDDevice so the class match succeeds,
++ * carries the digitizer usages, and logs every connect type.
++ */
++class IOHIDDevice : public IOService
++{
++	OSDeclareDefaultStructors(IOHIDDevice)
++
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
++	    OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IOHIDDevice, IOService)
++
++bool
++IOHIDDevice::start(IOService *provider)
++{
++	OSNumber *page, *usage;
++	OSArray *pairs;
++	OSDictionary *pair;
++
++	if (!super::start(provider)) {
++		return false;
++	}
++	page = OSNumber::withNumber(0xff00, 32);
++	usage = OSNumber::withNumber(0xf, 32);
++	if (page) {
++		setProperty("PrimaryUsagePage", page);
++		page->release();
++	}
++	if (usage) {
++		setProperty("PrimaryUsage", usage);
++		usage->release();
++	}
++	setProperty("Transport", "SPI");
++	setProperty("Product", "Liuqin Touch Device");
++	if ((pairs = OSArray::withCapacity(1)) != NULL) {
++		if ((pair = OSDictionary::withCapacity(2)) != NULL) {
++			page = OSNumber::withNumber(0xff00, 32);
++			usage = OSNumber::withNumber(0xf, 32);
++			if (page) { pair->setObject("DeviceUsagePage", page); page->release(); }
++			if (usage) { pair->setObject("DeviceUsage", usage); usage->release(); }
++			pairs->setObject(pair);
++			pair->release();
++		}
++		setProperty("DeviceUsagePairs", pairs);
++		pairs->release();
++	}
++	IOLog("LIUQIN HID: IOHIDDevice stub started (0xff00/0xf)\n");
++	registerService();
++	return true;
+ }
+ 
++IOReturn
++IOHIDDevice::newUserClient(task_t owningTask, void *securityID, UInt32 type,
++    OSDictionary *properties, IOUserClient **handler)
++{
++	IOLog("LIUQIN HID: IOHIDDevice stub newUserClient type 0x%x\n", (unsigned)type);
++	return super::newUserClient(owningTask, securityID, type, properties, handler);
++}
++
+ /*
+  * backboardd's HID notifier queues services that already exist when it is
+  * registered and only "pings" for services that first-match after the client
+@@ -491,6 +561,16 @@
+ 		buttons->release();
+ 	}
+ 
++	{
++		IOHIDDevice *dev = OSTypeAlloc(IOHIDDevice);
++
++		if (dev && dev->init() && dev->attach(nub) && dev->start(nub)) {
++			IOLog("LIUQIN HID: IOHIDDevice stub relaunched\n");
++		} else if (dev) {
++			dev->release();
++		}
++	}
++
+ 	touch = OSTypeAlloc(LiuqinHIDTouch);
+ 	if (touch && touch->init() && touch->attach(nub) && touch->start(nub)) {
+ 		IOLog("LIUQIN HID: touch relaunched\n");

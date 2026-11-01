@@ -1,0 +1,17 @@
+--- a/bsd/dev/liuqin_usb.c
++++ b/bsd/dev/liuqin_usb.c
+@@ -170,6 +170,14 @@
+ 	}
+ 	if (!clocks_on) {
+ 		printf("LIUQIN USB: controller unpowered or unclocked; DWC3 not read\n");
++		return;
++	}
++	/* Touching DWC3 is opt-in: a register access to a block whose clocks are not
++	 * really running data-aborts, and the boot must not die for a USB probe. */
++	int dwc_try = 0;
++	PE_parse_boot_argn("liuqinusbdwc", &dwc_try, sizeof(dwc_try));
++	if (!dwc_try) {
++		printf("LIUQIN USB: DWC3 probe skipped (liuqinusbdwc=1 to try)\n");
+ 		return;
+ 	}
+ 	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);

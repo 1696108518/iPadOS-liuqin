@@ -1,0 +1,36 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -298,6 +298,7 @@
+ 	bool        fifo_capable;      /* GENI_IF_DISABLE_RO says FIFO works */
+ 	bool        bitbang;            /* drive gpio16..19 as a software SPI */
+ 	uint32_t    pin_clk, pin_mosi, pin_miso, pin_cs;
++	uint32_t    pin_reset;          /* gpio20, active low */
+ 	uint32_t    bb_pace_us;         /* half clock period, default 5 us */
+ 	vm_offset_t dma;                /* staging page for SE DMA */
+ 	uint64_t    dma_pa;
+@@ -980,6 +981,25 @@
+ 	}
+ 	tch.bitbang = true;
+ 	tch.cs_manual = true;
++
++	/*
++	 * The touch reset is gpio20, not in the mainline device tree at all: the
++	 * vendor overlay's pmx_ts_reset_suspend pulls it down to hold the die in
++	 * reset and mi_ts_active releases it with a pull-up.  Nothing in the boot
++	 * path drives it, so the controller has been sitting in reset - which is
++	 * why it answered neither SPI nor its own interrupt line.  Assert, then
++	 * release and give the MCU time to come up.
++	 */
++	tch.pin_reset = 20;
++	tch_bb_dir(tch.pin_reset, true, 0);
++	delay(5 * 1000);
++	tch_bb_dir(tch.pin_reset, true, 1);
++	delay(30 * 1000);
++	printf("LIUQIN TOUCH: gpio20 reset released (ctl 0x%08x io 0x%08x), INT now %d\n",
++	    tch_rd(tch.tlmm, TLMM_CTL(tch.pin_reset)),
++	    tch_rd(tch.tlmm, TLMM_CTL(tch.pin_reset) + TLMM_IN_OUT),
++	    bb_get(21));
++
+ 	tch_bb_selftest();
+ 
+ 	/*

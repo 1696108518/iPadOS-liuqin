@@ -1,0 +1,129 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -298,6 +298,7 @@
+ 	bool        fifo_capable;      /* GENI_IF_DISABLE_RO says FIFO works */
+ 	bool        bitbang;            /* drive gpio16..19 as a software SPI */
+ 	bool        cs_high;            /* chip select is active high */
++	bool        page8;              /* page bytes as addr>>16 / addr>>8 */
+ 	uint32_t    pin_clk, pin_mosi, pin_miso, pin_cs;
+ 	uint32_t    pin_reset;          /* gpio20, active low */
+ 	uint32_t    bb_pace_us;         /* half clock period, default 5 us */
+@@ -899,8 +900,15 @@
+ 		return -1;
+ 	}
+ 	page[0] = 0xff;                                 /* set page */
+-	page[1] = (uint8_t)((addr >> 15) & 0xff);
+-	page[2] = (uint8_t)((addr >> 7) & 0xff);
++	if (tch.page8) {
++		/* The vendor NT36xxx driver's page register takes bits 23:16 and
++		 * 15:8; the nabu harness used the SPI 15/7 split instead. */
++		page[1] = (uint8_t)((addr >> 16) & 0xff);
++		page[2] = (uint8_t)((addr >> 8) & 0xff);
++	} else {
++		page[1] = (uint8_t)((addr >> 15) & 0xff);
++		page[2] = (uint8_t)((addr >> 7) & 0xff);
++	}
+ 	if (tch_xfer(page, NULL, sizeof(page)) == 0) {
+ 		memset(tx, 0, len + 2);
+ 		memset(rx, 0, len + 2);
+@@ -1121,6 +1129,25 @@
+ 	}
+ 
+ 	tch_bb_selftest();
++
++	/*
++	 * touch17's sweep found exactly one assignment that answers:
++	 * cs gpio17, clk gpio18, mosi gpio19, miso gpio16.  Start from it and
++	 * try both page-address splits before falling back to the sweep.
++	 */
++	tch_roles(17, 18, 19, 16);
++	tch_nvt_bringup();
++	for (unsigned mode = 0; mode < 2; mode++) {
++		tch.page8 = (mode == 1);
++		printf("LIUQIN TOUCH: reading with the %s page split\n",
++		    tch.page8 ? "addr>>16/>>8" : "addr>>15/>>7");
++		if (tch_probe_roles("discovered pins", 0) == 0) {
++			printf("LIUQIN TOUCH: bit-banged SPI: cs gpio%u clk gpio%u mosi gpio%u miso gpio%u\n",
++			    tch.pin_cs, tch.pin_clk, tch.pin_mosi, tch.pin_miso);
++			return 0;
++		}
++	}
++	tch.page8 = false;
+ 
+ 	if (tch_sweep(false, &combos) == 0) {
+ 		return 0;
+@@ -1163,8 +1190,13 @@
+ 	int err;
+ 
+ 	page[0] = 0xff;
+-	page[1] = (uint8_t)((addr >> 15) & 0xff);
+-	page[2] = (uint8_t)((addr >> 7) & 0xff);
++	if (tch.page8) {
++		page[1] = (uint8_t)((addr >> 16) & 0xff);
++		page[2] = (uint8_t)((addr >> 8) & 0xff);
++	} else {
++		page[1] = (uint8_t)((addr >> 15) & 0xff);
++		page[2] = (uint8_t)((addr >> 7) & 0xff);
++	}
+ 	tx[0] = (uint8_t)((addr & 0x7f) | 0x80);
+ 	tx[1] = val;
+ 	if (tch_cs(true) != 0) {
+@@ -1341,7 +1373,10 @@
+ 	return 0;
+ }
+ 
+-static void
++/* Returns true when the controller answered with data we can trust (a Novatek
++ * trim id or a self-consistent FWINFO), so garbage never reaches the HID
++ * layer as "touch". */
++static bool
+ tch_novatek_info(void)
+ {
+ 	uint8_t id[6] = { 0 };
+@@ -1353,6 +1388,8 @@
+ 	    have_id ? (name != NULL ? name : "unknown id") : "read failed",
+ 	    tch.last_irq);
+ 
++	bool valid = have_id && name != NULL;
++
+ 	uint8_t fw[16] = { 0 };
+ 	if (tch_nvt_read(NVT_FWINFO_ADDR, fw, sizeof(fw)) == 0) {
+ 		const uint32_t max_x = ((uint32_t)fw[4] << 8) | fw[5];
+@@ -1363,6 +1400,7 @@
+ 		if (sane) {
+ 			tch.max_x = max_x;
+ 			tch.max_y = max_y;
++			valid = true;
+ 		}
+ 		printf("LIUQIN TOUCH: fwinfo %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x "
+ 		    "%02x %02x %02x %02x %02x %02x (%s)\n",
+@@ -1375,6 +1413,7 @@
+ 		printf("LIUQIN TOUCH: fwinfo read failed, report space %ux%u\n",
+ 		    tch.max_x, tch.max_y);
+ 	}
++	return valid;
+ }
+ 
+ static uint32_t
+@@ -1570,8 +1609,20 @@
+ 		liuqin_boot_mark("touch spi failed");
+ 		return;
+ 	}
+-	tch_novatek_info();
++	const bool valid = tch_novatek_info();
++
+ 	liuqin_console_force = 0;
++	if (!valid) {
++		/* No trustworthy id: do not feed the HID layer garbage.  Watch the
++		 * INT line instead, which still says whether the MCU scans. */
++		thread_t watcher;
++
++		liuqin_boot_mark("touch no valid id");
++		if (kernel_thread_start(liuqin_touch_int_watch, NULL, &watcher) == KERN_SUCCESS) {
++			thread_deallocate(watcher);
++		}
++		return;
++	}
+ 	liuqin_boot_mark("touch id read");
+ 	liuqin_touch_reports_start();
+ 	liuqin_boot_mark("touch reports up");

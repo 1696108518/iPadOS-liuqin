@@ -1,0 +1,131 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -318,7 +318,7 @@
+ /* Printed once, before anything else this driver does.  Every log line that
+  * follows can then be attributed to a build without guessing: a log whose
+  * stamp is missing or old is a log from an older image, not a new failure. */
+-#define TCH_BUILD               "touch170 length-scaled-wait+cancel"
++#define TCH_BUILD               "touch171 crc-flag-cleared"
+ 
+ /* Novatek NT36xxx SPI protocol (vendor nt36xxx driver, SPI variant). */
+ /* The vendor driver (TWRP's nt36532_touch.ko) reads the trim id at 0x1fb104
+@@ -2862,6 +2862,11 @@
+ #define NVT_TX_AUTO_COPY_VAL    0x56u           /* hw_crc == 2 in the vendor module */
+ #define NVT_SPI_DMA_TX_INFO     0x1fc914u      /* map+144 */
+ #define NVT_SW_RESET_ADDR       0x1fb43eu      /* swrst_sif, vendor dmesg */
++/* crc_err_flag_addr=0x1fb535 in the vendor's own dmesg (NT36523's 0x3f135
++ * shifted by 0x1c4400, like every other address on this part).  When it is
++ * set the part reboots into a loop that answers 0xfc at the trim address and
++ * fills the report area with 0xfd; only 0xa5 written here stops it. */
++#define NVT_CRC_ERR_FLAG        0x1fb535u
+ #define NVT_EVENT_BASE          0x125800u      /* map[0] */
+ #define NVT_EVENT_RESET_STATE   (NVT_EVENT_BASE + 0x60u)
+ #define NVT_EVENT_HOST_CMD      (NVT_EVENT_BASE + 0xd0u)
+@@ -3147,6 +3152,60 @@
+ 	tch_fw_crc.flags = f[0];
+ 	tch_fw_crc.ilm = tch_fw_read32(NVT_BLD_ILM_RCRC);
+ 	tch_fw_crc.dlm = tch_fw_read32(NVT_BLD_DLM_RCRC);
++}
++
++/*
++ * nvt_stop_crc_reboot(): the part latches "CRC error" and then reboots into a
++ * loop that answers 0xfc at the trim address and fills the report area with
++ * 0xfd.  The vendor's escape is two idle commands (0xaa to the swrst address)
++ * followed by 0xa5 written to CRC_ERR_FLAG, verified by reading it back.
++ *
++ * touch170 wrote that 0xa5 to address 0x00000 - the first byte of ILM - and so
++ * never cleared the flag at all.  The flag is read here on every download and
++ * cleared if it is set, which is the only way to tell a stale latch (the part
++ * has been in the loop since some earlier boot) from a fresh failure.
++ */
++static void
++tch_crc_flag(const char *why, bool fix)
++{
++	uint8_t flag = 0, after = 0, id[4] = { 0 };
++	bool in_loop;
++	unsigned tries = 0;
++
++	(void)tch_nvt_read(NVT_CRC_ERR_FLAG, &flag, 1);
++	(void)tch_nvt_read(NVT_CHIP_VER_TRIM_ADDR, id, sizeof(id));
++	in_loop = id[0] == 0xfc ||
++	    (id[0] == 0xff && id[1] == 0xff && id[2] == 0xff);
++	if (!fix) {
++		printf("LIUQIN TOUCH: %s: crc flag 0x%02x, trim %02x %02x %02x %02x%s\n",
++		    why, flag, id[0], id[1], id[2], id[3],
++		    in_loop ? " (in the crc reboot loop)" : "");
++		return;
++	}
++	/*
++	 * The vendor's nvt_stop_crc_reboot(): the part has to be put back into
++	 * idle first (0xaa twice to the swrst address) and the flag cleared with
++	 * 0xa5, then read back to prove it took.  Without the idle commands the
++	 * write is swallowed, which is why touch170's write to 0x00000 - the
++	 * first byte of ILM, not the flag at all - never stopped anything.
++	 */
++	if (flag != 0xa5 || in_loop) {
++		for (tries = 0; tries < 5; tries++) {
++			(void)tch_nvt_write8(NVT_SW_RESET_ADDR, 0xaa);
++			(void)tch_nvt_write8(NVT_SW_RESET_ADDR, 0xaa);
++			delay(1000);
++			(void)tch_nvt_write8(NVT_CRC_ERR_FLAG, 0xa5);
++			(void)tch_nvt_read(NVT_CRC_ERR_FLAG, &after, 1);
++			if (after == 0xa5) {
++				break;
++			}
++		}
++	} else {
++		after = flag;
++	}
++	printf("LIUQIN TOUCH: %s: crc flag 0x%02x -> 0x%02x in %u tries, trim "
++	    "%02x %02x %02x %02x%s\n", why, flag, after, tries, id[0], id[1],
++	    id[2], id[3], in_loop ? " (was in the crc reboot loop)" : "");
+ }
+ 
+ /* One line, printed right after the copy engine reports done, and repeated in
+@@ -3232,6 +3291,10 @@
+ 	 * that mattered was silent exactly where it was needed.
+ 	 */
+ 	tch_dma_count = 0;
++	/* touch171: a latched CRC error keeps the part in its reboot loop across
++	 * every download, so clear it (and show the trim answer) before the reset
++	 * that starts this attempt. */
++	tch_crc_flag("before download", true);
+ 	/* nvt_bootloader_reset(): 0x69 to the software-reset register (0x1fb43e on
+ 	 * this part, the vendor's swrst_sif address) - 0x00000, which the
+ 	 * NT36523-family flow uses, is not it. */
+@@ -3517,6 +3580,9 @@
+ 	 * start, so a read before boot_ready proves nothing.  Read them again here.
+ 	 */
+ 	tch_fw_read_crc();
++	/* What a fresh boot leaves behind: 0xa3 normal run and a clear crc flag are
++	 * what the vendor's probe expects before the part starts scanning. */
++	tch_crc_flag(ready ? "after boot" : "boot timed out", false);
+ 
+ 	/* One verdict line that repeats what matters, because earlier lines can
+ 	 * be lost to console interleaving; the boot mark carries the answer to
+@@ -5043,8 +5109,10 @@
+ 			tch_fw_revive++;
+ 			printf("LIUQIN TOUCH: revive %u: interrupts without a frame, "
+ 			    "software reset and re-download\n", tch_fw_revive);
+-			(void)tch_nvt_write8(0x00000, 0xa5);
+-			(void)tch_nvt_write8(0x00000, 0xa5);
++			/* touch171: this used to write 0xa5 to 0x00000, the first
++			 * byte of ILM, so the latch that parks the part in the 0xfd
++			 * loop was never cleared; the flag lives at 0x1fb535. */
++			tch_crc_flag("revive", true);
+ 			delay(5 * 1000);
+ 			(void)tch_nvt_write8(NVT_SW_RESET_ADDR, 0x69);
+ 			delay(35 * 1000);
+@@ -5073,8 +5141,10 @@
+ 			printf("LIUQIN TOUCH: revive %u: no contact frame for %u s, "
+ 			    "re-downloading the firmware\n", tch_fw_revive,
+ 			    tch_quiet_checks * (unsigned)period);
+-			(void)tch_nvt_write8(0x00000, 0xa5);
+-			(void)tch_nvt_write8(0x00000, 0xa5);
++			/* touch171: this used to write 0xa5 to 0x00000, the first
++			 * byte of ILM, so the latch that parks the part in the 0xfd
++			 * loop was never cleared; the flag lives at 0x1fb535. */
++			tch_crc_flag("revive", true);
+ 			delay(5 * 1000);
+ 			(void)tch_nvt_write8(NVT_SW_RESET_ADDR, 0x69);
+ 			delay(35 * 1000);

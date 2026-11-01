@@ -1,0 +1,70 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -45,10 +45,13 @@
+ 
+ /* gcc_qupv3_wrap0_s4_clk_src, clk-rcg2 layout. */
+ #define GCC_S4_CMD_RCGR         0x274e4
+-#define GCC_S4_CFG_RCGR         0x274e8
+-#define GCC_S4_M                0x274f0
+-#define GCC_S4_N                0x274f4
+-#define GCC_S4_D                0x274f8
++#define GCC_S4_CFG_RCGR         0x274e8          /* +0x4 */
++#define GCC_S4_M                0x274ec          /* +0x8 */
++#define GCC_S4_N                0x274f0          /* +0xc */
++#define GCC_S4_D                0x274f4          /* +0x10 */
++#define RCG_CMD_UPDATE          (1u << 0)
++#define RCG_CMD_ROOT_EN         (1u << 1)
++#define RCG_CMD_ROOT_OFF        (1u << 31)
+ #define GCC_S4_CBCR             0x274dc          /* halt status: BRANCH_HALT_VOTED */
+ 
+ /* TLMM: one 0x1000 block per pin (pinctrl-sm8450.c PINGROUP). */
+@@ -112,6 +115,49 @@
+ 		    TLMM_MUX(ctl) == 1 ? "(qup4)" : "(not qup4)");
+ 	}
+ 
++	/* --- stage 2: switch the engine on, then read it --- */
++	if (level >= 2) {
++		uint32_t v = tch_rd(gcc, GCC_QUPV3_WRAP0_CBCR);
++		if (!(v & QUP_CBCR_S4)) {
++			*(volatile uint32_t *)(gcc + GCC_QUPV3_WRAP0_CBCR) = v | QUP_CBCR_S4;
++			__asm__ volatile ("dmb oshst" ::: "memory");
++			printf("LIUQIN TOUCH: GCC QUPV3_WRAP0_CBCR 0x%08x -> 0x%08x\n", v,
++			    tch_rd(gcc, GCC_QUPV3_WRAP0_CBCR));
++		}
++		/* RCG: BI_TCXO (src 0) in MND mode, no divider, then root on. */
++		*(volatile uint32_t *)(gcc + GCC_S4_M) = 0;
++		*(volatile uint32_t *)(gcc + GCC_S4_N) = 0;
++		*(volatile uint32_t *)(gcc + GCC_S4_D) = 0;
++		*(volatile uint32_t *)(gcc + GCC_S4_CFG_RCGR) = 0;
++		__asm__ volatile ("dmb oshst" ::: "memory");
++		*(volatile uint32_t *)(gcc + GCC_S4_CMD_RCGR) = RCG_CMD_UPDATE | RCG_CMD_ROOT_EN;
++		int spin;
++		for (spin = 0; spin < 1000; spin++) {
++			if (!(tch_rd(gcc, GCC_S4_CMD_RCGR) & RCG_CMD_UPDATE)) {
++				break;
++			}
++			delay(10);
++		}
++		const uint32_t cmd2 = tch_rd(gcc, GCC_S4_CMD_RCGR);
++		const uint32_t halt2 = tch_rd(gcc, GCC_S4_CBCR);
++		printf("LIUQIN TOUCH: s4 RCG cmd 0x%08x (%s%s) halt 0x%08x (%s)\n", cmd2,
++		    (cmd2 & RCG_CMD_ROOT_OFF) ? "root-off " : "root-on ",
++		    (cmd2 & RCG_CMD_UPDATE) ? "update-stuck" : "update-done",
++		    halt2, (halt2 & CBCR_CLK_OFF) ? "off" : "running");
++		/* Pins: data/clk/cs to qup4 (mux 2), drive 6 mA; IRQ pin stays a GPIO. */
++		for (unsigned i = 0; i < 4; i++) {
++			const uint32_t pin = 16 + i;
++			const uint32_t ctl = (2u << 2) | (0u << 0) | (2u << 6);
++			*(volatile uint32_t *)(tlmm + TLMM_CTL(pin)) = ctl;
++			__asm__ volatile ("dmb oshst" ::: "memory");
++			printf("LIUQIN TOUCH: gpio%u ctl 0x%08x -> 0x%08x\n", pin,
++			    tch_rd(tlmm, TLMM_CTL(pin)), ctl);
++		}
++		*(volatile uint32_t *)(tlmm + TLMM_CTL(21)) = (0u << 2) | (2u << 0);
++		__asm__ volatile ("dmb oshst" ::: "memory");
++		printf("LIUQIN TOUCH: gpio21 ctl 0x%08x (input, pull-up)\n", tch_rd(tlmm, TLMM_CTL(21)));
++	}
++
+ 	/* --- SE4: only when its clocks are up, otherwise the bus would hang. --- */
+ 	const bool clocked = (cbcr & (QUP_CBCR_M_AHB | QUP_CBCR_CORE | QUP_CBCR_CORE_2X | QUP_CBCR_S4)) ==
+ 	    (QUP_CBCR_M_AHB | QUP_CBCR_CORE | QUP_CBCR_CORE_2X | QUP_CBCR_S4);

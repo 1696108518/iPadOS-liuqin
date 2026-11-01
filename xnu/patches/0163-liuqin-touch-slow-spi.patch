@@ -1,0 +1,91 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -298,6 +298,7 @@
+ 	bool        fifo_capable;      /* GENI_IF_DISABLE_RO says FIFO works */
+ 	bool        bitbang;            /* drive gpio16..19 as a software SPI */
+ 	uint32_t    pin_clk, pin_mosi, pin_miso, pin_cs;
++	uint32_t    bb_pace_us;         /* half clock period, default 5 us */
+ 	vm_offset_t dma;                /* staging page for SE DMA */
+ 	uint64_t    dma_pa;
+ 	uint32_t    dma_tx_status;      /* last SE_DMA_TX/RX_IRQ_STAT */
+@@ -541,8 +542,9 @@
+ static inline void
+ bb_pace(void)
+ {
+-	for (int i = 0; i < 8; i++) {
+-		__asm__ volatile ("nop");
++	/* 0 until the first bit-bang setup runs */
++	if (tch.bb_pace_us != 0) {
++		delay((int)tch.bb_pace_us);
+ 	}
+ }
+ 
+@@ -918,20 +920,31 @@
+ 
+ 	for (unsigned i = 0; i < 4; i++) {
+ 		tch_bb_dir(pads[i], true, 0);
++		delay(10);
+ 		const int lo = bb_get(pads[i]);
+ 		tch_bb_dir(pads[i], true, 1);
++		delay(10);
+ 		const int hi = bb_get(pads[i]);
+ 
+ 		printf("LIUQIN TOUCH: pad gpio%u out: drive0 reads %d, drive1 reads %d%s (ctl 0x%08x)\n",
+ 		    pads[i], lo, hi, (lo == 0 && hi == 1) ? "" : "  <-- does not follow",
+ 		    tch_rd(tch.tlmm, TLMM_CTL(pads[i])));
++		/* Same drive, sampled immediately and after 50 us: a slow rise or
++		 * a loaded line looks like a dead one if read too early. */
++		bb_set(pads[i], 1);
++		const int now = bb_get(pads[i]);
++		delay(50);
++		const int later = bb_get(pads[i]);
++
++		printf("LIUQIN TOUCH: pad gpio%u rise: immediately %d, after 50 us %d\n",
++		    pads[i], now, later);
+ 	}
+ 	for (unsigned i = 0; i < 4; i++) {
+ 		tch_wr(tch.tlmm, TLMM_CTL(pads[i]), (0u << 2) | (1u << 0) | (2u << 6));  /* pull-down */
+-		bb_pace();
++		delay(2000);
+ 		const int pd = bb_get(pads[i]);
+ 		tch_wr(tch.tlmm, TLMM_CTL(pads[i]), (0u << 2) | (3u << 0) | (2u << 6));  /* pull-up */
+-		bb_pace();
++		delay(2000);
+ 		const int pu = bb_get(pads[i]);
+ 
+ 		printf("LIUQIN TOUCH: pad gpio%u in: pull-down reads %d, pull-up reads %d (%s)\n",
+@@ -958,6 +971,11 @@
+ 	};
+ 	uint8_t id[6];
+ 
++	tch.bb_pace_us = 5;                             /* ~100 kHz, very forgiving */
++	(void)PE_parse_boot_argn("liuqintouchpace", &tch.bb_pace_us, sizeof(tch.bb_pace_us));
++	if (tch.bb_pace_us > 1000) {
++		tch.bb_pace_us = 1000;
++	}
+ 	tch.pin_cs = 19;
+ 	tch_bb_dir(tch.pin_cs, true, 1);                /* chip select deasserted */
+ 	tch.bitbang = true;
+@@ -972,14 +990,19 @@
+ 		tch_bb_dir(tch.pin_mosi, true, 0);
+ 		tch_bb_dir(tch.pin_miso, false, 0);
+ 		memset(id, 0, sizeof(id));
++		uint8_t fw[16] = { 0 };
+ 		const int err = tch_nvt_read(NVT_CHIP_VER_TRIM_ADDR, id, sizeof(id));
++		const int err2 = tch_nvt_read(NVT_FWINFO_ADDR, fw, sizeof(fw));
++		const bool id_ok = err == 0 && id[3] == 0x65 && id[4] == 0x03;
++		const bool fw_ok = err2 == 0 && (uint8_t)(fw[0] + fw[1]) == 0xff;
+ 
+ 		printf("LIUQIN TOUCH: bitbang %u: clk gpio%u mosi gpio%u miso gpio%u -> "
+-		    "%02x %02x %02x %02x %02x %02x%s\n",
++		    "%02x %02x %02x %02x %02x %02x | fw %02x %02x %02x %02x%s\n",
+ 		    p, tch.pin_clk, tch.pin_mosi, tch.pin_miso,
+ 		    id[0], id[1], id[2], id[3], id[4], id[5],
+-		    err != 0 ? " (read failed)" : "");
+-		if (err == 0 && id[3] == 0x65 && id[4] == 0x03) {
++		    fw[0], fw[1], fw[2], fw[3],
++		    (err != 0 || err2 != 0) ? " (read failed)" : "");
++		if (id_ok || fw_ok) {
+ 			printf("LIUQIN TOUCH: bit-banged SPI: clk gpio%u mosi gpio%u miso gpio%u cs gpio%u\n",
+ 			    tch.pin_clk, tch.pin_mosi, tch.pin_miso, tch.pin_cs);
+ 			return 0;

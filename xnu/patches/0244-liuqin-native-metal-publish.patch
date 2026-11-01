@@ -1,0 +1,118 @@
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -16,6 +16,7 @@
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
+ iokit/Kernel/arm/hid/LiuqinHID.cpp                                optional iokitcpp
++iokit/NativeAdreno/LiuqinStubs.cpp                            optional iokitcpp
+ iokit/NativeAdreno/NativeAdrenoAccelerator.cpp                            optional iokitcpp
+ iokit/NativeAdreno/NativeAdrenoBoard.cpp                            optional iokitcpp
+ iokit/NativeAdreno/NativeAdrenoClient.cpp                            optional iokitcpp
+@@ -64,6 +65,5 @@
+ iokit/NativeAdreno/kits/ArmSmmu4K/ArmSmmu4KProgram.c                            optional iokitcpp
+ iokit/NativeAdreno/kits/ArmSmmu4K/ArmSmmu4KStreams.c                            optional iokitcpp
+ iokit/NativeAdreno/kits/ArmSmmu4K/ArmSmmu4KTableMemory.c                            optional iokitcpp
+-iokit/NativeAdreno/LiuqinStubs.cpp                            optional iokitcpp
+ iokit/NativeAdreno/LiuqinAdrenoGlue.cpp                            optional iokitcpp
+ iokit/NativeAdreno/NativeAdrenoPublish.cpp                            optional iokitcpp
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -14,6 +14,7 @@
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
++#include <IOKit/IOPlatformExpert.h>
+ #include "NativeAdrenoBoard.h"
+ #include "NativeAdrenoFirmware.h"
+ #include "NativeAdrenoGmuConfig.h"
+@@ -52,6 +53,20 @@
+ extern "C" const uint8_t native_adreno_sqe_firmware_image[] __attribute__((weak));
+ extern "C" const uint64_t native_adreno_sqe_firmware_image_size __attribute__((weak));
+ #include "NativeAdrenoUserClient.h"
++/* sheng native-Metal path (NativeAdrenoPublish.cpp / NativeAdrenoAccelerator.cpp).
++ * Kept opt-in through sheng-gpu-metal=1 until the userspace plugin lands. */
++extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *,NativeAdrenoSubmit *,
++    NativeAdrenoRing *,const NativeAdrenoRingClock *,const NativeAdrenoTimer *,
++    const NativeAdrenoAbiDeviceInfo *,uint32_t,uint32_t);
++extern "C" IOService *native_adreno_accelerator_allocate(void);
++/* Adreno 730 facts for the Vulkan driver: chip id 0x07030001 (a6xx_catalog),
++ * 3 MiB GMEM at 0x1000000, UCHE trap base as programmed by the ladder, the
++ * native window used by NativeAdrenoPublish, and UBWC 4.0 (bank bit 16,
++ * swizzle levels 2+3, eight-channel macrotile). */
++static const NativeAdrenoAbiDeviceInfo liuqin_metal_info = {
++    0x07030001u, 3u << 20, 0x1000000ull, 0x1fffffffff000ull,
++    0x20000000ull, 0x60000000ull, 16, 6, 1, 4, NativeAdrenoDeviceClientIova, 0
++};
+ /* Physical address of the fence page (the CP writes its timestamps there): the board log reads it from DRAM and through the CPU cache. */
+ extern "C" {volatile uint64_t native_adreno_fence_phys=0;}
+ 
+@@ -494,11 +509,64 @@
+         return kIOReturnNotReady;
+     }
+     execbuf_=new NativeAdrenoSubmit;
+-    core_=new NativeAdrenoUserClient;
+-    if(execbuf_ && core_ &&
+-        execbuf_->attach(vm,&ring_)==kIOReturnSuccess &&
+-        core_->open(NativeAdrenoAbiVersion,vm,execbuf_,&ring_,32,40)==kIOReturnSuccess)
+-        core_ready_=true;
++    const IOReturn submit_status=execbuf_?execbuf_->attach(vm,&ring_):kIOReturnNoMemory;
++    if(submit_status)IOLog("NativeAdreno: submit attach failed 0x%x\n",submit_status);
++    /* sheng-gpu-metal=1: publish the discovery-facing AGXAccelerator on top of
++     * the live VM/submit/ring. The original IOGPUFamily is replaced by the
++     * stub in LiuqinStubs.cpp on this port, so the class is allocated directly
++     * instead of through the sheng late-archive static init. */
++    uint32_t metal=0;
++    PE_parse_boot_argn("sheng-gpu-metal",&metal,sizeof(metal));
++    bool metal_published=false;
++    if(metal && submit_status==kIOReturnSuccess) {
++        NativeAdrenoRingClock clock{nullptr,ring_now,nullptr};
++        const IOReturn published=native_adreno_publish(vm,execbuf_,&ring_,&clock,nullptr,
++            &liuqin_metal_info,32,40);
++        IOLog("NativeAdreno: metal publish 0x%x\n",published);
++        if(published==kIOReturnSuccess) {
++            /* The stub IOAcceleratorES is registered by LiuqinStubs.cpp, which is
++             * linked before NativeAdrenoAccelerator.cpp in iokit/conf/files.arm64.
++             * If that order ever changes the class does not exist; say so instead
++             * of letting new AGXAccelerator fault on a missing metaclass. */
++            const OSSymbol *parent_name=OSSymbol::withCString("IOAcceleratorES");
++            const OSMetaClass *parent_class=parent_name?
++                OSMetaClass::getMetaClassWithName(parent_name):nullptr;
++            const OSSymbol *class_name=OSSymbol::withCString("AGXAccelerator");
++            const OSMetaClass *own_class=class_name?
++                OSMetaClass::getMetaClassWithName(class_name):nullptr;
++            if(parent_name)parent_name->release();
++            if(class_name)class_name->release();
++            if(!parent_class || parent_class->getClassSize()!=136 || !own_class) {
++                IOLog("NativeAdreno: accelerator class missing (parent %d own %d)\n",
++                    parent_class?1:0,own_class?1:0);
++            } else {
++                IOService *accelerator=native_adreno_accelerator_allocate();
++                if(accelerator && accelerator->init()) {
++                    accelerator->setProperty("MetalPluginName","NativeAdrenoMetal");
++                    accelerator->setProperty("MetalPluginClassName","NativeAdrenoMetalDevice");
++                    accelerator->setProperty("NativeSandboxGrantProcess",
++                        "backboardd,iconservicesagent,WidgetRenderer_Default,PosterBoard");
++                    if(accelerator->attach(IOService::getPlatform())) {
++                        accelerator->registerService();
++                        IOLog("NativeAdreno: accelerator published (IOAcceleratorES)\n");
++                        metal_published=true;
++                    } else {
++                        IOLog("NativeAdreno: accelerator attach failed\n");
++                        accelerator->release();
++                    }
++                } else {
++                    if(accelerator)accelerator->release();
++                    IOLog("NativeAdreno: accelerator allocate failed\n");
++                }
++            }
++        }
++    }
++    if(!metal_published) {
++        core_=new NativeAdrenoUserClient;
++        if(execbuf_ && core_ && submit_status==kIOReturnSuccess &&
++            core_->open(NativeAdrenoAbiVersion,vm,execbuf_,&ring_,32,40)==kIOReturnSuccess)
++            core_ready_=true;
++    }
+     ready_=true;
+     IOLog("NativeAdreno: CP started, fence=%u, interrupts masked=%08x, client=%s\n",
+         start_fence,NativeAdrenoIrq::mask(),core_ready_?"ready":"FAILED");

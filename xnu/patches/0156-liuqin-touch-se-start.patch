@@ -1,0 +1,287 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -103,6 +103,7 @@
+ #define GENI_FW_REVISION_RO     0x68
+ #define SE_GENI_CLK_SEL         0x7c
+ #define SE_GENI_CFG_SEQ_START   0x84
++#define START_TRIGGER           (1u << 0)
+ #define SE_GENI_BYTE_GRAN       0x254
+ #define SE_GENI_DMA_MODE_EN     0x258
+ #define SE_GENI_TX_PACKING_CFG0 0x260
+@@ -160,10 +161,13 @@
+ #define M_OPCODE_SHFT           27
+ #define M_PARAMS_MSK            0x07ffffffu
+ 
+-/* GENI_M_CMD0 / M_CMD_CTRL opcodes and params for SPI. */
++/* GENI_M_CMD0 / M_CMD_CTRL opcodes and params for SPI.  Linux builds the
++ * duplex opcode by OR-ing the two single-direction ones (3), but 3 is not an
++ * opcode in the GENI command table: Qualcomm's own U-Boot GENI SPI driver
++ * sends 7 for a full-duplex FIFO transfer, and so does this driver. */
+ #define SPI_TX_ONLY             1u
+ #define SPI_RX_ONLY             2u
+-#define SPI_TX_RX               (SPI_TX_ONLY | SPI_RX_ONLY)   /* FIFO duplex */
++#define SPI_TX_RX               7u
+ #define SPI_CS_ASSERT           8u
+ #define SPI_CS_DEASSERT         9u
+ #define FRAGMENTATION           (1u << 2)
+@@ -215,6 +219,16 @@
+ #define TRANS_LEN_MSK           0x00ffffffu
+ #define SE_SPI_SLAVE_EN         0x2bc
+ 
++/* More GENI registers the first touch4 boot showed we need to look at. */
++#define GENI_IF_DISABLE_RO      0x64
++#define FIFO_IF_DISABLE         (1u << 0)
++#define SE_GENI_M_CMD_CTRL_REG  0x604
++#define M_GENI_CMD_ABORT        (1u << 1)
++#define M_GENI_CMD_CANCEL       (1u << 2)
++#define M_GENI_DISABLE          (1u << 0)
++#define SE_GENI_M_GP_LENGTH     0x910
++#define M_GENI_CMD_ACTIVE       (1u << 0)
++
+ /* Novatek NT36xxx SPI protocol (vendor nt36xxx driver, SPI variant). */
+ #define NVT_CHIP_VER_TRIM_ADDR  0x3f004u
+ #define NVT_EVENT_BUF_ADDR      0x2fe00u
+@@ -234,7 +248,10 @@
+ 	uint32_t    div;                /* SE clock divider */
+ 	uint32_t    spi_hz;
+ 	uint32_t    last_irq;           /* M_IRQ_STATUS of the last command */
++	uint32_t    first_irq;          /* first M_IRQ_STATUS read of it */
++	uint32_t    status_after_cmd;   /* GENI_STATUS right after M_CMD0 */
+ 	uint32_t    max_x, max_y;       /* Novatek report space */
++	bool        cs_manual;          /* SE accepts CS_ASSERT/CS_DEASSERT */
+ 	bool        swap;               /* exchange the controller's axes */
+ 	bool        flip_x, flip_y;
+ };
+@@ -242,6 +259,7 @@
+ 	.max_x = NVT_TOUCH_W,
+ 	.max_y = NVT_TOUCH_H,
+ 	.div = 16,
++	.cs_manual = true,
+ };
+ static void *liuqin_touch_chan;
+ 
+@@ -360,6 +378,7 @@
+ 	uint32_t irq = 0;
+ 
+ 	tch_wr(tch.se, SE_GENI_M_CMD0, cmd);
++	tch.status_after_cmd = tch_rd(tch.se, SE_GENI_STATUS);
+ 	for (unsigned i = 0; i < ms * 20; i++) {
+ 		if (tx != NULL && txdone < txlen) {
+ 			const uint32_t wc = tch_rd(tch.se, SE_GENI_TX_FIFO_STATUS) & TX_FIFO_WC_MSK;
+@@ -379,6 +398,9 @@
+ 			tch_drain_rx(rx, rxlen, rxgot);
+ 		}
+ 		irq = tch_status();
++		if (i == 0) {
++			tch.first_irq = irq;
++		}
+ 		if (irq & (M_CMD_DONE_EN | errs)) {
+ 			break;
+ 		}
+@@ -405,12 +427,12 @@
+ 	}
+ 	if (tx != NULL) {
+ 		tch_wr(tch.se, SE_SPI_TX_TRANS_LEN, (uint32_t)len & TRANS_LEN_MSK);
+-		cmd |= SPI_TX_ONLY;
+ 	}
+ 	if (rx != NULL) {
+ 		tch_wr(tch.se, SE_SPI_RX_TRANS_LEN, (uint32_t)len & TRANS_LEN_MSK);
+-		cmd |= SPI_RX_ONLY;
+ 	}
++	cmd = (tx != NULL && rx != NULL) ? SPI_TX_RX :
++	    (tx != NULL ? SPI_TX_ONLY : SPI_RX_ONLY);
+ 	tch_fifo_mode();
+ 	const uint32_t irq = tch_run_cmd((cmd << M_OPCODE_SHFT) | FRAGMENTATION,
+ 	    tx, tx != NULL ? len : 0, rx, rx != NULL ? len : 0, &got, 50);
+@@ -430,10 +452,120 @@
+ {
+ 	tch_fifo_mode();
+ 	const uint32_t irq = tch_run_cmd(((assert ? SPI_CS_ASSERT : SPI_CS_DEASSERT) << M_OPCODE_SHFT),
++	    NULL, 0, NULL, 0, NULL, 20);
++	return (irq & M_CMD_DONE_EN) ? 0 : -1;
++}
++
++/* What the bootloader left in the engine, and what it looks like after every
++ * step: the first touch4 boot could only tell us "irq 0x2", which is not
++ * enough to pick a fix. */
++static void
++tch_dump_state(const char *when)
++{
++	printf("LIUQIN TOUCH: %s SE4 status 0x%08x irq 0x%08x irqen 0x%08x ctrl 0x%08x cmd0 0x%08x gp_len 0x%08x\n",
++	    when, tch_rd(tch.se, SE_GENI_STATUS), tch_rd(tch.se, SE_GENI_M_IRQ_STATUS),
++	    tch_rd(tch.se, SE_GENI_M_IRQ_EN), tch_rd(tch.se, SE_GENI_M_CMD_CTRL_REG),
++	    tch_rd(tch.se, SE_GENI_M_CMD0), tch_rd(tch.se, SE_GENI_M_GP_LENGTH));
++	printf("LIUQIN TOUCH: %s SE4 clk 0x%08x sel 0x%08x out 0x%08x cgc 0x%08x gsi 0x%08x seirq 0x%08x ifdis 0x%08x\n",
++	    when, tch_rd(tch.se, GENI_SER_M_CLK_CFG), tch_rd(tch.se, SE_GENI_CLK_SEL),
++	    tch_rd(tch.se, GENI_OUTPUT_CTRL), tch_rd(tch.se, GENI_CGC_CTRL),
++	    tch_rd(tch.se, SE_GSI_EVENT_EN), tch_rd(tch.se, SE_IRQ_EN),
++	    tch_rd(tch.se, GENI_IF_DISABLE_RO));
++	printf("LIUQIN TOUCH: %s SE4 spi trans 0x%08x word 0x%08x cpha 0x%08x cpol 0x%08x demux 0x%08x slave 0x%08x\n",
++	    when, tch_rd(tch.se, SE_SPI_TRANS_CFG), tch_rd(tch.se, SE_SPI_WORD_LEN),
++	    tch_rd(tch.se, SE_SPI_CPHA), tch_rd(tch.se, SE_SPI_CPOL),
++	    tch_rd(tch.se, SE_SPI_DEMUX_SEL), tch_rd(tch.se, SE_SPI_SLAVE_EN));
++}
++
++/* One CS_ASSERT, reported in full: whether the SE latched the command
++ * (GENI_STATUS.M_GENI_CMD_ACTIVE), the first interrupt status it raised and
++ * the last one. */
++static int
++tch_cs_probe(const char *after)
++{
++	tch_fifo_mode();
++	const uint32_t irq = tch_run_cmd(SPI_CS_ASSERT << M_OPCODE_SHFT,
+ 	    NULL, 0, NULL, 0, NULL, 20);
++
++	printf("LIUQIN TOUCH: CS assert %s: after-cmd 0x%08x first-irq 0x%08x irq 0x%08x\n",
++	    after, tch.status_after_cmd, tch.first_irq, irq);
+ 	return (irq & M_CMD_DONE_EN) ? 0 : -1;
+ }
+ 
++/* A one-byte TX_ONLY with CS deasserted: proves whether the SE runs commands
++ * at all without touching the chip. */
++static int
++tch_tx_probe(const char *after)
++{
++	uint8_t byte = 0xff;
++
++	tch_fifo_mode();
++	tch_wr(tch.se, SE_SPI_TX_TRANS_LEN, 1);
++	const uint32_t irq = tch_run_cmd((SPI_TX_ONLY << M_OPCODE_SHFT) | FRAGMENTATION,
++	    &byte, 1, NULL, 0, NULL, 20);
++
++	printf("LIUQIN TOUCH: TX probe %s: after-cmd 0x%08x first-irq 0x%08x irq 0x%08x\n",
++	    after, tch.status_after_cmd, tch.first_irq, irq);
++	return (irq & M_CMD_DONE_EN) ? 0 : -1;
++}
++
++/* Is the bus usable, and does it need help with chip select?  Tries the
++ * CS_ASSERT/CS_DEASSERT pair first and falls back to a bare transfer, which is
++ * all Qualcomm's own GENI SPI driver uses: if the engine accepts transfers but
++ * not the CS commands, it drives CS per transfer by itself. */
++static int
++tch_probe_bus(const char *how)
++{
++	if (tch_cs_probe(how) == 0) {
++		tch.cs_manual = true;
++		(void)tch_cs(false);
++		return 0;
++	}
++	if (tch_tx_probe(how) == 0) {
++		tch.cs_manual = false;
++		printf("LIUQIN TOUCH: transfers work, CS commands do not: CS per transfer\n");
++		return 0;
++	}
++	return -1;
++}
++
++/* The first touch4 boot answered "no" to every command with M_CMD_OVERRUN,
++ * which means the master sequencer is either still busy with something the
++ * bootloader left behind or disabled.  Walk the ways out of that state,
++ * logging each one, and stop at the first that works. */
++static int
++tch_se_start(void)
++{
++	static const struct {
++		uint32_t reg, val;
++		const char *what;
++	} fixes[] = {
++		{ SE_GENI_M_CMD_CTRL_REG, M_GENI_CMD_CANCEL, "cancel" },
++		{ SE_GENI_M_CMD_CTRL_REG, M_GENI_CMD_ABORT, "abort" },
++		{ SE_GENI_M_CMD_CTRL_REG, 0, "clear-disable" },
++		{ SE_GENI_CFG_SEQ_START, START_TRIGGER, "start-trigger" },
++	};
++
++	if (tch_probe_bus("as configured") == 0) {
++		return 0;
++	}
++	for (unsigned i = 0; i < sizeof(fixes) / sizeof(fixes[0]); i++) {
++		tch_wr(tch.se, fixes[i].reg, fixes[i].val);
++		delay(2000);
++		printf("LIUQIN TOUCH: %s: status 0x%08x irq 0x%08x ctrl 0x%08x\n",
++		    fixes[i].what, tch_rd(tch.se, SE_GENI_STATUS),
++		    tch_rd(tch.se, SE_GENI_M_IRQ_STATUS),
++		    tch_rd(tch.se, SE_GENI_M_CMD_CTRL_REG));
++		if (tch_probe_bus(fixes[i].what) == 0) {
++			printf("LIUQIN TOUCH: SE4 accepts commands after %s\n", fixes[i].what);
++			return 0;
++		}
++	}
++	tch_dump_state("dead");
++	printf("LIUQIN TOUCH: SE4 rejects every command, bus not started\n");
++	return -1;
++}
++
+ /* Novatek page/address framing: three bytes set the page, then the address
+  * with bit 7 clear selects a read, the part returns one dummy byte and then
+  * the data.  Mirrors nvt_spi_read() in the vendor driver (and the
+@@ -449,7 +581,7 @@
+ 	if (len + 2 > sizeof(tx) || len == 0) {
+ 		return -1;
+ 	}
+-	if (tch_cs(true) != 0) {
++	if (tch.cs_manual && tch_cs(true) != 0) {
+ 		return -1;
+ 	}
+ 	page[0] = 0xff;                                 /* set page */
+@@ -464,7 +596,7 @@
+ 			err = 0;
+ 		}
+ 	}
+-	if (tch_cs(false) != 0) {
++	if (tch.cs_manual && tch_cs(false) != 0) {
+ 		err = -1;
+ 	}
+ 	return err;
+@@ -491,6 +623,9 @@
+ static int
+ liuqin_touch_spi_setup(void)
+ {
++	/* Capture what the bootloader left behind before touching anything:
++	 * a stale interrupt status or a disabled sequencer shows up here. */
++	tch_dump_state("before init");
+ 	const uint32_t fwrev = tch_rd(tch.se, GENI_FW_REVISION_RO);
+ 	const uint32_t proto = (fwrev & FW_REV_PROTOCOL_MSK) >> FW_REV_PROTOCOL_SHFT;
+ 
+@@ -568,6 +703,16 @@
+ 	    "fifo %u byte/word, trans_cfg 0x%08x slave_en 0x%08x\n",
+ 	    tch.spi_hz / 1000, tch.div, tch.bytes_per_fifo_word,
+ 	    tch_rd(tch.se, SE_SPI_TRANS_CFG), tch_rd(tch.se, SE_SPI_SLAVE_EN));
++	if (tch_rd(tch.se, GENI_IF_DISABLE_RO) & FIFO_IF_DISABLE) {
++		printf("LIUQIN TOUCH: FIFO interface is disabled (if_disable 0x%08x): "
++		    "this engine only does GPI DMA\n", tch_rd(tch.se, GENI_IF_DISABLE_RO));
++	}
++	tch_dump_state("after init");
++	if (tch_se_start() != 0) {
++		return -1;
++	}
++	printf("LIUQIN TOUCH: SE4 running, chip select %s\n",
++	    tch.cs_manual ? "by hand" : "driven by the engine");
+ 	return 0;
+ }
+ 
+@@ -863,16 +1008,22 @@
+ 		    (cmd2 & RCG_CMD_ROOT_OFF) ? "root-off " : "root-on ",
+ 		    (cmd2 & RCG_CMD_UPDATE) ? "update-stuck" : "update-done",
+ 		    halt2, (halt2 & CBCR_CLK_OFF) ? "off" : "running");
+-		/* Pins: data/clk/cs to qup4 (mux 2), drive 6 mA; IRQ pin stays a GPIO. */
++		/* Pins: data/clk/cs to qup4.  The mux value is the index of the
++		 * function in the pin's function list, and pinctrl-sm8450.c lists
++		 * gpio16..19 as PINGROUP(n, qup4, phase_flag, ...), so qup4 is 1
++		 * and 2 is phase_flag (touch4 wrote 2 and left the SPI unconnected).
++		 * Drive 6 mA, no bias: the DT's qup_spi4_data_clk/qup_spi4_cs. */
+ 		for (unsigned i = 0; i < 4; i++) {
+ 			const uint32_t pin = 16 + i;
+-			const uint32_t ctl = (2u << 2) | (0u << 0) | (2u << 6);
++			const uint32_t ctl = (1u << 2) | (0u << 0) | (2u << 6);
+ 			*(volatile uint32_t *)(tlmm + TLMM_CTL(pin)) = ctl;
+ 			__asm__ volatile ("dmb oshst" ::: "memory");
+ 			printf("LIUQIN TOUCH: gpio%u ctl 0x%08x -> 0x%08x\n", pin,
+ 			    tch_rd(tlmm, TLMM_CTL(pin)), ctl);
+ 		}
+-		*(volatile uint32_t *)(tlmm + TLMM_CTL(21)) = (0u << 2) | (2u << 0);
++		/* 2 is keeper bias on this SoC, not pull-up (pinctrl-msm:
++		 * MSM_KEEPER 2, MSM_PULL_UP 3); the INT line wants a pull-up. */
++		*(volatile uint32_t *)(tlmm + TLMM_CTL(21)) = (0u << 2) | (3u << 0);
+ 		__asm__ volatile ("dmb oshst" ::: "memory");
+ 		printf("LIUQIN TOUCH: gpio21 ctl 0x%08x (input, pull-up)\n", tch_rd(tlmm, TLMM_CTL(21)));
+ 	}

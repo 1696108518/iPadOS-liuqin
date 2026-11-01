@@ -1,0 +1,31 @@
+--- a/bsd/dev/liuqin_ufs.c
++++ b/bsd/dev/liuqin_ufs.c
+@@ -1809,7 +1809,9 @@
+ 	liuqin_log_start();
+ 	liuqin_boot_mark("log thread started");
+ 	liuqin_sample_start();
+-	/* liuqin_usb_probe(); -- faults on this unit (data abort); USB is not needed for bring-up */
++	/* gated by liuqinusb (0 off, 1 report, 2 device); the QUSB2 PHY address is sweet's
++	 * and does not exist here, so liuqin_usb.c skips it unless asked. */
++	liuqin_usb_probe();
+ 	return 0;
+ }
+ 
+--- a/bsd/dev/liuqin_usb.c
++++ b/bsd/dev/liuqin_usb.c
+@@ -188,6 +188,15 @@
+ 	if (enabled >= 2) {
+ 		liuqin_usb_gadget_start(dwc);
+ 	}
++	/* The QUSB2 PHY block at sweet's 0x088e2000 does not exist on SM8475: reading it
++	 * data-aborted the boot once (worth the bring-up's only probe fault).  The phone uses
++	 * an eUSB2 repeater instead, so this path is opt-in until its address is known. */
++	int phy_try = 0;
++	PE_parse_boot_argn("liuqinusbphy", &phy_try, sizeof(phy_try));
++	if (!phy_try) {
++		printf("LIUQIN USB: QUSB2 PHY probe skipped (liuqinusbphy=1 to try)\n");
++		return;
++	}
+ 	if (cbcr[5] & CBCR_CLK_OFF) {
+ 		printf("LIUQIN USB: ahb2phy clock off; QUSB2 PHY not read\n");
+ 		return;

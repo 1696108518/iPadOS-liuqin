@@ -1,0 +1,114 @@
+--- a/iokit/Kernel/arm/hid/LiuqinHID.cpp
++++ b/iokit/Kernel/arm/hid/LiuqinHID.cpp
+@@ -336,7 +336,9 @@
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 1; }
+ private:
+ 	static void testFired(OSObject *owner, IOTimerEventSource *sender);
++	static void publishFired(OSObject *owner, IOTimerEventSource *sender);
+ 	IOTimerEventSource *fTest;
++	IOTimerEventSource *fPub;
+ 	UInt32 fTestSecs;
+ 	UInt32 fTestCount;
+ };
+@@ -366,6 +368,8 @@
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Dig_TouchScreen; }
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 2; }
+ private:
++	static void publishFired(OSObject *owner, IOTimerEventSource *sender);
++	IOTimerEventSource *fPub;
+ 	IOLock *fLock;
+ 	int fLogicalW, fLogicalH, fOffX, fOffY;
+ 	bool fDown[LIUQIN_TOUCH_FINGERS];
+@@ -377,6 +381,42 @@
+ 
+ static LiuqinHIDButtons *gLiuqinButtons;
+ static LiuqinHIDTouch *gLiuqinTouch;
++
++/*
++ * backboardd arms an IOService notification for HIDServiceSupport = true when
++ * it starts (~50 s in) and, on this port, never opened a service that had been
++ * published before that.  The services are therefore kept unpublished until
++ * liuqinhidpublish seconds after boot (default 120 s, 0 = publish immediately,
++ * which is what every build up to touch46 did).
++ */
++static UInt32
++liuqin_hid_publish_secs(void)
++{
++	UInt32 secs = 120;
++
++	PE_parse_boot_argn("liuqinhidpublish", &secs, sizeof(secs));
++	return secs;
++}
++
++/* Publish after the delay, or immediately when the delay is zero. */
++static void
++liuqin_hid_publish(IOService *service, IOTimerEventSource **timer, UInt32 secs,
++    void (*fired)(OSObject *, IOTimerEventSource *), const char *who)
++{
++	if (secs == 0) {
++		service->registerService();
++		IOLog("LIUQIN HID: %s published now\n", who);
++		return;
++	}
++	*timer = IOTimerEventSource::timerEventSource(service, fired);
++	if (*timer != NULL && service->getWorkLoop()->addEventSource(*timer) == kIOReturnSuccess) {
++		(*timer)->setTimeoutMS(secs * 1000);
++		IOLog("LIUQIN HID: %s publishes in %u s\n", who, secs);
++	} else {
++		service->registerService();
++		IOLog("LIUQIN HID: %s published now (no timer)\n", who);
++	}
++}
+ 
+ bool
+ LiuqinHIDButtons::start(IOService *provider)
+@@ -391,12 +431,22 @@
+ 		}
+ 	}
+ 	gLiuqinButtons = this;
+-	registerService();
+-	IOLog("LIUQIN HID: buttons registered (test every %u s)\n", fTestSecs);
++	liuqin_hid_publish(this, &fPub, liuqin_hid_publish_secs(),
++	    &LiuqinHIDButtons::publishFired, "buttons");
++	IOLog("LIUQIN HID: buttons up (test every %u s)\n", fTestSecs);
+ 	return true;
+ }
+ 
+ void
++LiuqinHIDButtons::publishFired(OSObject *owner, IOTimerEventSource *sender __unused)
++{
++	LiuqinHIDButtons *self = (LiuqinHIDButtons *)owner;
++
++	self->registerService();
++	IOLog("LIUQIN HID: buttons published late\n");
++}
++
++void
+ LiuqinHIDButtons::key(UInt32 usage, bool down)
+ {
+ 	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), kHIDPage_Consumer, usage, down);
+@@ -445,12 +495,22 @@
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+ 	setProperty("SurfaceHeight", (unsigned long long)(151 << 16), 32);
+ 	gLiuqinTouch = this;
+-	registerService();
+-	IOLog("LIUQIN HID: touch registered\n");
++	liuqin_hid_publish(this, &fPub, liuqin_hid_publish_secs(),
++	    &LiuqinHIDTouch::publishFired, "touch");
++	IOLog("LIUQIN HID: touch up\n");
+ 	return true;
+ }
+ 
+ void
++LiuqinHIDTouch::publishFired(OSObject *owner, IOTimerEventSource *sender __unused)
++{
++	LiuqinHIDTouch *self = (LiuqinHIDTouch *)owner;
++
++	self->registerService();
++	IOLog("LIUQIN HID: touch published late\n");
++}
++
++void
+ LiuqinHIDTouch::touch(int finger, bool down, int x, int y)
+ {
+ 	uint64_t now = mach_absolute_time();

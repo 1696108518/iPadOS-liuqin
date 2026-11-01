@@ -1,0 +1,38 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -1796,7 +1796,35 @@
+ 					    block[0], block[1], block[2], block[3],
+ 					    block[4], block[5], block[6], block[7],
+ 					    block[8], block[9], block[10], block[11]);
++				}
++			}
++		}
++		if ((polls % 10) == 0 && polls < 6000) {
++			/* Which base holds the report block?  Sample a few
++			 * candidates and log the first one whose bytes move. */
++#define TCH_CAND 5
++			static const uint32_t cand[TCH_CAND] = {
++				0x1f01au, 0x1f64eu, 0x11a00u, 0x3f004u, 0x2fe00u,
++			};
++			static uint8_t prev[TCH_CAND][8];
++			static bool prev_ok[TCH_CAND];
++			static unsigned hunt_logs;
++
++			for (unsigned c = 0; c < TCH_CAND; c++) {
++				uint8_t now[8] = { 0 };
++
++				if (tch_nvt_read(cand[c], now, sizeof(now)) != 0) {
++					continue;
+ 				}
++				if (prev_ok[c] && memcmp(prev, now, sizeof(now)) != 0 &&
++				    hunt_logs < 12) {
++					hunt_logs++;
++					printf("LIUQIN TOUCH: cand 0x%05x moved: %02x %02x %02x %02x %02x %02x %02x %02x\n",
++					    cand[c], now[0], now[1], now[2], now[3],
++					    now[4], now[5], now[6], now[7]);
++				}
++				memcpy(prev[c], now, sizeof(now));
++				prev_ok[c] = true;
+ 			}
+ 		}
+ 		{

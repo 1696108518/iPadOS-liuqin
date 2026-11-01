@@ -1,0 +1,84 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -2325,6 +2325,7 @@
+ 	int force_poll = 0;
+ 	bool saw_gpio = false;
+ 	bool dumped = false;
++	unsigned empty_run = 0;         /* consecutive frames with no record */
+ 
+ 	PE_parse_boot_argn("liuqintouchpoll", &force_poll, sizeof(force_poll));
+ 	memset(frame, 0, sizeof(frame));
+@@ -2370,30 +2371,11 @@
+ 		}
+ 		const bool health = !go;
+ 
+-		/* Same block the vendor's work function reads; a shorter read may
+-		 * leave the controller's buffer output disabled. */
+-		{
+-			static unsigned block_logs;
+-			uint8_t block[NVT_EVENT_BLOCK_LEN] = { 0 };
+-
+-			if (tch_nvt_read(NVT_EVENT_BUF_ADDR, block, sizeof(block)) == 0 &&
+-			    block_logs < 8) {
+-				bool any = false;
+-
+-				for (size_t i = 0; i < sizeof(block); i++) {
+-					if (block[i] != 0xff && block[i] != 0x00) {
+-						any = true;
+-					}
+-				}
+-				if (any) {
+-					block_logs++;
+-					printf("LIUQIN TOUCH: block %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+-					    block[0], block[1], block[2], block[3],
+-					    block[4], block[5], block[6], block[7],
+-					    block[8], block[9], block[10], block[11]);
+-				}
+-			}
+-		}
++		/*
++		 * One read per tick, not two: reading the 109-byte block and then
++		 * the 65-byte frame races the controller's single buffer and was
++		 * what made a held finger alternate between "frame" and "empty".
++		 */
+ 		/*
+ 		 * The candidate-address hunt and the 0x11a00 read that used to
+ 		 * live here were for the NT36523 map; the event buffer of this
+@@ -2420,20 +2402,27 @@
+ 			memcpy(last, frame, sizeof(frame));
+ 		} else if (!tch_frame_valid(frame)) {
+ 			/*
+-			 * The controller reports a lift as an empty frame (all
+-			 * 0xff, and 0xfd at the end of a gesture).  Without this
+-			 * branch the last finger stays down forever: backboardd
+-			 * keeps it pressed and ignores everything that follows.
+-			 * A spurious release costs one frame, the stuck finger
+-			 * costs the whole session.
++			 * A lift shows up as an empty frame (all 0xff, then 0xfd at
++			 * the end of a gesture), but so does a read that lands between
++			 * two reports.  Releasing on the first empty frame turned a
++			 * drag into a stream of taps (55 ups in one swipe on touch45),
++			 * so a release needs a run of them - ~6 ticks, 120 ms at the
++			 * loop's rate.  A real lift still ends the finger within a
++			 * gesture timeout.
+ 			 */
+-			for (int slot = 0; slot < NVT_MAX_FINGERS; slot++) {
+-				if (down[slot]) {
+-					down[slot] = false;
+-					liuqin_hid_touch(slot, 0, 0, 0);
++			if (empty_run < 0xff) {
++				empty_run++;
++			}
++			if (empty_run >= 6) {
++				for (int slot = 0; slot < NVT_MAX_FINGERS; slot++) {
++					if (down[slot]) {
++						down[slot] = false;
++						liuqin_hid_touch(slot, 0, 0, 0);
++					}
+ 				}
+ 			}
+ 		} else if (tch_frame_valid(frame)) {
++			empty_run = 0;
+ 			if (memcmp(frame, last, sizeof(frame)) != 0) {
+ 				if (!dumped) {
+ 					dumped = true;

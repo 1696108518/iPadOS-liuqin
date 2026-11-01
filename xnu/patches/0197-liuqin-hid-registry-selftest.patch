@@ -1,0 +1,74 @@
+--- a/iokit/Kernel/arm/hid/LiuqinHID.cpp
++++ b/iokit/Kernel/arm/hid/LiuqinHID.cpp
+@@ -413,6 +413,45 @@
+ 	return secs;
+ }
+ 
++/*
++ * Self-test for the registry side: run the same match backboardd runs
++ * (`IOProviderClass = IOService`, `IOPropertyMatch HIDServiceSupport = true`)
++ * from inside the kernel and report how many services it finds and whether
++ * ours are among them.  This also exercises matchPropertyTable(), which is the
++ * same hook a user-space match would hit.
++ */
++static void
++liuqin_hid_matchtest(void)
++{
++	OSDictionary *match = OSDictionary::withCapacity(2);
++	OSDictionary *props = OSDictionary::withCapacity(1);
++	OSString *cls = OSString::withCString("IOService");
++	unsigned count = 0, ours = 0;
++
++	if (match && props && cls) {
++		props->setObject("HIDServiceSupport", kOSBooleanTrue);
++		match->setObject("IOPropertyMatch", props);
++		match->setObject("IOProviderClass", cls);
++		OSIterator *it = IOService::getMatchingServices(match);
++		if (it) {
++			OSObject *obj;
++
++			while ((obj = it->getNextObject()) != NULL) {
++				count++;
++				if (obj == gLiuqinTouch || obj == gLiuqinButtons) {
++					ours++;
++				}
++			}
++			it->release();
++		}
++	}
++	IOLog("LIUQIN HID: selftest: HIDServiceSupport match found %u services, %u ours\n",
++	    count, ours);
++	OSSafeReleaseNULL(match);
++	OSSafeReleaseNULL(props);
++	OSSafeReleaseNULL(cls);
++}
++
+ /* Publish after the delay, or immediately when the delay is zero. */
+ static void
+ liuqin_hid_publish(IOService *service, IOTimerEventSource **timer, UInt32 secs,
+@@ -420,7 +459,12 @@
+ {
+ 	if (secs == 0) {
+ 		service->registerService();
+-		IOLog("LIUQIN HID: %s published now\n", who);
++		IOLog("LIUQIN HID: %s published now (prop %d, id 0x%llx)\n",
++		    who, service->getProperty("HIDServiceSupport") != NULL,
++		    (unsigned long long)service->getRegistryEntryID());
++		if (strcmp(who, "touch") == 0) {
++			liuqin_hid_matchtest();
++		}
+ 		return;
+ 	}
+ 	*timer = IOTimerEventSource::timerEventSource(service, fired);
+@@ -522,7 +566,10 @@
+ 	LiuqinHIDTouch *self = (LiuqinHIDTouch *)owner;
+ 
+ 	self->registerService();
+-	IOLog("LIUQIN HID: touch published late\n");
++	IOLog("LIUQIN HID: touch published late (prop %d, id 0x%llx)\n",
++	    self->getProperty("HIDServiceSupport") != NULL,
++	    (unsigned long long)self->getRegistryEntryID());
++	liuqin_hid_matchtest();
+ }
+ 
+ void

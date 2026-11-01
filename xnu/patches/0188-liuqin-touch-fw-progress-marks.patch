@@ -1,0 +1,80 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -1397,6 +1397,7 @@
+ 	uint32_t saved_pace, txinfo, polls, boot_polls, secs;
+ 	uint8_t boot_a = 0, boot_b = 0;
+ 	bool cascade, spi_dma, have_header = false, ready = false;
++	unsigned sec_done = 0;
+ 	uint64_t t0;
+ 
+ 	if (fw == NULL) {
+@@ -1416,6 +1417,14 @@
+ 	spi_dma = (fw[0x29] & 0x01) != 0;
+ 	printf("LIUQIN TOUCH: fw dl: size %u end 0x%x cascade %u info %u parts %u spidma %u\n",
+ 	    size, end, cascade, info_num, parts, spi_dma);
++	/*
++	 * The download takes about a minute on the bit-banged bus and the
++	 * console is muted (liuqinmute), so without these marks the screen says
++	 * nothing while it runs - the touch39 boot was powered off 13 s before
++	 * the verdict for exactly that reason.  Boot marks are drawn even when
++	 * the console is muted, and they carry the decisive CRC values.
++	 */
++	tch_visible_mark("touch fw dl start");
+ 
+ 	/* A 245 KiB image at 100 kHz takes minutes; the part is happy at 9.6 MHz,
+ 	 * so tighten the bit-bang pacing for the transfer and restore it after. */
+@@ -1483,6 +1492,7 @@
+ 			printf("LIUQIN TOUCH: fw dl part %u out of range (bin 0x%x len 0x%x)\n",
+ 			    i, bin, len);
+ 			tch.bb_pace_us = saved_pace;
++			tch_visible_mark("touch fw FAIL");
+ 			return -1;
+ 		}
+ 		nchunks = (len + 1 + NVT_FW_CHUNK - 1) / NVT_FW_CHUNK;
+@@ -1491,12 +1501,20 @@
+ 			printf("LIUQIN TOUCH: fw dl part %u @0x%05x write failed after %u chunks\n",
+ 			    i, sram, chunks);
+ 			tch.bb_pace_us = saved_pace;
++			tch_visible_mark("touch fw FAIL");
+ 			return -1;
+ 		}
+ 		written += len + 1;
+ 		chunks += nchunks;
+ 		printf("LIUQIN TOUCH: fw dl part %u @0x%05x len 0x%x bin 0x%x: %u chunk %u ms\n",
+ 		    i, sram, len + 1, bin, nchunks, tch_ms_since(p0));
++		{
++			char mark[24];
++
++			snprintf(mark, sizeof(mark), "touch fw sec %u",
++			    ++sec_done);
++			tch_visible_mark(mark);
++		}
+ 		if (i == 0) {
+ 			uint8_t back[8] = { 0 };
+ 
+@@ -1526,6 +1544,14 @@
+ 		delay(1000);
+ 	}
+ 	tch_fw_crc_line(txinfo, polls, ilm_crc, dlm_crc);
++	{
++		char mark[40];
++
++		snprintf(mark, sizeof(mark), "touch fw crc done %u ilm %u dlm %u",
++		    (tch_fw_crc.flags >> 2) & 1u, tch_fw_crc.flags & 1u,
++		    (tch_fw_crc.flags >> 1) & 1u);
++		tch_visible_mark(mark);
++	}
+ 
+ 	/* nvt_bld_crc_enable(): read-modify-write bit 7 of BLD_CRC_EN */
+ 	{
+@@ -1589,7 +1615,9 @@
+ 	tch.bb_pace_us = saved_pace;
+ 
+ 	/* One verdict line that repeats what matters, because earlier lines can
+-	 * be lost to console interleaving. */
++	 * be lost to console interleaving; the boot mark carries the answer to
++	 * the screen, where the muted console does not. */
++	tch_visible_mark(ready ? "touch fw BOOTED" : "touch fw did not boot");
+ 	printf("LIUQIN TOUCH: fw dl %s: %u B %u chunks %u s, txinfo 0x%02x@%u, "
+ 	    "crc 0x%02x ilm %08x dlm %08x, state 0x%02x@2fe60 0x%02x@2fd60 %u polls\n",
+ 	    ready ? "BOOTED" : "did not boot", written, chunks, secs, txinfo, polls,

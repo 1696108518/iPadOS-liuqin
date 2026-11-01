@@ -1,0 +1,425 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -1173,7 +1173,18 @@
+ #define NVT_BOOT_RDY_ADDR       0x3f10du
+ #define NVT_TX_AUTO_COPY_EN     0x3f7e8u
+ #define NVT_SPI_DMA_TX_INFO     0x3f7f1u
+-#define NVT_EVENT_BASE          0x2fe00u
++#define NVT_EVENT_BASE          0x2fe00u        /* NT36523 map */
++#define NVT_EVENT_BASE_N        0x2fd00u        /* NT36523N map - polled too */
++#define NVT_BLD_ILM_DES         0x3f128u
++#define NVT_BLD_DLM_DES         0x3f12cu
++#define NVT_BLD_ILM_LEN         0x3f118u
++#define NVT_BLD_DLM_LEN         0x3f130u
++#define NVT_BLD_ILM_GCRC        0x3f100u
++#define NVT_BLD_DLM_GCRC        0x3f104u
++#define NVT_BLD_ILM_RCRC        0x3f120u        /* computed by the bootloader */
++#define NVT_BLD_DLM_RCRC        0x3f124u
++#define NVT_BLD_CRC_EN          0x3f30eu
++#define NVT_BLD_CRC_FLAGS       0x3f133u        /* done | ilm | dlm */
+ #define NVT_FW_CHUNK            0xfc00u
+ 
+ static uint32_t
+@@ -1181,15 +1192,45 @@
+ {
+ 	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+ 	    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++/* The BLD descriptor and length registers are three bytes wide, the checksum
++ * registers four. */
++static uint32_t
++tch_fw_read24(uint32_t addr)
++{
++	uint8_t b[3] = { 0 };
++
++	(void)tch_nvt_read(addr, b, sizeof(b));
++	return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16);
++}
++
++static uint32_t
++tch_fw_read32(uint32_t addr)
++{
++	uint8_t b[4] = { 0 };
++
++	(void)tch_nvt_read(addr, b, sizeof(b));
++	return tch_le32(b);
++}
++
++/* Milliseconds since an absolutetime stamp: on arm64 the timebase is not
++ * nanoseconds, so convert instead of dividing. */
++static uint32_t
++tch_ms_since(uint64_t t0)
++{
++	uint64_t ns = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	return (uint32_t)(ns / 1000000ull);
+ }
+ 
+ /* One section: chunks of NVT_FW_CHUNK, each a page write followed by a single
+- * chip-select window holding [sram & 0x7f] and the payload. */
++ * chip-select window holding [sram | 0x80] and the payload. */
+ static int
+ tch_fw_write_sram(const uint8_t *img, uint32_t sram, uint32_t size, uint32_t off)
+ {
+ 	for (uint32_t done = 0; done < size; done += NVT_FW_CHUNK) {
+-		static unsigned chunk_no;
+ 		uint8_t page[3], hdr[1];
+ 		uint32_t addr = sram + done;
+ 		uint32_t len = size - done;
+@@ -1211,9 +1252,15 @@
+ 		if (err != 0) {
+ 			return -1;
+ 		}
+-		printf("LIUQIN TOUCH: fw chunk %u @sram 0x%05x len 0x%x\n",
+-		    ++chunk_no, addr, len);
+-		hdr[0] = (uint8_t)(addr & 0x7f);
++		/*
++		 * The address phase is a write, and every Novatek write carries
++		 * bit 7: the vendor's CTP_SPI_WRITE() runs SPI_WRITE_MASK() on
++		 * buf[0], and it is used for the bulk SRAM payload exactly like
++		 * nvt_write_addr() uses it for one byte.  Without the bit the
++		 * part takes each chunk for a read, the SRAM keeps its previous
++		 * contents and the whole download "succeeds" while nothing lands.
++		 */
++		hdr[0] = (uint8_t)((addr & 0x7f) | 0x80);
+ 		if (tch_cs(true) != 0) {
+ 			return -1;
+ 		}
+@@ -1297,18 +1344,60 @@
+ static bool
+ tch_fw_state_ready(void)
+ {
+-	uint8_t st[6] = { 0 };
++	uint8_t a = 0, b = 0;
+ 
+-	(void)tch_nvt_read(NVT_EVENT_BASE + 0x60, st, sizeof(st));
+-	return st[0] >= 0xa0 && st[0] <= 0xaf;
++	(void)tch_nvt_read(NVT_EVENT_BASE + 0x60, &a, 1);
++	(void)tch_nvt_read(NVT_EVENT_BASE_N + 0x60, &b, 1);
++	return (a >= 0xa0 && a <= 0xaf) || (b >= 0xa0 && b <= 0xaf);
++}
++
++/* The decisive "did the data land" read from nvt_read_bld_hw_crc(): the
++ * bootloader's CRC flags and the checksums it computed over ILM and DLM,
++ * against the golden values the container carries at 0x18 and 0x1c. */
++struct tch_fw_crc {
++	uint8_t  flags;                 /* bit2 done, bit0 ilm, bit1 dlm */
++	uint32_t ilm;
++	uint32_t dlm;
++};
++static struct tch_fw_crc tch_fw_crc;
++
++static void
++tch_fw_read_crc(void)
++{
++	uint8_t f[2] = { 0 };
++
++	(void)tch_nvt_read(NVT_BLD_CRC_FLAGS, f, sizeof(f));
++	tch_fw_crc.flags = f[0];
++	tch_fw_crc.ilm = tch_fw_read32(NVT_BLD_ILM_RCRC);
++	tch_fw_crc.dlm = tch_fw_read32(NVT_BLD_DLM_RCRC);
+ }
+ 
++/* One line, printed right after the copy engine reports done, and repeated in
++ * the verdict: with the console interleaving this session has seen, the values
++ * have to fit on the lines that survive. */
++static void
++tch_fw_crc_line(uint32_t txinfo, unsigned polls, uint32_t ilm_exp, uint32_t dlm_exp)
++{
++	tch_fw_read_crc();
++	printf("LIUQIN TOUCH: fw dl crc: txinfo 0x%02x@%u done %u ilm %u dlm %u | "
++	    "ilm exp %08x got %08x | dlm exp %08x got %08x\n",
++	    txinfo, polls, (tch_fw_crc.flags >> 2) & 1u, tch_fw_crc.flags & 1u,
++	    (tch_fw_crc.flags >> 1) & 1u, ilm_exp, tch_fw_crc.ilm,
++	    dlm_exp, tch_fw_crc.dlm);
++}
++
+ static int
+ tch_fw_download(void)
+ {
+ 	uint32_t size = 0;
+ 	const uint8_t *fw = liuqin_fw_get("novatek_nt36532_m81_fw_csot.bin", &size);
+ 	uint32_t end, info_num, ovly_num, parts;
++	uint32_t ilm_sram, ilm_len, ilm_crc, dlm_sram, dlm_len, dlm_crc;
++	uint32_t written = 0, chunks = 0;
++	uint32_t saved_pace, txinfo, polls, boot_polls, secs;
++	uint8_t boot_a = 0, boot_b = 0;
++	bool cascade, spi_dma, have_header = false, ready = false;
++	uint64_t t0;
+ 
+ 	if (fw == NULL) {
+ 		return -1;
+@@ -1317,112 +1406,196 @@
+ 	info_num = (((end / 2) - 0x30) / 0x10) + 1;
+ 	ovly_num = (fw[0x28] & 0x10) ? (fw[0x28] & 0x0f) : 0;
+ 	parts = 2 + ovly_num + info_num;
+-	printf("LIUQIN TOUCH: fw download: end 0x%x cascade %u info %u parts %u size %u\n",
+-	    end, (fw[0x20] >> 1) & 1, info_num, parts, size);
++	cascade = ((fw[0x20] >> 1) & 1) != 0;
++	/*
++	 * nvt_download_firmware_hw_crc() only calls nvt_spi_dma_setup() when the
++	 * image asks for it (fwdata[0x29] bit 0), so the SPI DMA value at
++	 * 0x3f7d0 is not programmed for this firmware.  Logged, so an image that
++	 * does set the bit is obvious instead of silently mis-driven.
++	 */
++	spi_dma = (fw[0x29] & 0x01) != 0;
++	printf("LIUQIN TOUCH: fw dl: size %u end 0x%x cascade %u info %u parts %u spidma %u\n",
++	    size, end, cascade, info_num, parts, spi_dma);
+ 
+ 	/* A 245 KiB image at 100 kHz takes minutes; the part is happy at 9.6 MHz,
+ 	 * so tighten the bit-bang pacing for the transfer and restore it after. */
+-	const uint32_t saved_pace = tch.bb_pace_us;
+-
++	saved_pace = tch.bb_pace_us;
+ 	tch.bb_pace_us = 2;
++	t0 = mach_absolute_time();
+ 
+ 	(void)tch_nvt_write8(0x00000, 0x69);            /* bootloader reset */
+ 	delay(35 * 1000);
+-	/* cascade: enable the TX auto-copy engine before feeding the SRAM */
++	/* cascade: nvt_tx_auto_copy_mode() before feeding the SRAM */
+ 	(void)tch_nvt_write8(NVT_TX_AUTO_COPY_EN, 0x69);
+-	printf("LIUQIN TOUCH: tx auto copy mode enabled\n");
+ 
+-	/* descriptors for ILM (part 0) and DLM (part 1) */
+-	{
+-		const uint32_t ilm_bin = tch_le32(fw + 0);
+-		const uint32_t ilm_sram = tch_le32(fw + 4);
+-		const uint32_t ilm_len = tch_le32(fw + 8);
+-		const uint32_t ilm_crc = tch_le32(fw + 0x18);
+-		const uint32_t dlm_bin = tch_le32(fw + 12);
+-		const uint32_t dlm_sram = tch_le32(fw + 16);
+-		const uint32_t dlm_len = tch_le32(fw + 20);
+-		const uint32_t dlm_crc = tch_le32(fw + 0x1c);
++	/* nvt_set_bld_hw_crc(): the auto-copy engine needs destination, length and
++	 * golden checksum for ILM (part 0) and DLM (part 1). */
++	ilm_sram = tch_le32(fw + 4);
++	ilm_len = tch_le32(fw + 8);
++	ilm_crc = tch_le32(fw + 0x18);
++	dlm_sram = tch_le32(fw + 16);
++	dlm_len = tch_le32(fw + 20);
++	dlm_crc = tch_le32(fw + 0x1c);
++	tch_fw_bld_bank(NVT_BLD_ILM_DES, ilm_sram, NVT_BLD_ILM_LEN, ilm_len,
++	    NVT_BLD_ILM_GCRC, ilm_crc);
++	tch_fw_bld_bank(NVT_BLD_DLM_DES, dlm_sram, NVT_BLD_DLM_LEN, dlm_len,
++	    NVT_BLD_DLM_GCRC, dlm_crc);
++	/* The descriptor registers read back, so a broken register write path
++	 * shows up before the two-minute transfer instead of after it. */
++	printf("LIUQIN TOUCH: fw dl bld: ilm des 0x%06x len 0x%06x | dlm des 0x%06x len 0x%06x\n",
++	    tch_fw_read24(NVT_BLD_ILM_DES), tch_fw_read24(NVT_BLD_ILM_LEN),
++	    tch_fw_read24(NVT_BLD_DLM_DES), tch_fw_read24(NVT_BLD_DLM_LEN));
+ 
+-		(void)ilm_bin;
+-		(void)dlm_bin;
+-		tch_fw_bld_bank(0x3f128u, ilm_sram, 0x3f118u, ilm_len, 0x3f100u, ilm_crc);
+-		tch_fw_bld_bank(0x3f12cu, dlm_sram, 0x3f130u, dlm_len, 0x3f104u, dlm_crc);
+-		printf("LIUQIN TOUCH: bld descriptors set (ilm 0x%x/0x%x crc 0x%08x, dlm 0x%x/0x%x crc 0x%08x)\n",
+-		    ilm_sram, ilm_len, ilm_crc, dlm_sram, dlm_len, dlm_crc);
+-	}
+-
+ 	for (uint32_t i = 0; i < parts; i++) {
+-		uint32_t bin, sram, len;
++		uint32_t bin, sram, len, nchunks;
++		uint64_t p0;
+ 
+ 		if (i < 2) {
+ 			bin = tch_le32(fw + i * 12);
+ 			sram = tch_le32(fw + 4 + i * 12);
+ 			len = tch_le32(fw + 8 + i * 12);
+ 		} else {
+-			const uint32_t pos = 0x30 + 0x10 * (i - 2);
++			uint32_t pos = 0x30 + 0x10 * (i - 2);
+ 
++			/*
++			 * nvt_bin_header_parser(): on a cascade image the last
++			 * info record lives at end - 0x10 once the header record
++			 * (source offset below the header size) has been seen.
++			 * Reading 0x30 + 0x10 * n there gives a pseudo record
++			 * (src 0x200, len 0), so the real one - the second half
++			 * of the header, src 0x100 to SRAM 0x114208 - was never
++			 * written.
++			 */
++			if (have_header && cascade) {
++				pos = end - 0x10;
++			}
+ 			sram = tch_le32(fw + pos);
+ 			len = tch_le32(fw + pos + 4);
+ 			bin = tch_le32(fw + pos + 8);
++			if (bin < end && len != 0) {
++				have_header = true;
++			}
+ 		}
+ 		if (len == 0) {
+ 			continue;
+ 		}
+-		if (bin + len > size) {
+-			printf("LIUQIN TOUCH: fw part %u out of range\n", i);
++		if (bin + len + 1 > size) {
++			printf("LIUQIN TOUCH: fw dl part %u out of range (bin 0x%x len 0x%x)\n",
++			    i, bin, len);
+ 			tch.bb_pace_us = saved_pace;
+ 			return -1;
+ 		}
+-		printf("LIUQIN TOUCH: fw part %u: sram 0x%x len 0x%x bin 0x%x\n", i, sram, len, bin);
++		nchunks = (len + 1 + NVT_FW_CHUNK - 1) / NVT_FW_CHUNK;
++		p0 = mach_absolute_time();
+ 		if (tch_fw_write_sram(fw, sram, len + 1, bin) != 0) {
+-			printf("LIUQIN TOUCH: fw part %u write failed\n", i);
++			printf("LIUQIN TOUCH: fw dl part %u @0x%05x write failed after %u chunks\n",
++			    i, sram, chunks);
+ 			tch.bb_pace_us = saved_pace;
+ 			return -1;
+ 		}
++		written += len + 1;
++		chunks += nchunks;
++		printf("LIUQIN TOUCH: fw dl part %u @0x%05x len 0x%x bin 0x%x: %u chunk %u ms\n",
++		    i, sram, len + 1, bin, nchunks, tch_ms_since(p0));
++		if (i == 0) {
++			uint8_t back[8] = { 0 };
++
++			/* Straight SRAM read-back: the cheapest proof that the
++			 * payload reached the part, independent of the CRC
++			 * engine's idea of "done". */
++			(void)tch_nvt_read(ilm_sram, back, sizeof(back));
++			printf("LIUQIN TOUCH: fw dl readback @0x%05x: "
++			    "%02x %02x %02x %02x %02x %02x %02x %02x | file %02x %02x %02x %02x\n",
++			    ilm_sram, back[0], back[1], back[2], back[3],
++			    back[4], back[5], back[6], back[7],
++			    fw[bin], fw[bin + 1], fw[bin + 2], fw[bin + 3]);
++		}
+ 	}
+ 
+-	/* cascade: wait for the auto-copy engine to report the transfer done */
+-	for (unsigned i = 0; i < 200; i++) {
++	/* nvt_check_spi_dma_tx_info(): 200 tries, 1 ms apart, 0x00 means the
++	 * copy engine has moved the image into ILM and DLM. */
++	txinfo = 0xff;
++	for (polls = 0; polls < 200; polls++) {
+ 		uint8_t info[2] = { 0 };
+ 
+ 		(void)tch_nvt_read(NVT_SPI_DMA_TX_INFO, info, sizeof(info));
+-		if (info[0] == 0x00) {
+-			printf("LIUQIN TOUCH: dma tx info clear after %u polls\n", i);
++		txinfo = info[0];
++		if (txinfo == 0x00) {
+ 			break;
+ 		}
+ 		delay(1000);
+ 	}
+-	/* enable the bootloader CRC (read-modify-write bit 7) */
++	tch_fw_crc_line(txinfo, polls, ilm_crc, dlm_crc);
++
++	/* nvt_bld_crc_enable(): read-modify-write bit 7 of BLD_CRC_EN */
+ 	{
+-		uint8_t en[2] = { 0 };
++		uint8_t en = 0;
+ 
+-		(void)tch_nvt_read(0x3f30eu, en, sizeof(en));
+-		en[1] = en[0] | 0x80;
+-		tch_fw_reg_write(0x3f30eu, 0x3f30eu, &en[1], 1);
++		(void)tch_nvt_read(NVT_BLD_CRC_EN, &en, 1);
++		en |= 0x80;
++		tch_fw_reg_write(NVT_BLD_CRC_EN, NVT_BLD_CRC_EN, &en, 1);
+ 	}
+-	/* clear the reset status and tell the host command to enable fw crc */
++	/*
++	 * nvt_fw_crc_enable(): clear the reset status, then send the host
++	 * command that enables the firmware CRC.  The cascade parts use 7- and
++	 * 3-byte writes (the reset status is a six-byte record); the older ones
++	 * 2 and 2.
++	 */
+ 	{
+-		uint8_t zero = 0x00;
+-		uint8_t crc_cmd = 0xae;
++		static const uint8_t clr[6] = { 0 };
++		static const uint8_t crc_cmd[2] = { 0xae, 0x00 };
++		static const uint8_t clr1[1] = { 0 };
++		static const uint8_t crc_cmd1[1] = { 0xae };
+ 
+-		tch_fw_reg_write(NVT_EVENT_BASE, NVT_EVENT_BASE + 0x60, &zero, 1);
+-		tch_fw_reg_write(NVT_EVENT_BASE, NVT_EVENT_BASE + 0x50, &crc_cmd, 1);
++		if (cascade) {
++			tch_fw_reg_write(NVT_EVENT_BASE, NVT_EVENT_BASE + 0x60,
++			    clr, sizeof(clr));
++			tch_fw_reg_write(NVT_EVENT_BASE, NVT_EVENT_BASE + 0x50,
++			    crc_cmd, sizeof(crc_cmd));
++		} else {
++			tch_fw_reg_write(NVT_EVENT_BASE, NVT_EVENT_BASE + 0x60,
++			    clr1, sizeof(clr1));
++			tch_fw_reg_write(NVT_EVENT_BASE, NVT_EVENT_BASE + 0x50,
++			    crc_cmd1, sizeof(crc_cmd1));
++		}
+ 	}
++	/*
++	 * nvt_boot_ready(): a part with hardware CRC (this family reports
++	 * hw_crc = 2) only has the bit set and left set; clearing it and
++	 * writing POR_CD = 0xA0 is the non-CRC path.  We cleared it, which
++	 * cancels the boot request we just made.
++	 */
+ 	(void)tch_nvt_write8(NVT_BOOT_RDY_ADDR, 1);
+ 	delay(5 * 1000);
+-	(void)tch_nvt_write8(NVT_BOOT_RDY_ADDR, 0);
+ 
+-	for (unsigned i = 0; i < 10; i++) {
+-		if (tch_fw_state_ready()) {
+-			tch.bb_pace_us = saved_pace;
+-			printf("LIUQIN TOUCH: firmware booted, state ready after %u polls\n", i);
+-			return 0;
++	/* nvt_check_fw_reset_state(RESET_STATE_INIT): 0xa0..0xaf at the reset
++	 * status.  Both cascade event buffers are polled because the vendor map
++	 * for this part is the one thing we never got from the TWRP dump. */
++	for (boot_polls = 0; boot_polls < 20; boot_polls++) {
++		uint8_t a[2] = { 0 }, b[2] = { 0 };
++
++		(void)tch_nvt_read(NVT_EVENT_BASE + 0x60, a, 1);
++		(void)tch_nvt_read(NVT_EVENT_BASE_N + 0x60, b, 1);
++		boot_a = a[0];
++		boot_b = b[0];
++		if ((boot_a >= 0xa0 && boot_a <= 0xaf) ||
++		    (boot_b >= 0xa0 && boot_b <= 0xaf)) {
++			ready = true;
++			break;
+ 		}
+ 		delay(10 * 1000);
+ 	}
++	secs = tch_ms_since(t0) / 1000;
+ 	tch.bb_pace_us = saved_pace;
+-	printf("LIUQIN TOUCH: firmware did not report ready\n");
+-	return -1;
++
++	/* One verdict line that repeats what matters, because earlier lines can
++	 * be lost to console interleaving. */
++	printf("LIUQIN TOUCH: fw dl %s: %u B %u chunks %u s, txinfo 0x%02x@%u, "
++	    "crc 0x%02x ilm %08x dlm %08x, state 0x%02x@2fe60 0x%02x@2fd60 %u polls\n",
++	    ready ? "BOOTED" : "did not boot", written, chunks, secs, txinfo, polls,
++	    tch_fw_crc.flags, tch_fw_crc.ilm, tch_fw_crc.dlm, boot_a, boot_b,
++	    boot_polls);
++	return ready ? 0 : -1;
+ }
+ 
+ /* Read the firmware state register (event 0x60) at both candidate bases; the
+@@ -1430,16 +1603,13 @@
+ static void
+ tch_fw_state(void)
+ {
+-	static const uint32_t bases[] = { 0x11a00u, 0x1f64eu };
++	uint8_t a = 0, b = 0;
+ 
+-	for (unsigned i = 0; i < 2; i++) {
+-		uint8_t st[4] = { 0 };
+-
+-		(void)tch_nvt_read(bases[i] + 0x60, st, sizeof(st));
+-		printf("LIUQIN TOUCH: fw state @0x%05x: %02x %02x %02x %02x (%s)\n",
+-		    bases[i] + 0x60, st[0], st[1], st[2], st[3],
+-		    st[0] >= 0xa0 && st[0] <= 0xaf ? "running" : "not ready");
+-	}
++	(void)tch_nvt_read(NVT_EVENT_BASE + 0x60, &a, 1);
++	(void)tch_nvt_read(NVT_EVENT_BASE_N + 0x60, &b, 1);
++	printf("LIUQIN TOUCH: fw state 0x%02x @0x2fe60, 0x%02x @0x2fd60 (%s)\n",
++	    a, b, ((a >= 0xa0 && a <= 0xaf) || (b >= 0xa0 && b <= 0xaf)) ?
++	    "running" : "not ready");
+ }
+ 
+ static void

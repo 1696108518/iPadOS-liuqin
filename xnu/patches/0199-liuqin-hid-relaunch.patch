@@ -1,0 +1,92 @@
+--- a/iokit/Kernel/arm/hid/LiuqinHID.cpp
++++ b/iokit/Kernel/arm/hid/LiuqinHID.cpp
+@@ -354,6 +354,7 @@
+ 	static void publishFired(OSObject *owner, IOTimerEventSource *sender);
+ 	IOTimerEventSource *fTest;
+ 	IOTimerEventSource *fPub;
++	IOTimerEventSource *fRelaunch;
+ 	UInt32 fTestSecs;
+ 	UInt32 fTestCount;
+ };
+@@ -404,10 +405,16 @@
+  * liuqinhidpublish seconds after boot (default 120 s, 0 = publish immediately,
+  * which is what every build up to touch46 did).
+  */
++static bool gLiuqinHidImmediate;        /* set for relaunched instances */
++
+ static UInt32
+ liuqin_hid_publish_secs(void)
+ {
+ 	UInt32 secs = 120;
++
++	if (gLiuqinHidImmediate) {
++		return 0;
++	}
+ 
+ 	PE_parse_boot_argn("liuqinhidpublish", &secs, sizeof(secs));
+ 	return secs;
+@@ -450,6 +457,43 @@
+ 	OSSafeReleaseNULL(match);
+ 	OSSafeReleaseNULL(props);
+ 	OSSafeReleaseNULL(cls);
++}
++
++/*
++ * backboardd's HID notifier queues services that already exist when it is
++ * registered and only "pings" for services that first-match after the client
++ * has drained that initial batch (IOUserNotification::next() sets `armed`).
++ * A service started during kernel init therefore never wakes it: the match
++ * lands in the initial queue, and nothing pings.  Creating fresh instances
++ * later - after backboardd has drained its queue - is what produces the ping.
++ */
++static void
++liuqin_hid_relaunch_fired(OSObject *owner __unused, IOTimerEventSource *sender __unused)
++{
++	IOService *nub = IOService::waitForService(IOService::serviceMatching("IOResources"));
++	LiuqinHIDButtons *buttons;
++	LiuqinHIDTouch *touch;
++
++	if (nub == NULL) {
++		IOLog("LIUQIN HID: relaunch: no IOResources\n");
++		return;
++	}
++	gLiuqinHidImmediate = true;
++
++	buttons = OSTypeAlloc(LiuqinHIDButtons);
++	if (buttons && buttons->init() && buttons->attach(nub) && buttons->start(nub)) {
++		IOLog("LIUQIN HID: buttons relaunched\n");
++	} else if (buttons) {
++		buttons->release();
++	}
++
++	touch = OSTypeAlloc(LiuqinHIDTouch);
++	if (touch && touch->init() && touch->attach(nub) && touch->start(nub)) {
++		IOLog("LIUQIN HID: touch relaunched\n");
++	} else if (touch) {
++		touch->release();
++	}
++	gLiuqinHidImmediate = false;
+ }
+ 
+ /* Publish after the delay, or immediately when the delay is zero. */
+@@ -492,6 +536,20 @@
+ 	gLiuqinButtons = this;
+ 	liuqin_hid_publish(this, &fPub, liuqin_hid_publish_secs(),
+ 	    &LiuqinHIDButtons::publishFired, "buttons");
++	{
++		UInt32 relaunch = 150;
++
++		PE_parse_boot_argn("liuqinhidrelaunch", &relaunch, sizeof(relaunch));
++		if (relaunch) {
++			fRelaunch = IOTimerEventSource::timerEventSource(this,
++			    &liuqin_hid_relaunch_fired);
++			if (fRelaunch &&
++			    _hidWorkLoop->addEventSource(fRelaunch) == kIOReturnSuccess) {
++				fRelaunch->setTimeoutMS(relaunch * 1000);
++				IOLog("LIUQIN HID: relaunch in %u s\n", relaunch);
++			}
++		}
++	}
+ 	IOLog("LIUQIN HID: buttons up (test every %u s)\n", fTestSecs);
+ 	return true;
+ }

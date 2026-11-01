@@ -1,0 +1,59 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -589,6 +589,7 @@
+ 
+ static int tch_xfer(const uint8_t *tx, uint8_t *rx, size_t len);
+ static void tch_nvt_bringup(void);
++static void liuqin_touch_int_watch(void *arg, wait_result_t wr);
+ static void liuqin_touch_reports_start(void);
+ 
+ /* liuqin_boot_mark() clears liuqin_console_force when it returns, so inside a
+@@ -1057,6 +1058,11 @@
+ 		return 0;
+ 	}
+ 	printf("LIUQIN TOUCH: controller still silent after the bring-up\n");
++	thread_t watcher;
++
++	if (kernel_thread_start(liuqin_touch_int_watch, NULL, &watcher) == KERN_SUCCESS) {
++		thread_deallocate(watcher);
++	}
+ 	return -1;
+ }
+ 
+@@ -1483,7 +1489,36 @@
+ 	liuqin_boot_mark("touch reports up");
+ }
+ 
++/*
++ * No SPI involved: watch gpio21, the controller's interrupt line.  A running
++ * touch MCU asserts it when a finger lands, so a transition while the user
++ * touches the panel proves the die is alive and only our bus is wrong.  Sixty
++ * seconds of 1 ms sampling, started when the bit-bang probe gives up.
++ */
+ static void
++liuqin_touch_int_watch(__unused void *arg, __unused wait_result_t wr)
++{
++	int last = bb_get(21);
++	unsigned changes = 0;
++
++	liuqin_boot_mark("touch int watch");
++	liuqin_console_force = 1;       /* the transitions must be visible */
++	printf("LIUQIN TOUCH: watching gpio21 (INT) for 60 s, start is %d - touch the panel now\n", last);
++	for (unsigned i = 0; i < 60000; i++) {
++		const int v = bb_get(21);
++
++		if (v != last) {
++			printf("LIUQIN TOUCH: gpio21 -> %d after %u ms (%u transitions)\n",
++			    v, i, ++changes);
++			last = v;
++		}
++		delay(1000);
++	}
++	printf("LIUQIN TOUCH: gpio21 watch finished, %u transitions\n", changes);
++	liuqin_console_force = 0;
++}
++
++static void
+ liuqin_touch_reports_start(void)
+ {
+ 	thread_t thread;

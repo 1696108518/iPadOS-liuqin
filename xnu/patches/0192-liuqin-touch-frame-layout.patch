@@ -1,0 +1,114 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -2148,8 +2148,13 @@
+ 		const uint32_t max_x = ((uint32_t)fw[4] << 8) | fw[5];
+ 		const uint32_t max_y = ((uint32_t)fw[6] << 8) | fw[7];
+ 		const bool ver_ok = ((fw[0] + fw[1]) & 0xff) == 0xff;
+-		const bool geom_ok = max_x > 0 && max_y > 0 &&
+-		    max_x <= 4096 && max_y <= 4096;
++		/*
++		 * These are the touch *sensor* counts (18000 x 30720 on this
++		 * panel), ten times the 1800x2880 display; the driver scales
++		 * them, so the old "<= 4096" test threw the right values away.
++		 */
++		const bool geom_ok = max_x > 100 && max_y > 100 &&
++		    max_x <= 65535 && max_y <= 65535;
+ 		const bool num_ok = fw[2] > 0 && fw[2] < 200 && fw[3] > 0 && fw[3] < 200;
+ 
+ 		if (geom_ok) {
+@@ -2162,7 +2167,7 @@
+ 		    fw[0], fw[1], fw[2], fw[3], fw[4], fw[5], fw[6], fw[7],
+ 		    fw[8], fw[9], fw[10], fw[11], fw[12], fw[13], fw[14], fw[15],
+ 		    fw[0], ver_ok ? " ok" : " MISMATCH", fw[2], fw[3],
+-		    geom_ok ? " sane" : " using the panel size");
++		    geom_ok ? " sensor space" : " using the panel size");
+ 		printf("LIUQIN TOUCH: report space %ux%u, %u fingers, chip 0x%02x (%s)\n",
+ 		    tch.max_x, tch.max_y, fw[9], fw[14],
+ 		    num_ok ? "sensor counts match the panel" : "sensor counts odd");
+@@ -2185,13 +2190,44 @@
+  * as zeros or 0xff between reports, and treating that as a lift would release
+  * a finger that is still down.  Novatek sends an explicit release record
+  * (event 3) when a finger lifts, so real lifts always decode. */
++/*
++ * Record layout of this part, from the vendor module's nvt_ts_work_func: the
++ * records start at the event buffer itself (stride 6), byte 0 is
++ * (id << 3) | event, and x and y are big-endian 16-bit values at +1 and +3 -
++ * not the packed x/y of the older nt36xxx parts.  The vendor also rejects
++ * event 0 and anything above 2 (3 is a release, reported through the slot
++ * tracking instead).
++ */
++static unsigned
++tch_rec_id(const uint8_t *frame, int i)
++{
++	return frame[6 * i] >> 3;
++}
++
++static unsigned
++tch_rec_event(const uint8_t *frame, int i)
++{
++	return frame[6 * i] & 7u;
++}
++
++static unsigned
++tch_rec_x(const uint8_t *frame, int i)
++{
++	return ((unsigned)frame[6 * i + 1] << 8) | frame[6 * i + 2];
++}
++
++static unsigned
++tch_rec_y(const uint8_t *frame, int i)
++{
++	return ((unsigned)frame[6 * i + 3] << 8) | frame[6 * i + 4];
++}
++
+ static bool
+ tch_frame_valid(const uint8_t *frame)
+ {
+ 	for (int i = 0; i < NVT_MAX_FINGERS; i++) {
+-		const uint8_t *p = frame + 1 + 6 * i;
+-		const unsigned id = p[0] >> 3;
+-		const unsigned event = p[0] & 7u;
++		const unsigned id = tch_rec_id(frame, i);
++		const unsigned event = tch_rec_event(frame, i);
+ 
+ 		if (id >= 1 && id <= NVT_MAX_FINGERS && event >= 1 && event <= 3) {
+ 			return true;
+@@ -2210,9 +2246,8 @@
+ 	uint32_t mask = 0;
+ 
+ 	for (int i = 0; i < NVT_MAX_FINGERS; i++) {
+-		const uint8_t *p = frame + 1 + 6 * i;
+-		const unsigned id = p[0] >> 3;
+-		const unsigned event = p[0] & 7u;
++		const unsigned id = tch_rec_id(frame, i);
++		const unsigned event = tch_rec_event(frame, i);
+ 
+ 		if (id == 0 || id > NVT_MAX_FINGERS) {
+ 			continue;
+@@ -2220,8 +2255,8 @@
+ 		if (event != 1 && event != 2) {         /* 3 = release, 0/4+ invalid */
+ 			continue;
+ 		}
+-		unsigned x = ((unsigned)p[1] << 4) | (p[3] >> 4);
+-		unsigned y = ((unsigned)p[2] << 4) | (p[3] & 0x0fu);
++		unsigned x = tch_rec_x(frame, i);
++		unsigned y = tch_rec_y(frame, i);
+ 		uint32_t rx = tch.max_x, ry = tch.max_y;
+ 
+ 		if (tch.swap) {
+@@ -2235,6 +2270,15 @@
+ 		if (x > rx || y > ry) {
+ 			continue;
+ 		}
++		{
++			static unsigned raw_logs;
++
++			if (raw_logs < 6) {
++				raw_logs++;
++				printf("LIUQIN TOUCH: finger %u ev %u raw %u,%u of %ux%u\n",
++				    id, event, x, y, rx, ry);
++			}
++		}
+ 		unsigned sx = tch_scale(x, rx, NVT_TOUCH_W);
+ 		unsigned sy = tch_scale(y, ry, NVT_TOUCH_H);
+ 

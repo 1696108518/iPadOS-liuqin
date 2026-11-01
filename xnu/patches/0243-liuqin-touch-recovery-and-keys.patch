@@ -1,0 +1,819 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -318,7 +318,7 @@
+ /* Printed once, before anything else this driver does.  Every log line that
+  * follows can then be attributed to a build without guessing: a log whose
+  * stamp is missing or old is a log from an older image, not a new failure. */
+-#define TCH_BUILD               "touch172 fw-status-clear"
++#define TCH_BUILD               "touch183 keys-spmi-map"
+ 
+ /* Novatek NT36xxx SPI protocol (vendor nt36xxx driver, SPI variant). */
+ /* The vendor driver (TWRP's nt36532_touch.ko) reads the trim id at 0x1fb104
+@@ -804,6 +804,7 @@
+ 
+ static int tch_xfer(const uint8_t *tx, uint8_t *rx, size_t len);
+ static void tch_nvt_bringup(void);
++static void liuqin_keys_start(void);
+ static int tch_nvt_write8(uint32_t addr, uint8_t val);
+ static void liuqin_touch_int_watch(void *arg, wait_result_t wr);
+ static void liuqin_touch_reports_start(void);
+@@ -3224,6 +3225,8 @@
+ }
+ 
+ static unsigned tch_status_clears;
++/* touch176: driving the controller's INT pin from the host is opt-in. */
++static bool tch_int_poke_ok;
+ 
+ static void
+ tch_clear_fw_status(const char *why)
+@@ -4529,6 +4532,14 @@
+ static volatile unsigned tch_hang_hits;
+ static volatile int tch_fw_dead;
+ static unsigned tch_fw_revive;
++/*
++ * touch181: the budget was 10, and every revive costs about 3 s of download
++ * plus the 30 s wait that triggers it - which is why "touch dies after 7-8
++ * minutes" (the counter runs out and the panel is then dead for the rest of
++ * the session).  The counter now only limits *consecutive* failures: a single
++ * valid frame gives the part its budget back.
++ */
++#define TCH_REVIVE_MAX  100000u
+ 
+ static int
+ tch_frame_decode(const uint8_t *frame, bool *down)
+@@ -4561,6 +4572,7 @@
+ 			continue;
+ 		}
+ 		tch_valid_frames++;
++		tch_fw_revive = 0;
+ 		{
+ 			static unsigned raw_logs;
+ 
+@@ -4709,11 +4721,50 @@
+ 		return;
+ 	}
+ 	if (++tch_hang_hits >= 3) {
+-		printf("LIUQIN TOUCH: three interrupts with 0xFD in the report area: the "
+-		    "firmware is stuck (vendor's CRC-fail loop pattern)\n");
+-		tch_fw_dead = 1;
+ 		tch_hang_hits = 0;
++		/*
++		 * touch175: before paying for a whole re-download, give the firmware
++		 * the one thing the vendor gives it after boot - the host-alive write
++		 * to event+0x51 - and look at the report area again.  touch172 ran
++		 * 216 s with the panel reporting and touch171/173/174 lost it 10-18 s
++		 * after boot with the same 0x51 write done once, so this asks whether
++		 * the byte is what the part is waiting for rather than a boot step.
++		 */
++		(void)tch_nvt_write8(NVT_FW_STATUS_BYTE, 0x00);
++		delay(5 * 1000);
++		{
++			uint8_t again[NVT_POINT_LEN] = { 0 };
++
++			if (tch_nvt_read(NVT_EVENT_BUF_ADDR, again, sizeof(again)) == 0 &&
++			    tch_frame_valid(again)) {
++				printf("LIUQIN TOUCH: firmware answered the 0x51 ack, "
++				    "keeping it running\n");
++				return;
++			}
++		}
++		printf("LIUQIN TOUCH: three interrupts with 0xFD in the report area: the "
++		    "firmware is stuck (vendor's CRC-fail loop pattern), %u valid "
++		    "frames so far\n", tch_valid_frames);
++		tch_fw_dead = 1;
++	}
++}
++
++/* touch179: what the report area is doing when frames stop arriving.  A frozen
++ * buffer means the firmware stopped writing; one that keeps changing without
++ * ever validating means the reads race its writes. */
++static unsigned tch_evt_changes;
++static uint8_t tch_evt_head[8];
++
++static bool
++tch_evt_changed(const uint8_t *a, uint8_t *b)
++{
++	memcpy(tch_evt_head, a, sizeof(tch_evt_head));
++	if (memcmp(a, b, NVT_POINT_LEN) != 0) {
++		memcpy(b, a, NVT_POINT_LEN);
++		tch_evt_changes++;
++		return true;
+ 	}
++	return false;
+ }
+ 
+ static void
+@@ -4721,6 +4772,7 @@
+ {
+ 	uint8_t frame[NVT_POINT_LEN];
+ 	uint8_t last[NVT_POINT_LEN];
++	uint8_t prevbuf[NVT_POINT_LEN];
+ 	bool down[NVT_MAX_FINGERS] = { false };
+ 	unsigned errors = 0;
+ 	unsigned edge_logs = 0;
+@@ -4730,11 +4782,13 @@
+ 	int force_poll = 0;
+ 	bool saw_gpio = false;
+ 	bool dumped = false;
++	bool fw_released = false;       /* held fingers already released */
+ 	unsigned empty_run = 0;         /* consecutive frames with no record */
+ 
+ 	PE_parse_boot_argn("liuqintouchpoll", &force_poll, sizeof(force_poll));
+ 	memset(frame, 0, sizeof(frame));
+ 	memset(last, 0, sizeof(last));
++	memset(prevbuf, 0, sizeof(prevbuf));
+ 	printf("LIUQIN TOUCH: report thread up, %s\n",
+ 	    force_poll ? "event-buffer polling" : "INT on gpio21");
+ 
+@@ -4750,6 +4804,26 @@
+ 			(void)tsleep(&liuqin_touch_chan, PZERO, "liuqintouch", ticks);
+ 			continue;
+ 		}
++		/*
++		 * touch177: the firmware can die in the middle of a drag (the last
++		 * frame it wrote stays "down"), and iOS then keeps the finger
++		 * pressed.  Release every slot as soon as the driver knows the part
++		 * stopped reporting, instead of waiting for the empty-frame run.
++		 */
++		if (tch_fw_dead && !fw_released) {
++			for (int slot = 0; slot < NVT_MAX_FINGERS; slot++) {
++				if (down[slot]) {
++					down[slot] = false;
++					liuqin_hid_touch(slot, 0, 0, 0);
++				}
++			}
++			empty_run = 0;
++			fw_released = true;
++			printf("LIUQIN TOUCH: firmware stopped mid-gesture, releasing "
++			    "every held finger\n");
++		} else if (!tch_fw_dead) {
++			fw_released = false;
++		}
+ 
+ 		const uint32_t gpio = tch_rd(tch.tlmm, TLMM_CTL(21) + TLMM_IN_OUT);
+ 		bool go = force_poll || (gpio & TLMM_IN_BIT) != 0;
+@@ -4805,6 +4879,10 @@
+ 		 * the first minute nothing was read at all any more.
+ 		 */
+ 		const bool health = !go;
++		/* touch179: does the report area still change after the panel stops
++		 * producing frames?  A frozen buffer means the firmware stopped
++		 * writing; a buffer that keeps changing but never validates means we
++		 * are racing its writes.  Counted here, printed in the heartbeat. */
+ 
+ 		/*
+ 		 * One read per tick, not two: reading the 109-byte block and then
+@@ -4824,7 +4902,8 @@
+ 				printf("LIUQIN TOUCH: event read failed (irq 0x%08x dma tx 0x%08x rx 0x%08x)\n",
+ 				    tch.last_irq, tch.dma_tx_status, tch.dma_rx_status);
+ 			}
+-		} else if (tch_evt_reads++, tch_frame_streak(frame, int_edge),
++		} else if (tch_evt_changed(frame, prevbuf), tch_evt_reads++,
++		    tch_frame_streak(frame, int_edge),
+ 		    !tch_frame_valid(frame) && evt_logs < 12 &&
+ 		    memcmp(frame, last, sizeof(frame)) != 0) {
+ 			evt_logs++;
+@@ -5105,11 +5184,23 @@
+ 	/* liuqinkeepalive=<ms>: poke INT on that period no matter what, to keep a
+ 	 * panel that naps from ever reaching its low-power state.  0 (default)
+ 	 * keeps the reactive behaviour: poke after five seconds of silence. */
++	/*
++	 * touch176: liuqinkeepalive=2000 has been in the boot line since touch141,
++	 * and it drives the controller's INT output pin low from the host every two
++	 * seconds whenever the panel is idle.  That is the only thing this driver
++	 * does differently when nobody is touching, and every boot that died did so
++	 * while idle (touch174 14 s, touch173 10 s, touch175 about a minute after
++	 * the last contact), while the boot that ran 216 s was being touched the
++	 * whole time.  The poke is the vendor's own wake path for a napping part,
++	 * but it is not free: it now needs liuqintouchwake=1 to run at all.
++	 */
+ 	{
+-		int ka = 0;
++		int ka = 0, wake = 0;
+ 
+ 		(void)PE_parse_boot_argn("liuqinkeepalive", &ka, sizeof(ka));
+-		if (ka >= 500 && ka <= 60000) {
++		(void)PE_parse_boot_argn("liuqintouchwake", &wake, sizeof(wake));
++		tch_int_poke_ok = wake != 0;
++		if (wake != 0 && ka >= 500 && ka <= 60000) {
+ 			keepalive_ms = (unsigned)ka;
+ 		}
+ 	}
+@@ -5121,7 +5212,7 @@
+ 		const int period = keepalive_ms ? (int)(keepalive_ms / 1000 ? keepalive_ms / 1000 : 1) : 5;
+ 
+ 		(void)tsleep(&tch_valid_frames, PZERO, "liuqinrcv", hz * period);
+-		if (keepalive_ms && bb_get(21) == 0) {
++		if (tch_int_poke_ok && keepalive_ms && bb_get(21) == 0) {
+ 			/* Only poke while the controller is not driving INT itself. */
+ 			(void)tch_int_wake();
+ 		}
+@@ -5130,11 +5221,13 @@
+ 		 * answer at all, does the state register say the firmware runs, and
+ 		 * has a single frame with a contact ever arrived. */
+ 		if ((++beats % 6) == 0) {
+-			printf("LIUQIN TOUCH: beat %us: %s, %u event reads (%u failed), "
+-			    "%u contact frames, fw 0x51=0x%02x\n",
+-			    beats * (unsigned)period, running ? "running" : "silent",
+-			    tch_evt_reads, tch_evt_errors, tch_valid_frames,
+-			    tch_fw_status_byte());
++			printf("LIUQIN TOUCH: beat %us: %s, %u event reads (%u failed, "
++			    "%u changes), %u contact frames, fw 0x51=0x%02x, buf %02x "
++			    "%02x %02x %02x\n", beats * (unsigned)period,
++			    running ? "running" : "silent", tch_evt_reads,
++			    tch_evt_errors, tch_evt_changes, tch_valid_frames,
++			    tch_fw_status_byte(), tch_evt_head[0], tch_evt_head[1],
++			    tch_evt_head[2], tch_evt_head[3]);
+ 		}
+ 		/* touch172: keep the handshake byte clear for the whole run, not just
+ 		 * once after boot.  If the firmware sets it and nobody clears it, it
+@@ -5152,7 +5245,7 @@
+ 			last_frames = tch_valid_frames;
+ 			tch_quiet_checks = 0;
+ 		}
+-		if (tch_fw_dead && tch_fw_revive < 10) {
++		if (tch_fw_dead && tch_fw_revive < TCH_REVIVE_MAX) {
+ 			tch_fw_revive++;
+ 			printf("LIUQIN TOUCH: revive %u: interrupts without a frame, "
+ 			    "software reset and re-download\n", tch_fw_revive);
+@@ -5160,10 +5253,29 @@
+ 			 * byte of ILM, so the latch that parks the part in the 0xfd
+ 			 * loop was never cleared; the flag lives at 0x1fb535. */
+ 			tch_crc_flag("revive", true);
+-			delay(5 * 1000);
+-			(void)tch_nvt_write8(NVT_SW_RESET_ADDR, 0x69);
+-			delay(35 * 1000);
++			/* touch178: this used to write 0x69 and read the info back,
++			 * which is not a recovery at all - the log right after it says
++			 * `fw state 0xa3 (running)`, so nothing was reset and nothing
++			 * was downloaded, and the panel went on reporting nothing for
++			 * the rest of the boot.  The full download is the only thing
++			 * that restarts a Novatek part. */
++			(void)tch_fw_download();
+ 			(void)tch_novatek_info();
++			/* touch180: a reload that reports "BOOTED" is not the same as a
++			 * panel that reports touches - 178's log has revives after which
++			 * the frame counter never moved again.  Print what the part says
++			 * about itself right after the reload so the next log separates
++			 * "the download failed" from "the firmware booted but does not
++			 * scan". */
++			{
++				uint8_t b[8] = { 0 };
++
++				(void)tch_nvt_read(NVT_EVENT_BUF_ADDR, b, sizeof(b));
++				printf("LIUQIN TOUCH: after the reload the report area reads "
++				    "%02x %02x %02x %02x, 0x51 0x%02x, state %s\n",
++				    b[0], b[1], b[2], b[3], tch_fw_status_byte(),
++				    tch_panel_running() ? "running" : "not ready");
++			}
+ 			tch_fw_dead = 0;
+ 			tch_hang_hits = 0;
+ 			tch_quiet_checks = 0;
+@@ -5178,12 +5290,18 @@
+ 			const unsigned quiet_s = tch_quiet_checks * (unsigned)period;
+ 
+ 			if (quiet_s >= 5 && quiet_s < 5 + (unsigned)period) {
+-				printf("LIUQIN TOUCH: %u s without a frame, poking INT to wake "
+-				    "the panel\n", quiet_s);
+-				(void)tch_int_wake();
++				if (tch_int_poke_ok) {
++					printf("LIUQIN TOUCH: %u s without a frame, poking INT "
++					    "to wake the panel\n", quiet_s);
++					(void)tch_int_wake();
++				} else {
++					printf("LIUQIN TOUCH: %u s without a frame, INT poke "
++					    "disabled (liuqintouchwake=1 enables it)\n", quiet_s);
++				}
+ 			}
+ 		}
+-		if (tch_quiet_checks * (unsigned)period >= 30 && tch_fw_revive < 10) {
++		if (tch_quiet_checks * (unsigned)period >= 30 &&
++		    tch_fw_revive < TCH_REVIVE_MAX) {
+ 			tch_fw_revive++;
+ 			printf("LIUQIN TOUCH: revive %u: no contact frame for %u s, "
+ 			    "re-downloading the firmware\n", tch_fw_revive,
+@@ -5192,10 +5310,29 @@
+ 			 * byte of ILM, so the latch that parks the part in the 0xfd
+ 			 * loop was never cleared; the flag lives at 0x1fb535. */
+ 			tch_crc_flag("revive", true);
+-			delay(5 * 1000);
+-			(void)tch_nvt_write8(NVT_SW_RESET_ADDR, 0x69);
+-			delay(35 * 1000);
++			/* touch178: this used to write 0x69 and read the info back,
++			 * which is not a recovery at all - the log right after it says
++			 * `fw state 0xa3 (running)`, so nothing was reset and nothing
++			 * was downloaded, and the panel went on reporting nothing for
++			 * the rest of the boot.  The full download is the only thing
++			 * that restarts a Novatek part. */
++			(void)tch_fw_download();
+ 			(void)tch_novatek_info();
++			/* touch180: a reload that reports "BOOTED" is not the same as a
++			 * panel that reports touches - 178's log has revives after which
++			 * the frame counter never moved again.  Print what the part says
++			 * about itself right after the reload so the next log separates
++			 * "the download failed" from "the firmware booted but does not
++			 * scan". */
++			{
++				uint8_t b[8] = { 0 };
++
++				(void)tch_nvt_read(NVT_EVENT_BUF_ADDR, b, sizeof(b));
++				printf("LIUQIN TOUCH: after the reload the report area reads "
++				    "%02x %02x %02x %02x, 0x51 0x%02x, state %s\n",
++				    b[0], b[1], b[2], b[3], tch_fw_status_byte(),
++				    tch_panel_running() ? "running" : "not ready");
++			}
+ 			tch_fw_dead = 0;
+ 			tch_hang_hits = 0;
+ 			tch_quiet_checks = 0;
+@@ -5389,6 +5526,9 @@
+ 	    tch_rd(se, SE_GENI_STATUS), tch_rd(se, GENI_FW_REVISION_RO),
+ 	    tch_rd(se, SE_GENI_S_CMD0), tch_rd(se, SE_GENI_S_IRQ_STATUS));
+ 
++	/* Buttons live on the PMICs and need nothing from the touch engine. */
++	liuqin_keys_start();
++
+ 	/* --- stage 3: SPI master, Novatek chip id, report thread --- */
+ 	if (level >= 3) {
+ 		thread_t thread;
+@@ -5401,4 +5541,481 @@
+ 		}
+ 	}
+ }
++
++/*
++ * ---------------------------------------------------------------- PMIC keys
++ *
++ * None of the tablet's three buttons is on a TLMM pin.  The device tree (both
++ * the stock overlay and the mainline liuqin DTS) puts them on the PMICs, which
++ * are only reachable over SPMI:
++ *
++ *   power        PMK8350 PON, SPMI SID 0, PON_RT_STS at 0x1310, bit 7
++ *                (qcom,pmk8350-pwrkey, code KEY_POWER)
++ *   volume down  the same PON byte, bit 6 - PON RESIN, wired to
++ *                qcom,pmk8350-resin with linux,code = KEY_VOLUMEDOWN
++ *   volume up    PM8350 GPIO6, SPMI SID 1, base 0x8d00, RT_STS at 0x8d10
++ *                (gpio-keys/key-volume-up, PM8350_ACTIVE_LOW)
++ *
++ * The SPMI master is the PMIC arbiter at 0xc42d000 ("qcom,spmi-pmic-arb").
++ * This part is arbiter v7.  Two details matter, and both were wrong in
++ * touch173, which is why ppid 0x013 was never found:
++ *
++ *   - the v7 APID->PPID table is at core + 0x2000 + 4*apid, not at 0x0b00
++ *     (Linux drivers/spmi/spmi-pmic-arb.c: pmic_arb_apid_map_offset_v7());
++ *   - an entry is (ppid << 8) | flags and PPID is 12 bits
++ *     (PMIC_ARB_PPID_MASK = 0xfff), so masking 13 bits folds the reserved
++ *     bit 20 into the comparison.
++ *
++ * Reading the reserved 0x0b00 window is also what made each old scan read cost
++ * ~26 ms: those offsets are not implemented and the interconnect waits for a
++ * timeout.  The real table reads take a normal MMIO access.
++ *
++ * Only reads are used here: writing a PMIC register from a port with no PMIC
++ * driver would be able to change a rail, and nothing about the buttons needs
++ * it.  The arbiter's own command register is written; that is the SPMI master,
++ * not a PMIC register.
++ */
++#define SPMI_CORE_PA            0x0c400000u
++#define SPMI_CORE_SIZE          0x3000u
++#define SPMI_CFG0_PA            0x0c42d000u
++#define SPMI_CFG1_PA            0x0c432000u
++#define SPMI_CFG_SIZE           0x4000u
++#define SPMI_OBS_PA             0x0c440000u
++#define SPMI_OBS_SIZE           0x80000u
++
++#define SPMI_REG_VERSION        0x0000u
++#define SPMI_REG_FEATURES0      0x0004u
++#define SPMI_REG_FEATURES1      0x0008u
++#define SPMI_FEATURES_MASK      0x7ffu
++#define SPMI_APID_MAP(i)        (0x2000u + 4u * (i))
++#define SPMI_APID_MAX           1024u
++#define SPMI_PPID_MASK          0x0fffu
++#define SPMI_IRQ_OWNER          (1u << 24)
++#define SPMI_OWNER(apid)        (4u * (apid))
++
++#define SPMI_CH_CMD             0x00u
++#define SPMI_CH_STATUS          0x08u
++#define SPMI_CH_RDATA0          0x18u
++#define SPMI_CH_STRIDE          0x20u
++#define SPMI_OP_READ            15u
++#define SPMI_ST_DONE            (1u << 0)
++#define SPMI_ST_ERR             0x7eu
++
++#define PMIC_PON_RT_STS         0x1310u
++#define PMIC_PON_KPDPWR         (1u << 7)
++#define PMIC_PON_RESIN          (1u << 6)
++#define PMIC_VOLUP_RT_STS       0x8d10u
++#define PMIC_GPIO_VAL           (1u << 0)
++
++/* A real SPMI byte read is tens of microseconds.  Anything past this is a bad
++ * APID or an unimplemented offset; the hardware's own timeout can be ~26 ms,
++ * and waiting for it on every sample would make the poll useless. */
++#define PMIC_READ_TIMEOUT_NS    (20ull * 1000 * 1000)
++
++static vm_offset_t pmic_core, pmic_cfg0, pmic_cfg1, pmic_obs;
++static uint32_t pmic_bus0_apids, pmic_bus1_apids;
++static int liuqin_keys_chan;
++
++static uint64_t
++pmic_ns_since(uint64_t t0)
++{
++	uint64_t ns = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	return ns;
++}
++
++/* Owner (EE) of an APID.  v7 keeps one ownership table per bus, indexed from
++ * that bus's base APID, inside that bus's "cfg" region. */
++static uint32_t
++pmic_owner(uint32_t apid)
++{
++	if (apid < pmic_bus0_apids) {
++		return pmic_cfg0 == 0 ? 0xfu :
++		    (tch_rd(pmic_cfg0, SPMI_OWNER(apid)) & 0x7u);
++	}
++	if (apid < pmic_bus0_apids + pmic_bus1_apids) {
++		return pmic_cfg1 == 0 ? 0xfu :
++		    (tch_rd(pmic_cfg1,
++		    SPMI_OWNER(apid - pmic_bus0_apids)) & 0x7u);
++	}
++	return 0xfu;
++}
++
++/*
++ * One SPMI register read.  The command word is the arbiter's own format
++ * (opcode << 27 | register << 4 | byte-count-1); the channel reports
++ * completion in STATUS bit 0 and any bus failure in bits 1..6.
++ *
++ * The timeout is wall-clock.  If a read is aimed at an APID that is not
++ * mapped, the status read itself can take ~26 ms; the old fixed 4000-iteration
++ * loop would then wait for over a minute.
++ */
++static int
++pmic_read_ex(uint32_t apid, uint32_t addr, uint8_t *buf, size_t len,
++    uint32_t *status_out, uint64_t *ns_out)
++{
++	const uint32_t ch = apid * SPMI_CH_STRIDE;
++	const uint32_t cmd = (SPMI_OP_READ << 27) |
++	    ((addr & 0xffu) << 4) | (uint32_t)(len - 1);
++	const uint64_t t0 = mach_absolute_time();
++	uint32_t st = 0;
++	unsigned i;
++
++	tch_wr(pmic_obs, ch + SPMI_CH_CMD, cmd);
++	for (i = 0; i < 100000; i++) {
++		st = tch_rd(pmic_obs, ch + SPMI_CH_STATUS);
++		if ((st & SPMI_ST_DONE) != 0) {
++			break;
++		}
++		if (pmic_ns_since(t0) >= PMIC_READ_TIMEOUT_NS) {
++			break;
++		}
++		delay(1);
++	}
++	if (ns_out != NULL) {
++		*ns_out = pmic_ns_since(t0);
++	}
++	if (status_out != NULL) {
++		*status_out = st;
++	}
++	if ((st & SPMI_ST_DONE) == 0 || (st & SPMI_ST_ERR) != 0) {
++		return -1;
++	}
++	for (i = 0; i < len; i++) {
++		const uint32_t r = tch_rd(pmic_obs,
++		    ch + (i < 4 ? SPMI_CH_RDATA0 : SPMI_CH_RDATA0 + 4u));
++		buf[i] = (uint8_t)((r >> (8 * (i & 3))) & 0xff);
++	}
++	return 0;
++}
++
++static int
++pmic_read(uint32_t apid, uint32_t addr, uint8_t *buf, size_t len)
++{
++	return pmic_read_ex(apid, addr, buf, len, NULL, NULL);
++}
++
++/*
++ * touch183 keys-spmi-map: one diagnostic pass, then the normal 50 ms poll.
++ *
++ * The first SPMI access waits 120 s so this thread cannot shift the touch
++ * bring-up, which is the exact failure mode touch173 hit: its synchronous
++ * 3 x 768-entry scan in probe moved "touch clocks+pins ready" from 47 s to
++ * 130 s.  A thread of its own, started after the panel is up, costs nothing.
++ */
++static void
++liuqin_keys_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint32_t pon_apid = (uint32_t)-1, volup_apid = (uint32_t)-1;
++	uint32_t arb_version, features0, features1, count;
++	uint32_t apid, mapped, shown;
++	uint64_t t0, ns;
++	uint32_t status;
++	uint8_t v;
++	int slow;
++
++	if (pmic_core == 0 || pmic_obs == 0) {
++		return;
++	}
++	printf("LIUQIN KEYS: thread up, waiting 120 s before the first SPMI read\n");
++	(void)tsleep(&liuqin_keys_chan, PZERO, "liuqinkeys", 120 * hz);
++
++	t0 = mach_absolute_time();
++	arb_version = tch_rd(pmic_core, SPMI_REG_VERSION);
++	ns = pmic_ns_since(t0);
++	features0 = tch_rd(pmic_core, SPMI_REG_FEATURES0);
++	features1 = tch_rd(pmic_core, SPMI_REG_FEATURES1);
++	count = features0 & SPMI_FEATURES_MASK;
++	pmic_bus0_apids = count;
++	pmic_bus1_apids = features1 & SPMI_FEATURES_MASK;
++	printf("LIUQIN KEYS: arbiter version 0x%08x read in %llu ns\n",
++	    arb_version, ns);
++	printf("LIUQIN KEYS: features 0x%08x/0x%08x -> bus0 %u apids, bus1 %u apids\n",
++	    features0, features1, pmic_bus0_apids, pmic_bus1_apids);
++	if (arb_version < 0x70000000u || arb_version >= 0x80000000u) {
++		printf("LIUQIN KEYS: not a v7 arbiter (the 0x2000 table is v7-only), stopping\n");
++		return;
++	}
++	if (count == 0 || count > SPMI_APID_MAX) {
++		printf("LIUQIN KEYS: bad bus0 APID count, stopping\n");
++		return;
++	}
++	if (pmic_bus1_apids > SPMI_APID_MAX - count) {
++		pmic_bus1_apids = SPMI_APID_MAX - count;
++	}
++
++	/* The handoff's first guess: APID == PPID == 0x13.  One transaction,
++	 * before the table scan, tells us whether the bus works at all. */
++	if (pmic_read_ex(19, PMIC_PON_RT_STS, &v, 1, &status, &ns) == 0) {
++		printf("LIUQIN KEYS: direct apid 19 addr 0x1310 -> 0x%02x "
++		    "(status 0x%08x, %llu us)\n", v, status, ns / 1000ull);
++	} else {
++		printf("LIUQIN KEYS: direct apid 19 addr 0x1310 failed "
++		    "(status 0x%08x, %llu us)\n", status, ns / 1000ull);
++	}
++
++	/* Time the first table read: if the old 26 ms cost is still there, do
++	 * not stall for 20 s scanning 768 entries. */
++	t0 = mach_absolute_time();
++	(void)tch_rd(pmic_core, SPMI_APID_MAP(0));
++	ns = pmic_ns_since(t0);
++	slow = ns > 2000ull * 1000ull;
++	printf("LIUQIN KEYS: first map read at 0x%x took %llu ns%s\n",
++	    SPMI_APID_MAP(0), ns, slow ? " (slow: the scan yields every 64 APIDs)" : "");
++
++	{
++		uint32_t scanned;
++
++		t0 = mach_absolute_time();
++		mapped = 0;
++		shown = 0;
++		for (apid = 0; apid < count; apid++) {
++			const uint32_t m = tch_rd(pmic_core, SPMI_APID_MAP(apid));
++			const uint32_t ppid = (m >> 8) & SPMI_PPID_MASK;
++
++			if (m != 0) {
++				mapped++;
++				if (shown < 24) {
++					printf("LIUQIN KEYS: map[%u] ppid 0x%03x irq %u\n",
++					    apid, ppid, (m & SPMI_IRQ_OWNER) ? 1 : 0);
++					shown++;
++				}
++				if (ppid == 0x013 && pon_apid == (uint32_t)-1) {
++					pon_apid = apid;
++				}
++				if (ppid == 0x18d && volup_apid == (uint32_t)-1) {
++					volup_apid = apid;
++				}
++			}
++			if (pon_apid != (uint32_t)-1 && volup_apid != (uint32_t)-1) {
++				break;
++			}
++			if (slow && (apid & 63u) == 63u) {
++				printf("LIUQIN KEYS: bus0 scan %u/%u\n", apid + 1, count);
++				(void)tsleep(&liuqin_keys_chan, PZERO,
++				    "liuqinkeys", hz / 50);
++			}
++		}
++		scanned = (apid < count) ? apid + 1 : count;
++		ns = pmic_ns_since(t0);
++		printf("LIUQIN KEYS: bus0 scan %u apids in %llu us "
++		    "(%llu ns/read), %u mapped\n", scanned, ns / 1000ull,
++		    scanned ? ns / scanned : 0, mapped);
++	}
++	printf("LIUQIN KEYS: bus0 lookup: power 0x013 -> %d, volume up 0x18d -> %d\n",
++	    (int)pon_apid, (int)volup_apid);
++
++	/* If the PON block is not on bus 0, try bus 1.  v7 splits the APID
++	 * space: bus1 starts at bus0's count, and its table entries and
++	 * ownership table use the global APID. */
++	if ((pon_apid == (uint32_t)-1 || volup_apid == (uint32_t)-1) &&
++	    pmic_bus1_apids != 0) {
++		const uint32_t first = pmic_bus0_apids;
++		const uint32_t scan = pmic_bus1_apids;
++		uint32_t scanned;
++
++		printf("LIUQIN KEYS: trying bus1 apids %u..%u\n",
++		    first, first + scan - 1);
++		t0 = mach_absolute_time();
++		for (apid = first; apid < first + scan; apid++) {
++			const uint32_t m = tch_rd(pmic_core, SPMI_APID_MAP(apid));
++			const uint32_t ppid = (m >> 8) & SPMI_PPID_MASK;
++
++			if (m != 0) {
++				if (ppid == 0x013 && pon_apid == (uint32_t)-1) {
++					pon_apid = apid;
++				}
++				if (ppid == 0x18d && volup_apid == (uint32_t)-1) {
++					volup_apid = apid;
++				}
++			}
++			if (pon_apid != (uint32_t)-1 && volup_apid != (uint32_t)-1) {
++				break;
++			}
++			if (slow && ((apid - first) & 63u) == 63u) {
++				printf("LIUQIN KEYS: bus1 scan %u/%u\n",
++				    apid - first + 1, scan);
++				(void)tsleep(&liuqin_keys_chan, PZERO,
++				    "liuqinkeys", hz / 50);
++			}
++		}
++		scanned = (apid < first + scan) ? apid - first + 1 : scan;
++		ns = pmic_ns_since(t0);
++		printf("LIUQIN KEYS: bus1 scan %u apids in %llu us: "
++		    "power -> %d, volume up -> %d\n", scanned,
++		    ns / 1000ull, (int)pon_apid, (int)volup_apid);
++	}
++	if (pon_apid == (uint32_t)-1 && volup_apid == (uint32_t)-1) {
++		printf("LIUQIN KEYS: neither PPID found; stopping (no polling)\n");
++		return;
++	}
++	if (pon_apid != (uint32_t)-1) {
++		printf("LIUQIN KEYS: power/volume down ppid 0x013 -> apid %u "
++		    "(owner EE %u)\n", pon_apid, pmic_owner(pon_apid));
++	}
++	if (volup_apid != (uint32_t)-1) {
++		printf("LIUQIN KEYS: volume up ppid 0x18d -> apid %u "
++		    "(owner EE %u)\n", volup_apid, pmic_owner(volup_apid));
++	}
++
++	/* One annotated read of each register before the poll starts. */
++	{
++		uint8_t pon = 0;
++		uint8_t volup = 0;
++		uint32_t pon_st = 0, volup_st = 0;
++
++		if (pon_apid != (uint32_t)-1) {
++			if (pmic_read_ex(pon_apid, PMIC_PON_RT_STS, &pon, 1,
++			    &pon_st, NULL) == 0) {
++				printf("LIUQIN KEYS: pon reads 0x%02x "
++				    "(power %s, volume down %s)\n", pon,
++				    (pon & PMIC_PON_KPDPWR) ? "pressed" : "released",
++				    (pon & PMIC_PON_RESIN) ? "pressed" : "released");
++			} else {
++				printf("LIUQIN KEYS: pon read failed (status 0x%08x)\n",
++				    pon_st);
++				pon_apid = (uint32_t)-1;
++			}
++		}
++		if (volup_apid != (uint32_t)-1) {
++			if (pmic_read_ex(volup_apid, PMIC_VOLUP_RT_STS, &volup, 1,
++			    &volup_st, NULL) == 0) {
++				printf("LIUQIN KEYS: volume up reads 0x%02x "
++				    "(active low: %s)\n", volup,
++				    (volup & PMIC_GPIO_VAL) ? "released" : "pressed");
++			} else {
++				printf("LIUQIN KEYS: volume up read failed "
++				    "(status 0x%08x)\n", volup_st);
++				volup_apid = (uint32_t)-1;
++			}
++		}
++	}
++	if (pon_apid == (uint32_t)-1 && volup_apid == (uint32_t)-1) {
++		printf("LIUQIN KEYS: no readable key register, stopping\n");
++		return;
++	}
++
++	printf("LIUQIN KEYS: polling power/volume down every 50 ms; "
++	    "press a key (volume up is active low)\n");
++	{
++		uint8_t last_pon = 0, last_volup = 0;
++		bool power = false, voldown = false, volup = false;
++		unsigned agree_power = 0, agree_voldown = 0, agree_volup = 0;
++		unsigned failures = 0;
++		bool have_pon = false, have_volup = false;
++		const int ticks = (hz / 20) > 0 ? hz / 20 : 1;
++
++		for (;;) {
++			uint8_t pon = last_pon, vu = last_volup;
++			bool power_now = power, voldown_now = voldown;
++			bool volup_now = volup;
++
++			(void)tsleep(&liuqin_keys_chan, PZERO, "liuqinkeys", ticks);
++			if (pon_apid != (uint32_t)-1) {
++				if (pmic_read(pon_apid, PMIC_PON_RT_STS, &pon, 1) == 0) {
++					failures = 0;
++					have_pon = true;
++					power_now = (pon & PMIC_PON_KPDPWR) != 0;
++					voldown_now = (pon & PMIC_PON_RESIN) != 0;
++				} else {
++					failures++;
++				}
++			}
++			if (volup_apid != (uint32_t)-1) {
++				if (pmic_read(volup_apid, PMIC_VOLUP_RT_STS, &vu, 1) == 0) {
++					failures = 0;
++					have_volup = true;
++					/* DTS: gpios = <&pm8350_gpios 6 GPIO_ACTIVE_LOW> */
++					volup_now = (vu & PMIC_GPIO_VAL) == 0;
++				} else {
++					failures++;
++				}
++			}
++			if (failures >= 20) {
++				printf("LIUQIN KEYS: 20 consecutive SPMI failures, stopping\n");
++				return;
++			}
++			if ((have_pon && pon != last_pon) ||
++			    (have_volup && vu != last_volup)) {
++				printf("LIUQIN KEYS: raw pon 0x%02x volup 0x%02x\n",
++				    pon, vu);
++				last_pon = pon;
++				last_volup = vu;
++			}
++
++			/* Two equal samples (100 ms) debounce a press. */
++			if (power_now != power) {
++				if (++agree_power >= 2) {
++					power = power_now;
++					agree_power = 0;
++					liuqin_touch_post(power ? LIUQIN_BUTTON_DOWN :
++					    LIUQIN_BUTTON_UP, LIUQIN_BUTTON_LOCK, 0, 0);
++					printf("LIUQIN KEYS: power %s\n",
++					    power ? "down" : "up");
++				}
++			} else {
++				agree_power = 0;
++			}
++			if (voldown_now != voldown) {
++				if (++agree_voldown >= 2) {
++					voldown = voldown_now;
++					agree_voldown = 0;
++					liuqin_touch_post(voldown ? LIUQIN_BUTTON_DOWN :
++					    LIUQIN_BUTTON_UP, LIUQIN_BUTTON_VOLUME_DOWN, 0, 0);
++					printf("LIUQIN KEYS: volume down %s\n",
++					    voldown ? "down" : "up");
++				}
++			} else {
++				agree_voldown = 0;
++			}
++			if (volup_now != volup) {
++				if (++agree_volup >= 2) {
++					volup = volup_now;
++					agree_volup = 0;
++					liuqin_touch_post(volup ? LIUQIN_BUTTON_DOWN :
++					    LIUQIN_BUTTON_UP, LIUQIN_BUTTON_VOLUME_UP, 0, 0);
++					printf("LIUQIN KEYS: volume up %s\n",
++					    volup ? "down" : "up");
++				}
++			} else {
++				agree_volup = 0;
++			}
++		}
++	}
++}
++
++/*
++ * touch183 keys-spmi-map: this diagnostic build enables the poller by default
++ * because the 567-byte boot line must not change.  The released driver keeps
++ * the keys off unless liuqinkeys=1; `liuqinkeys=0` still disables this build.
++ */
++static void
++liuqin_keys_start(void)
++{
++	int on = 1;
++	thread_t thread;
++
++	if (PE_parse_boot_argn("liuqinkeys", &on, sizeof(on)) && on == 0) {
++		printf("LIUQIN KEYS: disabled by liuqinkeys=0\n");
++		return;
++	}
++	pmic_core = ml_io_map(SPMI_CORE_PA, SPMI_CORE_SIZE);
++	pmic_obs = ml_io_map(SPMI_OBS_PA, SPMI_OBS_SIZE);
++	pmic_cfg0 = ml_io_map(SPMI_CFG0_PA, SPMI_CFG_SIZE);
++	pmic_cfg1 = ml_io_map(SPMI_CFG1_PA, SPMI_CFG_SIZE);
++	if (pmic_core == 0 || pmic_obs == 0) {
++		printf("LIUQIN KEYS: spmi map failed (core %d obs %d)\n",
++		    pmic_core != 0, pmic_obs != 0);
++		return;
++	}
++	printf("LIUQIN KEYS: touch183 diagnostic build, keys enabled by default "
++	    "(liuqinkeys=0 disables)\n");
++	if (kernel_thread_start(liuqin_keys_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("LIUQIN KEYS: thread not started\n");
++	}
++}
++
+ #endif /* ARM64_BOARD_CONFIG_LIUQIN */

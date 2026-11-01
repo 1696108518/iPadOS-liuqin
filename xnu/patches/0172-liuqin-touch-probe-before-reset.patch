@@ -1,0 +1,36 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -1209,8 +1209,33 @@
+ 	 * touch17's sweep found exactly one assignment that answers:
+ 	 * cs gpio17, clk gpio18, mosi gpio19, miso gpio16.  Start from it and
+ 	 * try both page-address splits before falling back to the sweep.
++	 */
++	/*
++	 * Probe before resetting anything.  If the controller is still running
++	 * its RAM firmware (ABL or a preceding TWRP boot loaded it), a reset pulse
++	 * discards it and the part goes silent - so release the reset line only,
++	 * and look for a live chip first.
+ 	 */
+ 	tch_roles(17, 18, 19, 16);
++	tch_bb_dir(tch.pin_reset, true, 1);             /* deasserted, no pulse */
++	delay(20 * 1000);
++	printf("LIUQIN TOUCH: probing before any reset (gpio20 high, INT %d)\n", bb_get(21));
++	for (unsigned mode = 0; mode < 4; mode++) {
++		tch.bb_cpol = (mode >> 1) & 1;
++		tch.bb_cpha = mode & 1;
++		bb_set(tch.pin_clk, tch.bb_cpol);
++		if (tch_probe_roles("live probe", 900 + mode) == 0) {
++			printf("LIUQIN TOUCH: live controller answered in SPI mode %u\n", mode);
++			printf("LIUQIN TOUCH: bit-banged SPI: cs gpio%u clk gpio%u mosi gpio%u miso gpio%u\n",
++			    tch.pin_cs, tch.pin_clk, tch.pin_mosi, tch.pin_miso);
++			return 0;
++		}
++	}
++	tch.bb_cpol = 0;
++	tch.bb_cpha = 0;
++	bb_set(tch.pin_clk, 0);
++
++	tch.page8 = false;
+ 	tch_nvt_bringup();
+ 	for (unsigned mode = 0; mode < 2; mode++) {
+ 		tch.page8 = (mode == 1);

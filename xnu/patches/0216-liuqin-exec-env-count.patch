@@ -1,0 +1,24 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7434,13 +7434,21 @@
+ 			{
+ 				char *e = imgp->ip_endargv;
+ 				char *end = imgp->ip_endenvv;
++				int vars = 0, dyld = 0;
+ 
++				printf("EXECENV %s: span=%ld\n", p->p_name,
++				    (e != NULL && end != NULL && end > e) ? (long)(end - e) : -1L);
+ 				while (e != NULL && end != NULL && e < end && *e != '\0') {
++					vars++;
+ 					if (strncmp(e, "DYLD_", 5) == 0 && strlen(e) < 120) {
++						dyld++;
+ 						printf("EXECENV %s: %s\n", p->p_name, e);
++					} else if (vars <= 3) {
++						printf("EXECENV %s: (env %d) %.96s\n", p->p_name, vars, e);
+ 					}
+ 					e += strlen(e) + 1;
+ 				}
++				printf("EXECENV %s: vars=%d dyld=%d\n", p->p_name, vars, dyld);
+ 			}
+ #else
+ 			printf("Allowing spawn of iOS binary %s since it has "

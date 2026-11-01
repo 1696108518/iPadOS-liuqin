@@ -1,0 +1,60 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -1186,6 +1186,7 @@
+ tch_fw_write_sram(const uint8_t *img, uint32_t sram, uint32_t size, uint32_t off)
+ {
+ 	for (uint32_t done = 0; done < size; done += NVT_FW_CHUNK) {
++		static unsigned chunk_no;
+ 		uint8_t page[3], hdr[1];
+ 		uint32_t addr = sram + done;
+ 		uint32_t len = size - done;
+@@ -1207,6 +1208,8 @@
+ 		if (err != 0) {
+ 			return -1;
+ 		}
++		printf("LIUQIN TOUCH: fw chunk %u @sram 0x%05x len 0x%x\n",
++		    ++chunk_no, addr, len);
+ 		hdr[0] = (uint8_t)(addr & 0x7f);
+ 		if (tch_cs(true) != 0) {
+ 			return -1;
+@@ -1262,6 +1265,12 @@
+ 	printf("LIUQIN TOUCH: fw download: end 0x%x cascade %u info %u parts %u size %u\n",
+ 	    end, (fw[0x20] >> 1) & 1, info_num, parts, size);
+ 
++	/* A 245 KiB image at 100 kHz takes minutes; the part is happy at 9.6 MHz,
++	 * so tighten the bit-bang pacing for the transfer and restore it after. */
++	const uint32_t saved_pace = tch.bb_pace_us;
++
++	tch.bb_pace_us = 2;
++
+ 	(void)tch_nvt_write8(0x00000, 0x69);            /* bootloader reset */
+ 	delay(35 * 1000);
+ 
+@@ -1284,11 +1293,13 @@
+ 		}
+ 		if (bin + len > size) {
+ 			printf("LIUQIN TOUCH: fw part %u out of range\n", i);
++			tch.bb_pace_us = saved_pace;
+ 			return -1;
+ 		}
+ 		printf("LIUQIN TOUCH: fw part %u: sram 0x%x len 0x%x bin 0x%x\n", i, sram, len, bin);
+ 		if (tch_fw_write_sram(fw, sram, len + 1, bin) != 0) {
+ 			printf("LIUQIN TOUCH: fw part %u write failed\n", i);
++			tch.bb_pace_us = saved_pace;
+ 			return -1;
+ 		}
+ 	}
+@@ -1300,11 +1311,13 @@
+ 
+ 	for (unsigned i = 0; i < 10; i++) {
+ 		if (tch_fw_state_ready()) {
++			tch.bb_pace_us = saved_pace;
+ 			printf("LIUQIN TOUCH: firmware booted, state ready after %u polls\n", i);
+ 			return 0;
+ 		}
+ 		delay(10 * 1000);
+ 	}
++	tch.bb_pace_us = saved_pace;
+ 	printf("LIUQIN TOUCH: firmware did not report ready\n");
+ 	return -1;
+ }

@@ -1,0 +1,28 @@
+--- a/iokit/NativeAdreno/NativeAdrenoPublish.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoPublish.cpp
+@@ -410,6 +410,10 @@
+         memset(line,0,sizeof(native_adreno_metal_diag.report));
+         memcpy(line,meta->text,n);
+         native_adreno_metal_diag.reports=native_adreno_metal_diag.reports+1;
++        /* The plugin's result line (raw test or Turnip phase). Keep it in the
++         * kernel log as well as the diagnostic page, so one boot log says
++         * whether the userspace half reached the driver and what it got. */
++        IOLog("NativeAdrenoMetal: %.*s\n",int(n),meta->text);
+     }
+     /* A call that is still running when the boot page is photographed shows as inflight = its method number + 1 (0 = none), so a hang in the
+      * kernel is attributable to one ABI method. */
+@@ -696,12 +700,14 @@
+         IOLockLock(g.lock);
+         if(record) {record->refused=record->refused+1;record->last_refusal=uint32_t(refusal);}
+         IOLockUnlock(g.lock);
++        IOLog("NativeAdreno: metal client refused 0x%x type 0x%x proc %s\n",refusal,type,opener);
+         return refusal;
+     }
+     IOLockLock(g.lock);
+     if(record)record->opens=record->opens+1;
+     IOLockUnlock(g.lock);
+     native_adreno_metal_diag.opens=native_adreno_metal_diag.opens+1;
++    IOLog("NativeAdreno: metal client open type 0x%x proc %s\n",type,opener);
+     *handler=connection;
+     return kIOReturnSuccess;
+ }

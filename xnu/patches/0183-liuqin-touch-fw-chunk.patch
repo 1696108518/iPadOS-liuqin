@@ -1,0 +1,24 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -1212,8 +1212,19 @@
+ 			return -1;
+ 		}
+ 		err = tch_xfer(hdr, NULL, 1);
+-		if (err == 0) {
+-			err = tch_xfer(img + off + done, NULL, len);
++		/*
++		 * tch_xfer() caps a single call at 256 bytes; the payload goes out
++		 * in pieces inside the same chip-select window, which is one SPI
++		 * message to the controller either way.
++		 */
++		for (uint32_t sent = 0; err == 0 && sent < len; ) {
++			uint32_t n = len - sent;
++
++			if (n > 256) {
++				n = 256;
++			}
++			err = tch_xfer(img + off + done + sent, NULL, n);
++			sent += n;
+ 		}
+ 		if (tch_cs(false) != 0) {
+ 			err = -1;

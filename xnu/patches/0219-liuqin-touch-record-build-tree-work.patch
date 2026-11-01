@@ -1,0 +1,1674 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -43,6 +43,7 @@
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <libkern/libkern.h>
++#include <libkern/OSAtomic.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <vm/pmap.h>
+@@ -276,9 +277,12 @@
+ 
+ /* One page of physically contiguous memory stages every SE-DMA transfer;
+  * TX and RX live 256 bytes apart so a cache-line flush never overlaps. */
+-#define TCH_DMA_TX_OFF          0x000
+-#define TCH_DMA_RX_OFF          0x100
+-#define TCH_DMA_MAX             128
++/* Two 16 KiB pages inside the 5 MiB low window: one for TX, one for RX, so a
++ * 256-byte firmware piece or a 65-byte frame fits in a single transfer. */
++#define TCH_DMA_TX_OFF          0x0000
++#define TCH_DMA_RX_OFF          0x4000
++#define TCH_DMA_MAX             0x3f00
++#define TCH_DMA_SIZE            (TCH_DMA_RX_OFF + TCH_DMA_MAX)
+ 
+ /* Novatek NT36xxx SPI protocol (vendor nt36xxx driver, SPI variant). */
+ /* The vendor driver (TWRP's nt36532_touch.ko) reads the trim id at 0x1fb104
+@@ -292,7 +296,7 @@
+ #define NVT_FWINFO_ADDR         0x125878u      /* event buffer + 0x78 */
+ #define NVT_MAX_FINGERS         10
+ #define NVT_POINT_LEN           65             /* event byte + 10 x 6 + 4 */
+-#define NVT_BUF_MAX             176
++#define NVT_BUF_MAX             320      /* 256-byte verify reads + overhead */
+ /* The vendor's work function reads the event block with len = 109
+  * (one count byte plus 18 six-byte records). */
+ #define NVT_EVENT_BLOCK_LEN     109
+@@ -319,6 +323,7 @@
+ 	uint32_t    bb_pace_us;         /* half clock period, default 5 us */
+ 	vm_offset_t dma;                /* staging page for SE DMA */
+ 	uint64_t    dma_pa;
++	bool        use_dma;            /* transfers go through the SE's DMA */
+ 	uint32_t    dma_tx_status;      /* last SE_DMA_TX/RX_IRQ_STAT */
+ 	uint32_t    dma_rx_status;
+ 	uint32_t    last_irq;           /* M_IRQ_STATUS of the last command */
+@@ -529,6 +534,9 @@
+  * The TLMM register is one 0x1000 block per pin; its IO register is at +0x4
+  * with the output value in bit 1 and the input in bit 0 (SM8450 PINGROUP).
+  */
++/* Shadow copy of each pad's IO register; see bb_set(). */
++static uint32_t bb_shadow[6];           /* index pin - 16 */
++
+ static void
+ tch_bb_dir(uint32_t pin, bool out, int level)
+ {
+@@ -536,17 +544,39 @@
+ 
+ 	io = (io & ~TLMM_OUT_BIT) | (level ? TLMM_OUT_BIT : 0);
+ 	tch_wr(tch.tlmm, TLMM_CTL(pin) + TLMM_IN_OUT, io);
++	if (pin - 16 < 6) {
++		bb_shadow[pin - 16] = io & ~TLMM_IN_BIT;
++	}
+ 	/* mux 0 (GPIO), no pull, 6 mA, output enable in bit 9 */
+ 	tch_wr(tch.tlmm, TLMM_CTL(pin), (out ? (1u << 9) : 0) | (2u << 6));
+ }
+ 
++/*
++ * Shadow copy of each pad's IO register.  The bit-banged bus used to do a
++ * read-modify-write per edge, and on this port every TLMM access costs
++ * microseconds: five accesses per bit is what made a 245 KiB download take
++ * 84 seconds.  Writing the shadow needs no read at all.
++ */
++static inline uint32_t *
++bb_io(uint32_t pin)
++{
++	return (uint32_t *)(tch.tlmm + TLMM_CTL(pin) + TLMM_IN_OUT);
++}
++
+ static inline void
+ bb_set(uint32_t pin, int level)
+ {
+-	volatile uint32_t *io = (volatile uint32_t *)(tch.tlmm + TLMM_CTL(pin) + TLMM_IN_OUT);
+-	const uint32_t v = *io;
++	volatile uint32_t *io = (volatile uint32_t *)bb_io(pin);
++	const unsigned idx = pin - 16;
+ 
+-	*io = (v & ~TLMM_OUT_BIT) | (level ? TLMM_OUT_BIT : 0);
++	if (idx < 6) {
++		bb_shadow[idx] = (bb_shadow[idx] & ~TLMM_OUT_BIT) | (level ? TLMM_OUT_BIT : 0);
++		*io = bb_shadow[idx];
++	} else {
++		const uint32_t v = *io;
++
++		*io = (v & ~TLMM_OUT_BIT) | (level ? TLMM_OUT_BIT : 0);
++	}
+ }
+ 
+ static inline int
+@@ -557,12 +587,58 @@
+ 	return (v & TLMM_IN_BIT) != 0;
+ }
+ 
++/*
++ * Pacing.  delay() costs about 16 us on this port no matter what is asked for,
++ * and the bit-bang called it three times per bit - that, not the pads, is why
++ * the bus ran at ~20 kHz.  A calibrated spin loop is a few hundred nanoseconds
++ * and makes the pace argument mean something.
++ */
++static uint32_t bb_spin_per_us = 60;    /* calibrated at bring-up */
++
++static void
++bb_calibrate(void)
++{
++	uint64_t t0, t1, ns = 0;
++	const uint32_t n = 20000;
++	int spin = 0;
++	volatile uint32_t sink = 0;
++
++	if (PE_parse_boot_argn("liuqintouchspin", &spin, sizeof(spin)) && spin > 0) {
++		bb_spin_per_us = (uint32_t)spin;
++		printf("LIUQIN TOUCH: bit-bang spin %u iterations/us (boot arg)\n",
++		    bb_spin_per_us);
++		return;
++	}
++	t0 = mach_absolute_time();
++	for (uint32_t i = 0; i < n; i++) {
++		__asm__ volatile ("nop" ::: "memory");
++		sink++;
++	}
++	t1 = mach_absolute_time();
++	absolutetime_to_nanoseconds(t1 - t0, &ns);
++	if (ns > 0 && sink == n) {
++		/* iterations per microsecond: n / (ns/1000) */
++		const uint64_t us = ns / 1000ull;
++		if (us > 0) {
++			bb_spin_per_us = (uint32_t)(n / us);
++		}
++		if (bb_spin_per_us < 4) {
++			bb_spin_per_us = 4;
++		}
++	}
++	printf("LIUQIN TOUCH: bit-bang spin %u iterations/us (%llu ns for %u nops)\n",
++	    bb_spin_per_us, ns, n);
++}
++
+ static inline void
+ bb_pace(void)
+ {
+-	/* 0 until the first bit-bang setup runs */
+ 	if (tch.bb_pace_us != 0) {
+-		delay((int)tch.bb_pace_us);
++		uint32_t n = bb_spin_per_us * tch.bb_pace_us;
++
++		while (n-- != 0) {
++			__asm__ volatile ("nop" ::: "memory");
++		}
+ 	}
+ }
+ 
+@@ -613,7 +689,13 @@
+ 		bb_pace();
+ 		return 0;
+ 	}
+-	tch_fifo_mode();
++	/* CS is a command-table opcode with no data behind it, so it runs in
++	 * whichever mode the data path uses; switching to FIFO mode here used to
++	 * turn the DMA engine off under a transfer. */
++	tch_irq_clear();
++	if (!tch.use_dma) {
++		tch_fifo_mode();
++	}
+ 	const uint32_t irq = tch_run_cmd(((assert ? SPI_CS_ASSERT : SPI_CS_DEASSERT) << M_OPCODE_SHFT),
+ 	    NULL, 0, NULL, 0, NULL, 20);
+ 	return (irq & M_CMD_DONE_EN) ? 0 : -1;
+@@ -630,8 +712,14 @@
+ static void
+ tch_visible_mark(const char *what)
+ {
++	const int was = liuqin_console_force;
++
+ 	liuqin_boot_mark(what);
+-	liuqin_console_force = 1;
++	/* liuqin_boot_mark() clears the flag on its way out, and with
++	 * liuqinmarks=0 it does not set it again: the bring-up's lines after the
++	 * first mark then only reached the log ring.  Put back what the caller
++	 * asked for, which also makes the DMA steps visible on screen. */
++	liuqin_console_force = was;
+ }
+ 
+ /* What the bootloader left in the engine, and what it looks like after every
+@@ -661,7 +749,9 @@
+ static int
+ tch_cs_probe(const char *after)
+ {
+-	tch_fifo_mode();
++	if (!tch.use_dma) {
++		tch_fifo_mode();
++	}
+ 	const uint32_t irq = tch_run_cmd(SPI_CS_ASSERT << M_OPCODE_SHFT,
+ 	    NULL, 0, NULL, 0, NULL, 20);
+ 
+@@ -753,19 +843,41 @@
+ 	if (tch.dma != 0) {
+ 		return 0;
+ 	}
+-	if (kmem_alloc_contig(kernel_map, &tch.dma, PAGE_SIZE, PAGE_MASK, 0, 0,
+-	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		printf("LIUQIN TOUCH: no contiguous DMA memory\n");
+-		tch.dma = 0;
+-		return -1;
+-	}
+-	const ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)tch.dma);
++	/*
++	 * The QUP's DMA only addresses 32-bit physical memory, and the page the
++	 * allocator hands out lands at 0x8a0150000 (34.5 GiB) - the first
++	 * transfer then never completes and the machine wedges.  Use a fixed page
++	 * inside the free window the device tree leaves between
++	 * cdsp_secure_heap (ends 0x85200000) and video_region (0x85700000): that
++	 * range belongs to no reserved region and to no ADT bank, so neither the
++	 * firmware nor our own allocator can hand it to anyone else.
++	 */
++	{
++		int fixed = 0;
+ 
+-	if (pn == 0) {
+-		printf("LIUQIN TOUCH: DMA page has no physical address\n");
+-		return -1;
++		if (!PE_parse_boot_argn("liuqintouchdmaphys", &fixed, sizeof(fixed)) || fixed == 0) {
++			fixed = 0x85200000;
++		}
++		tch.dma_pa = (uint64_t)(uint32_t)fixed;
++		printf("LIUQIN TOUCH: DMA: mapping phys 0x%x, 2 pages\n", fixed);
++		tch.dma = (vm_offset_t)ml_io_map((vm_offset_t)tch.dma_pa, 2 * PAGE_SIZE);
++		printf("LIUQIN TOUCH: DMA: ml_io_map returned 0x%llx\n", (uint64_t)tch.dma);
++		if (tch.dma == 0) {
++			printf("LIUQIN TOUCH: cannot map the DMA page at 0x%llx\n", tch.dma_pa);
++			return -1;
++		}
++		/* Device memory: only aligned accesses are allowed (memset() faults
++		 * with an unaligned data abort on it). */
++		{
++			volatile uint64_t *zero = (volatile uint64_t *)tch.dma;
++
++			for (unsigned i = 0; i < 2 * PAGE_SIZE / sizeof(uint64_t); i++) {
++				zero[i] = 0;
++			}
++		}
++		printf("LIUQIN TOUCH: DMA page fixed at phys 0x%llx (%s)\n",
++		    tch.dma_pa, fixed == 0x85200000 ? "default window" : "requested");
+ 	}
+-	tch.dma_pa = ptoa_64(pn);
+ 	if (tch.dma_pa == 0) {
+ 		printf("LIUQIN TOUCH: DMA page maps to physical 0\n");
+ 		return -1;
+@@ -774,11 +886,74 @@
+ 	 * when it drove this SE over GPI DMA. */
+ 	tch_wr(tch.se, SE_DMA_TX_FSM_RST, 1);
+ 	tch_wr(tch.se, SE_DMA_RX_FSM_RST, 1);
+-	printf("LIUQIN TOUCH: DMA staging page at 0x%llx (phys 0x%llx)\n",
+-	    (uint64_t)tch.dma, tch.dma_pa);
++	tch.use_dma = true;
++	printf("LIUQIN TOUCH: DMA staging page at 0x%llx (phys 0x%llx, %u KiB)\n",
++	    (uint64_t)tch.dma, tch.dma_pa, (unsigned)(2 * PAGE_SIZE / 1024));
+ 	return 0;
+ }
+ 
++/*
++ * apps_smmu (vendor DTB: soc/apps-smmu@15000000, "qcom,qsmmu-v500", 1 MiB).
++ * QUPv3_0's GENI SE - the wrapper that owns SE4 - carries
++ * iommus = <&apps_smmu 0x5a3 0>, so every SE DMA transaction is translated by
++ * stream 0x5A3.  An S2CR that is not in bypass makes that transaction fault,
++ * and a stalled fault stalls the interconnect: the machine froze on the very
++ * first DMA opcode with nothing else printed.  qsmmu-v500 indexes S2CR by the
++ * stream id at 0x8000 + 4*n, so the register is 0x15000000 + 0x968c.
++ *
++ * liuqintouchsmmu: 0 off, 1 report only, 2 report and set the stream to bypass.
++ */
++#define APPS_SMMU_PA   0x15000000u
++#define SMMU_SCR0      0x0000u
++#define SMMU_IDR0      0x0020u
++#define SMMU_S2CR(n)   (0x8000u + (n) * 4u)
++#define SMMU_STREAM    0x5a3u
++#define S2CR_TYPE_BYPASS 0x1u
++
++static void
++tch_smmu_fix(void)
++{
++	int mode = 1;
++	vm_offset_t smmu;
++	uint32_t scr0, idr0, s2cr0, s2cr1, s2cr;
++
++	(void)PE_parse_boot_argn("liuqintouchsmmu", &mode, sizeof(mode));
++	if (mode <= 0) {
++		return;
++	}
++	smmu = ml_io_map(APPS_SMMU_PA, 0x10000);
++	if (smmu == 0) {
++		printf("LIUQIN TOUCH: SMMU: cannot map 0x%x\n", APPS_SMMU_PA);
++		return;
++	}
++	scr0 = tch_rd(smmu, SMMU_SCR0);
++	idr0 = tch_rd(smmu, SMMU_IDR0);
++	s2cr0 = tch_rd(smmu, SMMU_S2CR(0));
++	s2cr1 = tch_rd(smmu, SMMU_S2CR(1));
++	s2cr = tch_rd(smmu, SMMU_S2CR(SMMU_STREAM));
++	printf("LIUQIN TOUCH: SMMU scr0 0x%08x idr0 0x%08x S2CR[0] 0x%08x S2CR[1] 0x%08x\n",
++	    scr0, idr0, s2cr0, s2cr1);
++	printf("LIUQIN TOUCH: SMMU S2CR[0x%x] 0x%08x type %u (0 translate, 1 bypass, 2 fault)\n",
++	    SMMU_STREAM, s2cr, s2cr & 3u);
++	if (mode < 2) {
++		return;
++	}
++	if (idr0 == 0 || idr0 == 0xffffffffu) {
++		/* Not an SMMU register block: never write into whatever this is. */
++		printf("LIUQIN TOUCH: SMMU: no IDR0, refusing to write\n");
++		return;
++	}
++	if ((s2cr & 3u) == S2CR_TYPE_BYPASS) {
++		printf("LIUQIN TOUCH: SMMU stream already bypasses, nothing to write\n");
++		return;
++	}
++	printf("LIUQIN TOUCH: SMMU writing bypass to S2CR[0x%x] (0x%08x -> 0x%08x)\n",
++	    SMMU_STREAM, s2cr, (s2cr & ~3u) | S2CR_TYPE_BYPASS);
++	tch_wr(smmu, SMMU_S2CR(SMMU_STREAM), (s2cr & ~3u) | S2CR_TYPE_BYPASS);
++	printf("LIUQIN TOUCH: SMMU S2CR[0x%x] now 0x%08x\n", SMMU_STREAM,
++	    tch_rd(smmu, SMMU_S2CR(SMMU_STREAM)));
++}
++
+ /* geni_se_select_mode(GENI_SE_DMA): the SE moves the data itself. */
+ static void
+ tch_dma_mode(void)
+@@ -801,9 +976,51 @@
+ 	tch_wr(tch.se, SE_GENI_M_IRQ_CLEAR, 0xffffffff);
+ }
+ 
+-/* One SPI transfer through the serial engine's own DMA engine: what an SE with
+- * FIFO_IF_DISABLE set needs (geni_se_tx/rx_init_dma, then poll the DMA status,
+- * exactly as geni_se_tx/rx_init_dma() and the U-Boot GENI SPI driver do). */
++/*
++ * The staging page is mapped Device (VM_WIMG_IO): the CPU does not cache it, so
++ * no cache maintenance is needed and byte accesses are the only ones that are
++ * always aligned.  memset()/memcpy() on it faulted once already (clang emits
++ * wide stores), and flush_dcache64() takes a *physical* address and goes through
++ * phystokv_range(), which panics for a page outside the ADT's DRAM bank - that
++ * panic is what touch126 hit right after "DMA page fixed".
++ */
++static void
++tch_dma_put(uint32_t off, const uint8_t *src, size_t len)
++{
++	volatile uint8_t *p = (volatile uint8_t *)(tch.dma + off);
++
++	for (size_t i = 0; i < len; i++) {
++		p[i] = src[i];
++	}
++}
++
++static void
++tch_dma_get(uint32_t off, uint8_t *dst, size_t len)
++{
++	volatile uint8_t *p = (volatile uint8_t *)(tch.dma + off);
++
++	for (size_t i = 0; i < len; i++) {
++		dst[i] = p[i];
++	}
++}
++
++static void
++tch_dma_clear(uint32_t off, size_t len)
++{
++	volatile uint8_t *p = (volatile uint8_t *)(tch.dma + off);
++
++	for (size_t i = 0; i < len; i++) {
++		p[i] = 0;
++	}
++}
++
++/*
++ * One SPI transfer through the serial engine's own DMA engine: what an SE with
++ * FIFO_IF_DISABLE set needs (geni_se_tx/rx_init_dma, then the command).  The
++ * order matters and used to be backwards: Linux programs the DMA pointer,
++ * attribute and length *first* and only then writes SE_GENI_M_CMD0, so the
++ * sequencer finds the descriptor ready when the command starts.
++ */
+ static int
+ tch_dma_xfer(const uint8_t *tx, uint8_t *rx, size_t len)
+ {
+@@ -813,32 +1030,25 @@
+ 	    (tx != NULL ? SPI_TX_ONLY : SPI_RX_ONLY);
+ 	uint32_t txst = 0, rxst = 0, irq = 0;
+ 	bool ok;
++	unsigned i;
+ 
+ 	if (tch.dma == 0 || len == 0 || len > TCH_DMA_MAX) {
+ 		return -1;
+ 	}
+ 	if (tx != NULL) {
+-		memcpy((void *)(tch.dma + TCH_DMA_TX_OFF), tx, len);
+-		flush_dcache64((addr64_t)tx_pa, (unsigned)len, TRUE);
++		tch_dma_put(TCH_DMA_TX_OFF, tx, len);
+ 	}
+ 	if (rx != NULL) {
+-		/* Nothing dirty may survive into the buffer the engine is about
+-		 * to overwrite, and nothing stale may survive the transfer. */
+-		memset((void *)(tch.dma + TCH_DMA_RX_OFF), 0, len);
+-		flush_dcache64((addr64_t)rx_pa, (unsigned)len, TRUE);
++		tch_dma_clear(TCH_DMA_RX_OFF, len);
+ 	}
+ 	tch_wr(tch.se, SE_SPI_TX_TRANS_LEN, tx != NULL ? (uint32_t)len : 0);
+ 	tch_wr(tch.se, SE_SPI_RX_TRANS_LEN, rx != NULL ? (uint32_t)len : 0);
+-	if (tch_dma_count < 4) {
+-		tch_dma_count++;
+-		printf("LIUQIN TOUCH: DMA #%u %s len %u tx 0x%llx rx 0x%llx mode 0x%08x\n",
+-		    tch_dma_count, cmd == SPI_TX_RX ? "tx+rx" : (tx != NULL ? "tx" : "rx"),
+-		    (unsigned)len, tx != NULL ? tx_pa : 0, rx != NULL ? rx_pa : 0,
+-		    tch_rd(tch.se, SE_GENI_DMA_MODE_EN));
+-	}
+-	tch_dma_mode();
+-	tch_wr(tch.se, SE_GENI_M_CMD0, (cmd << M_OPCODE_SHFT) | FRAGMENTATION);
++
++	/* geni_se_select_mode(GENI_SE_DMA) + geni_se_tx/rx_init_dma(). */
++	tch_wr(tch.se, SE_GENI_DMA_MODE_EN,
++	    tch_rd(tch.se, SE_GENI_DMA_MODE_EN) | GENI_DMA_MODE_EN);
+ 	if (rx != NULL) {
++		tch_wr(tch.se, SE_DMA_RX_IRQ_CLR, 0xffffffff);
+ 		tch_wr(tch.se, SE_DMA_RX_IRQ_EN_SET, DMA_IRQ_EN);
+ 		tch_wr(tch.se, SE_DMA_RX_PTR_L, (uint32_t)rx_pa);
+ 		tch_wr(tch.se, SE_DMA_RX_PTR_H, (uint32_t)(rx_pa >> 32));
+@@ -846,16 +1056,34 @@
+ 		tch_wr(tch.se, SE_DMA_RX_LEN, (uint32_t)len);
+ 	}
+ 	if (tx != NULL) {
++		tch_wr(tch.se, SE_DMA_TX_IRQ_CLR, 0xffffffff);
+ 		tch_wr(tch.se, SE_DMA_TX_IRQ_EN_SET, DMA_IRQ_EN);
+ 		tch_wr(tch.se, SE_DMA_TX_PTR_L, (uint32_t)tx_pa);
+ 		tch_wr(tch.se, SE_DMA_TX_PTR_H, (uint32_t)(tx_pa >> 32));
+ 		tch_wr(tch.se, SE_DMA_TX_ATTR, GENI_SE_DMA_EOT_BUF);
+ 		tch_wr(tch.se, SE_DMA_TX_LEN, (uint32_t)len);
+ 	}
+-	for (unsigned i = 0; i < 50 * 20; i++) {
++	if (tch_dma_count < 8) {
++		tch_dma_count++;
++		printf("LIUQIN TOUCH: DMA #%u %s len %u tx 0x%llx rx 0x%llx mode 0x%08x\n",
++		    tch_dma_count, cmd == SPI_TX_RX ? "tx+rx" : (tx != NULL ? "tx" : "rx"),
++		    (unsigned)len, tx != NULL ? tx_pa : 0, rx != NULL ? rx_pa : 0,
++		    tch_rd(tch.se, SE_GENI_DMA_MODE_EN));
++	}
++
++	if (tch_dma_count <= 8) {
++		printf("LIUQIN TOUCH: DMA #%u issuing opcode %u (the transfer starts here)\n",
++		    tch_dma_count, (unsigned)cmd);
++	}
++	tch_wr(tch.se, SE_GENI_M_CMD0, (cmd << M_OPCODE_SHFT) | FRAGMENTATION);
++	tch.status_after_cmd = tch_rd(tch.se, SE_GENI_STATUS);
++	for (i = 0; i < 50 * 20; i++) {
+ 		txst = tx != NULL ? tch_rd(tch.se, SE_DMA_TX_IRQ_STAT) : 0;
+ 		rxst = rx != NULL ? tch_rd(tch.se, SE_DMA_RX_IRQ_STAT) : 0;
+ 		irq = tch_status();
++		if (i == 0) {
++			tch.first_irq = irq;
++		}
+ 		if (irq & TCH_IRQ_ERRS) {
+ 			break;
+ 		}
+@@ -865,6 +1093,11 @@
+ 		}
+ 		delay(50);
+ 	}
++	if (tch_dma_count <= 8) {
++		printf("LIUQIN TOUCH: DMA #%u came back: status 0x%08x irq 0x%08x tx 0x%08x "
++		    "rx 0x%08x after %u polls\n", tch_dma_count,
++		    tch_rd(tch.se, SE_GENI_STATUS), irq, txst, rxst, i);
++	}
+ 	tch.dma_tx_status = txst;
+ 	tch.dma_rx_status = rxst;
+ 	tch.last_irq = irq;
+@@ -880,6 +1113,11 @@
+ 		tch_wr(tch.se, SE_GENI_M_IRQ_CLEAR, irq);
+ 	}
+ 	if (!ok) {
++		if (tch_dma_count <= 8) {
++			printf("LIUQIN TOUCH: DMA failed: status 0x%08x irq 0x%08x tx 0x%08x "
++			    "rx 0x%08x after %u polls\n", tch_rd(tch.se, SE_GENI_STATUS),
++			    irq, txst, rxst, i);
++		}
+ 		if (tx != NULL) {
+ 			tch_wr(tch.se, SE_DMA_TX_FSM_RST, 1);
+ 		}
+@@ -890,8 +1128,7 @@
+ 		return -1;
+ 	}
+ 	if (rx != NULL) {
+-		flush_dcache64((addr64_t)rx_pa, (unsigned)len, TRUE);
+-		memcpy(rx, (void *)(tch.dma + TCH_DMA_RX_OFF), len);
++		tch_dma_get(TCH_DMA_RX_OFF, rx, len);
+ 	}
+ 	return 0;
+ }
+@@ -907,14 +1144,46 @@
+ 		return 0;
+ 	}
+ 	return tch.fifo_capable ? tch_fifo_xfer(tx, rx, len) : tch_dma_xfer(tx, rx, len);
++}
++
++/*
++ * One owner of the bus at a time.  Bring-up runs before the report thread
++ * exists, but recovery re-downloads the firmware while that thread reads the
++ * event buffer every 10 ms.  Two interleaved chip-select windows and page
++ * commands return garbage to both: in the touch127 log every post-reset
++ * download read a bogus BLD descriptor ("ilm des 0x2f74a2") and wrote an image
++ * that never booted, while the report thread's own reads returned 0xff.  The
++ * lock makes one register access atomic; tch_fw_active keeps the report thread
++ * off the bus for the whole download, where a single 64 KiB chunk already
++ * holds the bus for about a second.
++ */
++static volatile UInt32 tch_spi_owner;
++static volatile int tch_fw_active;
++
++static bool
++tch_spi_acquire(void)
++{
++	for (int i = 0; i < 4000; i++) {
++		if (OSCompareAndSwap(0, 1, &tch_spi_owner)) {
++			return true;
++		}
++		delay(500);             /* half a millisecond per try, ~2 s max */
++	}
++	return false;
+ }
+ 
++static void
++tch_spi_release(void)
++{
++	(void)OSCompareAndSwap(1, 0, &tch_spi_owner);
++}
++
+ /* Novatek page/address framing: three bytes set the page, then the address
+  * with bit 7 clear selects a read, the part returns one dummy byte and then
+  * the data.  Mirrors nvt_spi_read() in the vendor driver (and the
+  * tools/touch-novatek harness). */
+ static int
+-tch_nvt_read(uint32_t addr, uint8_t *out, size_t len)
++tch_nvt_read_locked(uint32_t addr, uint8_t *out, size_t len)
+ {
+ 	uint8_t page[3];
+ 	uint8_t tx[NVT_BUF_MAX];
+@@ -971,7 +1240,20 @@
+ 	}
+ 	if (tch.cs_manual && tch_cs(false) != 0) {
+ 		err = -1;
++	}
++	return err;
++}
++
++static int
++tch_nvt_read(uint32_t addr, uint8_t *out, size_t len)
++{
++	int err;
++
++	if (!tch_spi_acquire()) {
++		return -1;
+ 	}
++	err = tch_nvt_read_locked(addr, out, len);
++	tch_spi_release();
+ 	return err;
+ }
+ 
+@@ -1244,60 +1526,106 @@
+ /* One section: chunks of NVT_FW_CHUNK, each a page write followed by a single
+  * chip-select window holding [sram | 0x80] and the payload. */
+ static int
+-tch_fw_write_sram(const uint8_t *img, uint32_t sram, uint32_t size, uint32_t off)
++tch_fw_chunk_write_locked(const uint8_t *data, uint32_t addr, uint32_t len)
+ {
+-	for (uint32_t done = 0; done < size; done += NVT_FW_CHUNK) {
+-		uint8_t page[3], hdr[1];
+-		uint32_t addr = sram + done;
++	uint8_t page[3], hdr[1];
++	int err;
++
++	page[0] = 0xff;
++	page[1] = (uint8_t)((addr >> 15) & 0xff);
++	page[2] = (uint8_t)((addr >> 7) & 0xff);
++	if (tch_cs(true) != 0) {
++		return -1;
++	}
++	err = tch_xfer(page, NULL, sizeof(page));
++	if (tch_cs(false) != 0) {
++		err = -1;
++	}
++	if (err != 0) {
++		return -1;
++	}
++	/*
++	 * The address phase is a write, and every Novatek write carries
++	 * bit 7: the vendor's CTP_SPI_WRITE() runs SPI_WRITE_MASK() on
++	 * buf[0], and it is used for the bulk SRAM payload exactly like
++	 * nvt_write_addr() uses it for one byte.  Without the bit the
++	 * part takes each chunk for a read, the SRAM keeps its previous
++	 * contents and the whole download "succeeds" while nothing lands.
++	 */
++	hdr[0] = (uint8_t)((addr & 0x7f) | 0x80);
++	if (tch_cs(true) != 0) {
++		return -1;
++	}
++	err = tch_xfer(hdr, NULL, 1);
++	/*
++	 * tch_xfer() caps a single call at 256 bytes; the payload goes out
++	 * in pieces inside the same chip-select window, which is one SPI
++	 * message to the controller either way.
++	 */
++	for (uint32_t sent = 0; err == 0 && sent < len; ) {
++		uint32_t n = len - sent;
++
++		if (n > 256) {
++			n = 256;
++		}
++		err = tch_xfer(data + sent, NULL, n);
++		sent += n;
++	}
++	if (tch_cs(false) != 0) {
++		err = -1;
++	}
++	return err;
++}
++
++/*
++ * Write a section in chunks, checking each chunk before the next one goes out.
++ * The bit-banged bus drops a bit every few thousand bytes, and without this the
++ * only symptom was a wrong checksum two minutes later - with no way to tell
++ * which part of the image was corrupt.  A 16-byte read-back costs milliseconds
++ * and a wrong chunk is simply written again.
++ */
++static int
++tch_fw_write_sram_locked(const uint8_t *img, uint32_t sram, uint32_t size, uint32_t off)
++{
++	for (uint32_t done = 0; done < size; done += NVT_FW_CHUNK) {
++		const uint32_t addr = sram + done;
+ 		uint32_t len = size - done;
+-		int err;
++		uint32_t check;
++		int err = -1;
+ 
+ 		if (len > NVT_FW_CHUNK) {
+ 			len = NVT_FW_CHUNK;
+ 		}
+-		page[0] = 0xff;
+-		page[1] = (uint8_t)((addr >> 15) & 0xff);
+-		page[2] = (uint8_t)((addr >> 7) & 0xff);
+-		if (tch_cs(true) != 0) {
+-			return -1;
+-		}
+-		err = tch_xfer(page, NULL, sizeof(page));
+-		if (tch_cs(false) != 0) {
+-			err = -1;
+-		}
+-		if (err != 0) {
+-			return -1;
+-		}
+-		/*
+-		 * The address phase is a write, and every Novatek write carries
+-		 * bit 7: the vendor's CTP_SPI_WRITE() runs SPI_WRITE_MASK() on
+-		 * buf[0], and it is used for the bulk SRAM payload exactly like
+-		 * nvt_write_addr() uses it for one byte.  Without the bit the
+-		 * part takes each chunk for a read, the SRAM keeps its previous
+-		 * contents and the whole download "succeeds" while nothing lands.
+-		 */
+-		hdr[0] = (uint8_t)((addr & 0x7f) | 0x80);
+-		if (tch_cs(true) != 0) {
+-			return -1;
+-		}
+-		err = tch_xfer(hdr, NULL, 1);
+-		/*
+-		 * tch_xfer() caps a single call at 256 bytes; the payload goes out
+-		 * in pieces inside the same chip-select window, which is one SPI
+-		 * message to the controller either way.
+-		 */
+-		for (uint32_t sent = 0; err == 0 && sent < len; ) {
+-			uint32_t n = len - sent;
++		check = len >= 16 ? 16 : len;
++		for (int attempt = 1; attempt <= 2; attempt++) {
++			uint8_t back[16] = { 0 };
+ 
+-			if (n > 256) {
+-				n = 256;
++			err = tch_fw_chunk_write_locked(img + off + done, addr, len);
++			if (err != 0) {
++				printf("LIUQIN TOUCH: fw chunk @0x%05x write failed (try %d)\n",
++				    addr, attempt);
++				continue;
+ 			}
+-			err = tch_xfer(img + off + done + sent, NULL, n);
+-			sent += n;
++			(void)tch_nvt_read_locked(addr, back, check);
++			if (memcmp(back, img + off + done, check) == 0) {
++				err = 0;
++				break;
++			}
++			/* The copy engine moves the chunk asynchronously: give it a
++			 * moment and look again before calling the chunk corrupt. */
++			delay(2 * 1000);
++			(void)tch_nvt_read_locked(addr, back, check);
++			if (memcmp(back, img + off + done, check) == 0) {
++				err = 0;
++				break;
++			}
++			err = 0;                /* rewritten below, the CRC has the last word */
++			printf("LIUQIN TOUCH: fw chunk @0x%05x read back %02x %02x %02x %02x, "
++			    "file %02x %02x %02x %02x (try %d)\n", addr,
++			    back[0], back[1], back[2], back[3],
++			    img[off + done], img[off + done + 1],
++			    img[off + done + 2], img[off + done + 3], attempt);
+ 		}
+-		if (tch_cs(false) != 0) {
+-			err = -1;
+-		}
+ 		if (err != 0) {
+ 			return -1;
+ 		}
+@@ -1305,10 +1633,23 @@
+ 	return 0;
+ }
+ 
++static int
++tch_fw_write_sram(const uint8_t *img, uint32_t sram, uint32_t size, uint32_t off)
++{
++	int err;
++
++	if (!tch_spi_acquire()) {
++		return -1;
++	}
++	err = tch_fw_write_sram_locked(img, sram, size, off);
++	tch_spi_release();
++	return err;
++}
++
+ /* Register write in the bootloader: page command then [reg | 0x80, data...],
+  * each as its own chip-select transaction (nvt_set_bld_crc_bank and friends). */
+ static void
+-tch_fw_reg_write(uint32_t page_addr, uint32_t reg_addr, const uint8_t *data, size_t len)
++tch_fw_reg_write_locked(uint32_t page_addr, uint32_t reg_addr, const uint8_t *data, size_t len)
+ {
+ 	uint8_t page[3];
+ 	/* register byte plus up to 6 data bytes (the cascade reset-status clear
+@@ -1335,6 +1676,16 @@
+ 	(void)tch_cs(false);
+ }
+ 
++static void
++tch_fw_reg_write(uint32_t page_addr, uint32_t reg_addr, const uint8_t *data, size_t len)
++{
++	if (!tch_spi_acquire()) {
++		return;
++	}
++	tch_fw_reg_write_locked(page_addr, reg_addr, data, len);
++	tch_spi_release();
++}
++
+ /* ILM/DLM descriptors the cascade auto-copy engine needs before it will move
+  * the image: destination, length and golden checksum per section. */
+ static void
+@@ -1379,6 +1730,14 @@
+ };
+ static struct tch_fw_crc tch_fw_crc;
+ 
++/* Set by the download: false when the checksums say the image is corrupt. */
++static bool tch_fw_crc_ok = true;
++
++/* Bit-bang pacing delay of the download in microseconds.  liuqintouchdlpace
++ * overrides it; a wrong checksum doubles it for the next attempt. */
++static uint32_t tch_dl_pace = 4;
++static unsigned tch_dl_retry;           /* rewrites after a failed read-back */
++
+ static void
+ tch_fw_read_crc(void)
+ {
+@@ -1405,13 +1764,13 @@
+ }
+ 
+ static int
+-tch_fw_download(void)
++tch_fw_download_busy(void)
+ {
+ 	uint32_t size = 0;
+ 	const uint8_t *fw = liuqin_fw_get("novatek_nt36532_m81_fw_csot.bin", &size);
+ 	uint32_t end, info_num, ovly_num, parts;
+ 	uint32_t ilm_sram, ilm_len, ilm_crc, dlm_sram, dlm_len, dlm_crc;
+-	uint32_t written = 0, chunks = 0;
++	uint32_t written = 0, chunks = 0, fw_ilm_bin = 0, fw_dlm_bin = 0;
+ 	uint32_t saved_pace, txinfo, polls, boot_polls, secs;
+ 	uint8_t boot_a = 0;
+ 	bool cascade, spi_dma, have_header = false, ready = false;
+@@ -1447,9 +1806,18 @@
+ 	/* A 245 KiB image at 100 kHz takes minutes; the part is happy at 9.6 MHz,
+ 	 * so tighten the bit-bang pacing for the transfer and restore it after. */
+ 	saved_pace = tch.bb_pace_us;
+-	tch.bb_pace_us = 2;
++	/* The bit-banged clock is *this* delay, not liuqintouchdiv (which only
++	 * sets the unused serial-engine divider): the "slow" builds never slowed
++	 * a single bit of the download.  4 us is the first setting that has not
++	 * produced a wrong ILM checksum. */
++	tch.bb_pace_us = tch_dl_pace;
++	printf("LIUQIN TOUCH: fw dl bit-bang pace %u us (2 us was the corrupt one)\n",
++	    tch_dl_pace);
+ 	t0 = mach_absolute_time();
+ 
++retry:
++	have_header = false;
++	tch.bb_pace_us = tch_dl_pace;
+ 	/* nvt_bootloader_reset(): 0x69 to the software-reset register (0x1fb43e on
+ 	 * this part, the vendor's swrst_sif address) - 0x00000, which the
+ 	 * NT36523-family flow uses, is not it. */
+@@ -1464,6 +1832,8 @@
+ 	dlm_sram = tch_le32(fw + 16);
+ 	dlm_len = tch_le32(fw + 20);
+ 	dlm_crc = tch_le32(fw + 0x1c);
++	fw_ilm_bin = tch_le32(fw + 0);
++	fw_dlm_bin = tch_le32(fw + 12);
+ 	tch_fw_bld_bank(NVT_BLD_ILM_DES, ilm_sram, NVT_BLD_ILM_LEN, ilm_len,
+ 	    NVT_BLD_ILM_GCRC, ilm_crc);
+ 	tch_fw_bld_bank(NVT_BLD_DLM_DES, dlm_sram, NVT_BLD_DLM_LEN, dlm_len,
+@@ -1550,6 +1920,18 @@
+ 			    ilm_sram, back[0], back[1], back[2], back[3],
+ 			    back[4], back[5], back[6], back[7],
+ 			    fw[bin], fw[bin + 1], fw[bin + 2], fw[bin + 3]);
++		} else if (i == 1) {
++			uint8_t back[16] = { 0 };
++
++			/* The DLM carries the panel parameters and is the block whose
++			 * checksum keeps coming back wrong: this read-back tells a bus
++			 * that dropped bytes from a CRC that disagrees with the image. */
++			(void)tch_nvt_read(dlm_sram, back, sizeof(back));
++			printf("LIUQIN TOUCH: fw dl dlm readback @0x%05x: "
++			    "%02x %02x %02x %02x %02x %02x %02x %02x | file %02x %02x %02x %02x %02x %02x %02x %02x\n",
++			    dlm_sram, back[0], back[1], back[2], back[3], back[4], back[5],
++			    back[6], back[7], fw[bin], fw[bin + 1], fw[bin + 2], fw[bin + 3],
++			    fw[bin + 4], fw[bin + 5], fw[bin + 6], fw[bin + 7]);
+ 		}
+ 	}
+ 
+@@ -1566,8 +1948,91 @@
+ 		}
+ 		delay(1000);
+ 	}
++	/*
++	 * Full read-back of both sections: the BLD CRC registers report the last
++	 * section written, so they cannot prove the image, and with the bit-bang
++	 * at its current speed this costs a couple of seconds.  Logged, not acted
++	 * on - a rewrite here would race the copy engine.
++	 */
++	{
++		uint32_t bad = 0, first = 0;
++		uint8_t blk[256];
++
++		printf("LIUQIN TOUCH: fw verify: reading the image back\n");
++		for (uint32_t off = 0; off < ilm_len; off += 0x1000) {
++			uint32_t n = ilm_len - off;
++
++			if (n > 128) {
++				n = 128;
++			}
++			if (tch_nvt_read(ilm_sram + off, blk, n) != 0) {
++				bad++;
++				if (!first) {
++					first = off;
++				}
++				continue;
++			}
++			for (uint32_t k = 0; k < n; k++) {
++				if (blk[k] != fw[fw_ilm_bin + off + k]) {
++					if (bad++ == 0) {
++						first = off + k;
++					}
++				}
++			}
++		}
++		for (uint32_t off = 0; off < dlm_len; off += 0x1000) {
++			uint32_t n = dlm_len - off;
++
++			if (n > 128) {
++				n = 128;
++			}
++			if (tch_nvt_read(dlm_sram + off, blk, n) != 0) {
++				bad++;
++				if (!first) {
++					first = 0x100000u + off;
++				}
++				continue;
++			}
++			for (uint32_t k = 0; k < n; k++) {
++				if (blk[k] != fw[fw_dlm_bin + off + k]) {
++					if (bad++ == 0) {
++						first = 0x100000u + off + k;
++					}
++				}
++			}
++		}
++		if (bad && tch_dl_retry < 3) {
++			tch_dl_retry++;
++			tch_dl_pace = tch_dl_pace < 32 ? tch_dl_pace * 2 : 32;
++			printf("LIUQIN TOUCH: fw verify: %u of %u bytes differ (first at SRAM "
++			    "0x%05x), rewriting at %u us\n", bad, ilm_len + dlm_len, first,
++			    tch_dl_pace);
++			tch_dma_count = 0;
++			goto retry;
++		}
++		if (bad) {
++			printf("LIUQIN TOUCH: fw verify: %u of %u bytes differ, first at SRAM "
++			    "0x%05x (giving up after %u rewrites)\n", bad, ilm_len + dlm_len,
++			    first, tch_dl_retry);
++			tch_visible_mark("touch fw verify BAD");
++		} else {
++			printf("LIUQIN TOUCH: fw verify: image identical to the file (%u bytes)\n",
++			    ilm_len + dlm_len);
++			tch_visible_mark("touch fw verify ok");
++		}
++	}
++
+ 	tch_fw_crc_line(txinfo, polls, ilm_crc, dlm_crc);
++	/* The bit-banged bus is marginal: when a transfer comes back with a wrong
++	 * checksum the data is corrupt, and retrying at the same clock just fails
++	 * again.  Remember it so the bring-up ladder can slow the bus down. */
+ 	{
++		uint8_t f = 0;
++
++		(void)tch_nvt_read(NVT_BLD_CRC_FLAGS, &f, 1);
++		tch_fw_crc_ok = (f & 0x04) != 0 && (f & 0x03) == 0x03;
++	}
++	{
+ 		char mark[40];
+ 
+ 		snprintf(mark, sizeof(mark), "touch fw crc done %u ilm %u dlm %u",
+@@ -1650,6 +2115,21 @@
+ 	return ready ? 0 : -1;
+ }
+ 
++/* The download owns the bus for its whole life: a register read from the
++ * report thread every 10 ms would otherwise interleave with the chunk
++ * transfers and corrupt both sides.  tch_fw_active lets that thread skip the
++ * bus while this runs instead of timing out on the lock. */
++static int
++tch_fw_download(void)
++{
++	int err;
++
++	tch_fw_active = 1;
++	err = tch_fw_download_busy();
++	tch_fw_active = 0;
++	return err;
++}
++
+ /* Read the firmware state register (event 0x60) at both candidate bases; the
+  * vendor expects 0xa0..0xaf once the application firmware runs. */
+ static void
+@@ -1741,6 +2221,7 @@
+ {
+ 	unsigned combos = 0;
+ 
++	bb_calibrate();
+ 	tch.bb_pace_us = 5;                             /* ~100 kHz, very forgiving */
+ 	(void)PE_parse_boot_argn("liuqintouchpace", &tch.bb_pace_us, sizeof(tch.bb_pace_us));
+ 	if (tch.bb_pace_us > 1000) {
+@@ -1898,7 +2379,7 @@
+ 
+ /* Novatek write: page, then the address with bit 7 set and the data. */
+ static int
+-tch_nvt_write8(uint32_t addr, uint8_t val)
++tch_nvt_write8_locked(uint32_t addr, uint8_t val)
+ {
+ 	uint8_t page[3];
+ 	uint8_t tx[2];
+@@ -1935,6 +2416,19 @@
+ 	return err;
+ }
+ 
++static int
++tch_nvt_write8(uint32_t addr, uint8_t val)
++{
++	int err;
++
++	if (!tch_spi_acquire()) {
++		return -1;
++	}
++	err = tch_nvt_write8_locked(addr, val);
++	tch_spi_release();
++	return err;
++}
++
+ /* The vendor driver's bring-up, in its order: bootloader reset, software reset
+  * to idle, unlock.  It is what it does before trusting the bus when the id does
+  * not match, and the NT36532 answers it from ROM even when the RAM firmware is
+@@ -2055,6 +2549,19 @@
+ 	tch.fifo_capable = (tch_rd(tch.se, GENI_IF_DISABLE_RO) & FIFO_IF_DISABLE) == 0;
+ 	printf("LIUQIN TOUCH: FIFO interface %s (if_disable 0x%08x)\n",
+ 	    tch.fifo_capable ? "present" : "disabled", tch_rd(tch.se, GENI_IF_DISABLE_RO));
++	{
++		/* The bit has always read 1 here, but the FIFO path has never
++		 * actually been exercised: force it once and see whether the engine
++		 * moves bytes (liuqintouchfifo=1).  A hardware-timed SPI transfer
++		 * without DMA also means no apps_smmu stream in the way. */
++		int force_fifo = 0;
++
++		(void)PE_parse_boot_argn("liuqintouchfifo", &force_fifo, sizeof(force_fifo));
++		if (force_fifo && !tch.fifo_capable) {
++			printf("LIUQIN TOUCH: liuqintouchfifo=1, using the FIFO engine anyway\n");
++			tch.fifo_capable = true;
++		}
++	}
+ 	tch_dump_state("after init");
+ 
+ 	if (!tch.fifo_capable) {
+@@ -2078,9 +2585,15 @@
+ 		if (tch_dma_alloc() != 0) {
+ 			return -1;
+ 		}
++		tch_smmu_fix();
+ 		tch_visible_mark("touch bus probe");
+ 		if (tch_se_start() != 0) {
+-			return -1;
++			/* The low page did not fix it: keep the boot usable by going
++			 * back to the pads, and leave the log line that says so. */
++			printf("LIUQIN TOUCH: SE DMA path did not start, falling back to bit-bang\n");
++			tch.use_dma = false;
++			tch.dma = 0;
++			return tch_bitbang_start();
+ 		}
+ 		printf("LIUQIN TOUCH: SE4 running, chip select %s\n",
+ 		    tch.cs_manual ? "by hand" : "driven by the engine");
+@@ -2089,13 +2602,18 @@
+ 
+ 	tch_visible_mark("touch bus probe");
+ 	if (tch_se_start() != 0) {
+-		return -1;
++		printf("LIUQIN TOUCH: SE4 engine did not start, falling back to bit-bang\n");
++		tch.fifo_capable = false;
++		tch.use_dma = false;
++		return tch_bitbang_start();
+ 	}
+ 	printf("LIUQIN TOUCH: SE4 running, chip select %s\n",
+ 	    tch.cs_manual ? "by hand" : "driven by the engine");
+ 	return 0;
+ }
+ 
++static void tch_dump_event_page(unsigned n);
++
+ /* Returns true when the controller answered with data we can trust (a Novatek
+  * trim id or a self-consistent FWINFO), so garbage never reaches the HID
+  * layer as "touch". */
+@@ -2135,8 +2653,36 @@
+ 	 * but never scans.  Download the image from the firmware area unless the
+ 	 * chip already reports a running firmware.
+ 	 */
+-	if (have_id && !tch_fw_state_ready()) {
+-		tch_fw_download();
++	if (have_id) {
++		/* The part sometimes stays in its bootloader after the handover
++		 * (state 0xfc); retrying the download is what makes bring-up
++		 * reliable.  Each attempt is logged with the state it reached. */
++		for (int attempt = 1; attempt <= 3; attempt++) {
++			uint8_t st = 0;
++
++			if (tch_fw_state_ready()) {
++				break;
++			}
++			(void)tch_nvt_read(NVT_EVENT_RESET_STATE, &st, 1);
++			printf("LIUQIN TOUCH: bring-up attempt %d, state 0x%02x, spi div %u\n",
++			    attempt, st, tch.div);
++			tch_fw_download();
++			if (!tch_fw_crc_ok && tch_dl_pace < 32) {
++				/* The last transfer was corrupt.  Doubling the serial-engine
++				 * divider does nothing on the bit-banged path, so slow the
++				 * pacing delay itself and try again. */
++				tch_dl_pace *= 2;
++				printf("LIUQIN TOUCH: firmware checksum bad, slowing the "
++				    "bit-banged download to %u us\n", tch_dl_pace);
++			}
++			(void)tsleep(&liuqin_touch_chan, PZERO, "liuqinfw", hz / 2);
++			(void)tch_nvt_read(NVT_EVENT_RESET_STATE, &st, 1);
++			printf("LIUQIN TOUCH: attempt %d state now 0x%02x (%s)\n", attempt, st,
++			    (st >= 0xa0 && st <= 0xaf) ? "running" : "not ready");
++			if (st >= 0xa0 && st <= 0xaf) {
++				break;
++			}
++		}
+ 	}
+ 
+ 	uint8_t fw[16] = { 0 };
+@@ -2248,12 +2794,23 @@
+  * asks for it?  Nothing in user space can tell us until the library runs, so the
+  * kernel looks (vnode_lookup + a size query) and says so in the log.
+  */
++static void tch_probe_injection_files(void);
++
++/* Called from liuqin_ufs.c right after the root is mounted. */
++void
++liuqin_touch_probe_files(void)
++{
++	tch_probe_injection_files();
++}
++
+ static void
+ tch_probe_injection_files(void)
+ {
+ 	static const char *const paths[] = {
+ 		"/usr/lib/libliuqintouch.dylib",
+ 		"/System/Library/LaunchDaemons/com.apple.backboardd.plist",
++		"/System/Library/xpc/launchd.plist",
++		"/usr/libexec/backboardd",
+ 	};
+ 
+ 	for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+@@ -2268,8 +2825,22 @@
+ 		VATTR_INIT(&va);
+ 		VATTR_WANTED(&va, va_data_size);
+ 		if (vnode_getattr(vp, &va, vfs_context_current()) == 0) {
+-			printf("LIUQIN INPUT: %s present, %lld bytes\n", paths[i],
+-			    (long long)va.va_data_size);
++			/* The first bytes say whether the file really is the binary we
++			 * flashed (dyld refuses a file it cannot read as Mach-O). */
++			unsigned char magic[8] = { 0 };
++			int resid = 0;
++
++			if (vn_rdwr(UIO_READ, vp, (caddr_t)magic, sizeof(magic), 0,
++			    UIO_SYSSPACE, 0, vfs_context_ucred(vfs_context_current()), &resid,
++			    current_proc()) == 0) {
++				printf("LIUQIN INPUT: %s present, %lld bytes, magic "
++				    "%02x%02x%02x%02x %02x%02x%02x%02x\n", paths[i],
++				    (long long)va.va_data_size, magic[0], magic[1], magic[2], magic[3],
++				    magic[4], magic[5], magic[6], magic[7]);
++			} else {
++				printf("LIUQIN INPUT: %s present, %lld bytes, unreadable\n",
++				    paths[i], (long long)va.va_data_size);
++			}
+ 		}
+ 		vnode_put(vp);
+ 	}
+@@ -2277,6 +2848,21 @@
+ 
+ static uint32_t tch_last_x[NVT_MAX_FINGERS], tch_last_y[NVT_MAX_FINGERS];
+ 
++/* Frames with at least one decoded contact since boot: the recovery thread
++ * watches it to tell "the panel scans" from "the panel is stuck in its
++ * bootloader even though the state register says running". */
++static volatile unsigned tch_valid_frames;
++/* Liveness counters for the heartbeat: reads that came back at all say whether
++ * the bus works, and the gap to tch_valid_frames says whether the panel scans. */
++static volatile unsigned tch_evt_reads;
++static volatile unsigned tch_evt_errors;
++/* Consecutive report reads whose record area is all 0xFD/0xFE: the vendor's own
++ * nvt_wdt_fw_recovery() reads that pattern as "the application firmware hung"
++ * and re-downloads after ten of them. */
++static volatile unsigned tch_hang_hits;
++static volatile int tch_fw_dead;
++static unsigned tch_fw_revive;
++
+ static int
+ tch_frame_decode(const uint8_t *frame, bool *down)
+ {
+@@ -2307,6 +2893,7 @@
+ 		if (x > rx || y > ry) {
+ 			continue;
+ 		}
++		tch_valid_frames++;
+ 		{
+ 			static unsigned raw_logs;
+ 
+@@ -2359,7 +2946,110 @@
+ 	    frame[15], frame[16], frame[17], frame[18], frame[19]);
+ }
+ 
++/*
++ * Idle wake: this panel stops answering once it has been idle for a while (the
++ * display going to sleep is the usual trigger).  Driving the INT line low for a
++ * moment is the cheap wake some Novatek parts accept; if that does not bring the
++ * buffer back within a few tries the caller falls back to a full reset.
++ */
++static bool
++tch_int_wake(void)
++{
++	tch_bb_dir(21, true, 0);
++	delay(200);
++	tch_bb_dir(21, false, 0);
++	tch_wr(tch.tlmm, TLMM_CTL(21), (0u << 2) | (3u << 6));   /* mux 0 (GPIO), pull-up, input */
++	delay(1000);
++	return false;
++}
++
++/* Diagnostics for the "panel asserts INT but no frame decodes" state: dump the
++ * report page at the moment the controller says it has data, twice, plus the
++ * registers that prove the bus still answers. */
++static unsigned tch_int_dumps;
++
+ static void
++tch_dump_event_page(unsigned n)
++{
++	uint8_t b[96];
++	uint8_t st = 0;
++	uint8_t fw[4] = { 0 };
++	uint32_t saved_dummy = tch.dummy;
++	unsigned i;
++
++	printf("LIUQIN TOUCH: int-dump %u at pace %u us\n", n, tch.bb_pace_us);
++	if (tch_nvt_read(NVT_EVENT_BUF_ADDR, b, sizeof(b)) == 0) {
++		printf("LIUQIN TOUCH: dump%u 125800:", n);
++		for (i = 0; i < 24; i++) {
++			printf(" %02x", b[i]);
++		}
++		printf("\nLIUQIN TOUCH: dump%u 125818:", n);
++		for (i = 24; i < 48; i++) {
++			printf(" %02x", b[i]);
++		}
++		printf("\n");
++	} else {
++		printf("LIUQIN TOUCH: dump%u 125800 read failed\n", n);
++	}
++	/* The two addresses the older NT36xxx maps use, in case this firmware
++	 * keeps its report somewhere else than the vendor map says. */
++	if (tch_nvt_read(0x2fe00, b, 32) == 0) {
++		printf("LIUQIN TOUCH: dump%u 2fe00:", n);
++		for (i = 0; i < 16; i++) {
++			printf(" %02x", b[i]);
++		}
++		printf("\n");
++	}
++	if (tch_nvt_read(0x11a00, b, 32) == 0) {
++		printf("LIUQIN TOUCH: dump%u 11a00:", n);
++		for (i = 0; i < 16; i++) {
++			printf(" %02x", b[i]);
++		}
++		printf("\n");
++	}
++	/* Same address without the dummy byte: a shift here means the framing
++	 * (not the data) is what we get wrong. */
++	tch.dummy = 0;
++	if (tch_nvt_read(NVT_EVENT_BUF_ADDR, b, 24) == 0) {
++		printf("LIUQIN TOUCH: dump%u nodummy:", n);
++		for (i = 0; i < 16; i++) {
++			printf(" %02x", b[i]);
++		}
++		printf("\n");
++	}
++	tch.dummy = saved_dummy;
++	(void)tch_nvt_read(NVT_EVENT_RESET_STATE, &st, 1);
++	(void)tch_nvt_read(NVT_FWINFO_ADDR, fw, sizeof(fw));
++	printf("LIUQIN TOUCH: dump%u: state 0x%02x fwinfo %02x %02x %02x %02x\n",
++	    n, st, fw[0], fw[1], fw[2], fw[3]);
++}
++
++/*
++ * nvt_wdt_fw_recovery() counts *interrupts* that carry 0xFD/0xFE in the record
++ * area, not reads: after a normal lift the buffer also sits at 0xFD, so a plain
++ * read counter fires on every gesture.  Three interrupts without a frame, on the
++ * other hand, means the part is in its CRC-fail reboot loop (its state register
++ * even reads 0xFC in that loop).
++ */
++static void
++tch_frame_streak(const uint8_t *frame, bool int_edge)
++{
++	if (tch_frame_valid(frame)) {
++		tch_hang_hits = 0;
++		return;
++	}
++	if (!int_edge) {
++		return;
++	}
++	if (++tch_hang_hits >= 3) {
++		printf("LIUQIN TOUCH: three interrupts with 0xFD in the report area: the "
++		    "firmware is stuck (vendor's CRC-fail loop pattern)\n");
++		tch_fw_dead = 1;
++		tch_hang_hits = 0;
++	}
++}
++
++static void
+ liuqin_touch_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	uint8_t frame[NVT_POINT_LEN];
+@@ -2383,12 +3073,29 @@
+ 
+ 	for (;;) {
+ 		const int ticks = hz / 100 > 0 ? hz / 100 : 1;
++
++		/*
++		 * A firmware download owns the bus and a chunk transfer holds it
++		 * for about a second; a read in between is not just wasted, it
++		 * interleaves page commands with the download and corrupts both.
++		 */
++		if (tch_fw_active) {
++			(void)tsleep(&liuqin_touch_chan, PZERO, "liuqintouch", ticks);
++			continue;
++		}
++
+ 		const uint32_t gpio = tch_rd(tch.tlmm, TLMM_CTL(21) + TLMM_IN_OUT);
+ 		bool go = force_poll || (gpio & TLMM_IN_BIT) != 0;
+ 
+ 		const bool int_high = (gpio & TLMM_IN_BIT) != 0;
+ 
+-		if (int_high != prev_high && edge_logs < 12) {
++		const bool int_edge = int_high && !prev_high;
++
++		if (int_edge && tch_int_dumps < 8) {
++			tch_int_dumps++;
++			tch_dump_event_page(tch_int_dumps);
++		}
++		if (int_high != prev_high && edge_logs < 40) {
+ 			edge_logs++;
+ 			printf("LIUQIN TOUCH: gpio21 %s (level %u)\n",
+ 			    int_high ? "asserted" : "released", int_high ? 1 : 0);
+@@ -2413,10 +3120,23 @@
+ 		 * back off to once a second so the path stays alive without cost.
+ 		 */
+ 		polls++;
+-		if (!go && polls > 6000) {
+-			(void)tsleep(&liuqin_touch_chan, PZERO, "liuqintouch", ticks);
+-			continue;
+-		}
++		/*
++		 * No idle watchdog here any more.  It poked the INT line every
++		 * two seconds without a finger and pulsed the reset line every
++		 * third poke, which put a running panel back into its bootloader
++		 * about every six seconds; the next download then took 70 s and
++		 * mostly failed, so touch never survived.  Silence with nobody
++		 * touching the glass is not a fault: the recovery thread decides
++		 * that from the controller's own state register, and only when
++		 * the part really stopped answering.
++		 */
++		/*
++		 * The interrupt line of this panel never asserts, so the event buffer
++		 * has to be polled for the lifetime of the thread.  This used to skip
++		 * the read entirely once "polls" passed 6000, which is exactly the
++		 * "touch works for a minute and then stops" this port showed: after
++		 * the first minute nothing was read at all any more.
++		 */
+ 		const bool health = !go;
+ 
+ 		/*
+@@ -2429,12 +3149,16 @@
+ 		 * live here were for the NT36523 map; the event buffer of this
+ 		 * part is 0x125800 (refs/novatek/nt36532_vendor_map.md).
+ 		 */
++		/* Every attempt is counted so the heartbeat can say whether "no
++		 * frames" means a dead bus or a panel that simply is not sending. */
+ 		if (tch_nvt_read(NVT_EVENT_BUF_ADDR, frame, sizeof(frame)) != 0) {
++			tch_evt_errors++;
+ 			if (errors++ < 4) {
+ 				printf("LIUQIN TOUCH: event read failed (irq 0x%08x dma tx 0x%08x rx 0x%08x)\n",
+ 				    tch.last_irq, tch.dma_tx_status, tch.dma_rx_status);
+ 			}
+-		} else if (!tch_frame_valid(frame) && evt_logs < 12 &&
++		} else if (tch_evt_reads++, tch_frame_streak(frame, int_edge),
++		    !tch_frame_valid(frame) && evt_logs < 12 &&
+ 		    memcmp(frame, last, sizeof(frame)) != 0) {
+ 			evt_logs++;
+ 			printf("LIUQIN TOUCH: evt data %02x %02x %02x %02x %02x %02x %02x %02x (no record)\n",
+@@ -2505,6 +3229,50 @@
+ 	}
+ }
+ 
++/*
++ * Is the SMMU reachable at all?  UFS carries iommus = <&apps_smmu 0xe0 0> in the
++ * vendor DTB and moves 16 MiB/s with physical addresses, so the TCU is powered
++ * and that stream bypasses - yet the first read of the GR0 window aborts with a
++ * synchronous external abort.  This probe reads four windows in order, printing
++ * before each read, so the last line on screen names the window that dies.
++ * liuqinsmmuprobe=1 enables it.
++ */
++static void
++tch_smmu_probe_windows(void)
++{
++	static const struct {
++		uint32_t pa;
++		const char *what;
++	} w[] = {
++		{ 0x151ce000u, "tcru" },
++		{ 0x151d1000u, "anoc_1_tbu" },
++		{ 0x3da0000u,  "kgsl_smmu" },
++		{ 0x15000000u, "apps_smmu_gr0" },
++	};
++	int on = 0;
++
++	(void)PE_parse_boot_argn("liuqinsmmuprobe", &on, sizeof(on));
++	if (on <= 0) {
++		return;
++	}
++	liuqin_console_force = 1;
++	for (unsigned i = 0; i < sizeof(w) / sizeof(w[0]); i++) {
++		vm_offset_t v;
++		uint32_t a, b;
++
++		printf("LIUQIN TOUCH: smmu-probe %s: mapping 0x%x\n", w[i].what, w[i].pa);
++		v = ml_io_map(w[i].pa, PAGE_SIZE);
++		printf("LIUQIN TOUCH: smmu-probe %s: va 0x%llx, reading\n", w[i].what,
++		    (uint64_t)v);
++		a = tch_rd(v, 0x0000);
++		b = tch_rd(v, 0x0020);
++		printf("LIUQIN TOUCH: smmu-probe %s: [0x00] 0x%08x [0x20] 0x%08x\n",
++		    w[i].what, a, b);
++	}
++	printf("LIUQIN TOUCH: smmu-probe done\n");
++	liuqin_console_force = 0;
++}
++
+ /* The SPI bring-up runs from its own thread a few seconds after the boot has
+  * settled, not from the mount path: a hang here must not take the boot down
+  * with it, and by then the persistent log has flushed everything that led to
+@@ -2525,6 +3293,7 @@
+ 	printf("LIUQIN TOUCH: SPI bring-up in %d s\n", delay_s);
+ 	(void)tsleep(&liuqin_touch_chan, PZERO, "liuqintspi", hz * delay_s);
+ 
++	tch_smmu_probe_windows();
+ 	liuqin_boot_mark("touch spi start");
+ 	/* Draw the bring-up lines as well: with liuqinmute=1 they would only
+ 	 * reach the persistent log, and a wedge here freezes the log thread
+@@ -2567,7 +3336,10 @@
+ 	unsigned changes = 0;
+ 
+ 	liuqin_boot_mark("touch int watch");
+-	liuqin_console_force = 1;       /* the transitions must be visible */
++	extern int liuqin_marks_draw;
++	if (liuqin_marks_draw) {
++		liuqin_console_force = 1;       /* the transitions must be visible */
++	}
+ 	printf("LIUQIN TOUCH: watching gpio21 (INT) for 60 s, start is %d - touch the panel now\n", last);
+ 	for (unsigned i = 0; i < 60000; i++) {
+ 		const int v = bb_get(21);
+@@ -2581,6 +3353,220 @@
+ 	}
+ 	printf("LIUQIN TOUCH: gpio21 watch finished, %u transitions\n", changes);
+ 	liuqin_console_force = 0;
++}
++
++/*
++ * Is the application firmware running?  Two independent answers, because one
++ * register is not proof: a part still in its bootloader can answer 0x00, and the
++ * DLM download can come back with a wrong checksum while the firmware runs
++ * anyway.  The version byte in FWINFO and its complement are the second
++ * witness.
++ */
++static bool
++tch_panel_running_once(void)
++{
++	uint8_t st = 0;
++	uint8_t fw[4] = { 0 };
++
++	if (tch_nvt_read(NVT_EVENT_RESET_STATE, &st, 1) == 0 && st >= 0xa0 && st <= 0xaf) {
++		return true;
++	}
++	if (tch_nvt_read(NVT_FWINFO_ADDR, fw, sizeof(fw)) == 0 &&
++	    fw[0] != 0x00 && fw[0] != 0xff && (uint8_t)(fw[0] + fw[1]) == 0xff) {
++		return true;
++	}
++	return false;
++}
++
++/* Three tries fifty milliseconds apart: the bit-banged bus drops a bit now and
++ * then, and one corrupt read must never be taken for a dead panel when the
++ * answer is to download the firmware again. */
++static bool
++tch_panel_running(void)
++{
++	for (int i = 0; i < 3; i++) {
++		if (tch_panel_running_once()) {
++			return true;
++		}
++		delay(50 * 1000);
++	}
++	return false;
++}
++
++/* The trim id comes from ROM even in the bootloader, so a part that answers it
++ * is reachable and a software reset plus a download is enough to revive it. */
++static bool
++tch_id_reads(void)
++{
++	uint8_t id[6] = { 0 };
++
++	if (tch_nvt_read(NVT_CHIP_VER_TRIM_ADDR, id, sizeof(id)) != 0) {
++		return false;
++	}
++	return id[4] == 0x65 && id[5] == 0x03;
++}
++
++/*
++ * Panel recovery, driven by what the controller says about itself instead of by
++ * the contact counter.  A panel with no finger on it reports no contact, and
++ * that is not a fault; the old thread read it as one and reset the part five
++ * seconds after every boot, which threw it back into its bootloader where the
++ * bit-banged download needs 70 s and mostly fails.  Now the state is checked
++ * every five seconds, a reset is only considered after fifteen seconds of a
++ * part that does not answer at all, and a part that still answers its trim id
++ * is revived with a software reset and a download - not with a reset pulse,
++ * because the pulse is what left the post-reset downloads reading a garbage
++ * BLD descriptor.  Boot arg liuqinrecover=0 disables the thread.
++ */
++static void
++liuqin_touch_recover_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	int level = 1;
++	int silent = 0;
++	int rounds = 0;
++	unsigned beats = 0;
++	unsigned last_frames = 0;
++	unsigned tch_quiet_checks = 0;
++	unsigned keepalive_ms = 0;
++
++	(void)PE_parse_boot_argn("liuqinrecover", &level, sizeof(level));
++	if (level <= 0) {
++		printf("LIUQIN TOUCH: recovery disabled (liuqinrecover=0)\n");
++		return;
++	}
++	/* liuqinkeepalive=<ms>: poke INT on that period no matter what, to keep a
++	 * panel that naps from ever reaching its low-power state.  0 (default)
++	 * keeps the reactive behaviour: poke after five seconds of silence. */
++	{
++		int ka = 0;
++
++		(void)PE_parse_boot_argn("liuqinkeepalive", &ka, sizeof(ka));
++		if (ka >= 500 && ka <= 60000) {
++			keepalive_ms = (unsigned)ka;
++		}
++	}
++	if (keepalive_ms) {
++		printf("LIUQIN TOUCH: keep-alive: poking INT every %u ms\n", keepalive_ms);
++	}
++	for (;;) {
++		bool running;
++		const int period = keepalive_ms ? (int)(keepalive_ms / 1000 ? keepalive_ms / 1000 : 1) : 5;
++
++		(void)tsleep(&tch_valid_frames, PZERO, "liuqinrcv", hz * period);
++		if (keepalive_ms && bb_get(21) == 0) {
++			/* Only poke while the controller is not driving INT itself. */
++			(void)tch_int_wake();
++		}
++		running = tch_panel_running();
++		/* Every 30 s one line that says where the chain stands: does the bus
++		 * answer at all, does the state register say the firmware runs, and
++		 * has a single frame with a contact ever arrived. */
++		if ((++beats % 6) == 0) {
++			printf("LIUQIN TOUCH: beat %us: %s, %u event reads (%u failed), "
++			    "%u contact frames\n", beats * (unsigned)period,
++			    running ? "running" : "silent", tch_evt_reads, tch_evt_errors,
++			    tch_valid_frames);
++		}
++		/* Frame bookkeeping, and both revive paths, must stay *above* the
++		 * `if (running)` branch: the part keeps answering state 0xa3 even
++		 * after it has stopped reporting, so everything placed below that
++		 * branch never runs - which is why touch142 never revived. */
++		if (tch_valid_frames == last_frames) {
++			tch_quiet_checks++;
++		} else {
++			last_frames = tch_valid_frames;
++			tch_quiet_checks = 0;
++		}
++		if (tch_fw_dead && tch_fw_revive < 10) {
++			tch_fw_revive++;
++			printf("LIUQIN TOUCH: revive %u: interrupts without a frame, "
++			    "software reset and re-download\n", tch_fw_revive);
++			(void)tch_nvt_write8(0x00000, 0xa5);
++			(void)tch_nvt_write8(0x00000, 0xa5);
++			delay(5 * 1000);
++			(void)tch_nvt_write8(NVT_SW_RESET_ADDR, 0x69);
++			delay(35 * 1000);
++			(void)tch_novatek_info();
++			tch_fw_dead = 0;
++			tch_hang_hits = 0;
++			tch_quiet_checks = 0;
++			last_frames = tch_valid_frames;
++			silent = 0;
++			continue;
++		}
++		/* The part can also simply go to sleep: it keeps answering its
++		 * registers but stops scanning and never asserts INT.  A Novatek part
++		 * in deep sleep wakes when the host pulls INT low for a moment. */
++		{
++			const unsigned quiet_s = tch_quiet_checks * (unsigned)period;
++
++			if (quiet_s >= 5 && quiet_s < 5 + (unsigned)period) {
++				printf("LIUQIN TOUCH: %u s without a frame, poking INT to wake "
++				    "the panel\n", quiet_s);
++				(void)tch_int_wake();
++			}
++		}
++		if (tch_quiet_checks * (unsigned)period >= 30 && tch_fw_revive < 10) {
++			tch_fw_revive++;
++			printf("LIUQIN TOUCH: revive %u: no contact frame for %u s, "
++			    "re-downloading the firmware\n", tch_fw_revive,
++			    tch_quiet_checks * (unsigned)period);
++			(void)tch_nvt_write8(0x00000, 0xa5);
++			(void)tch_nvt_write8(0x00000, 0xa5);
++			delay(5 * 1000);
++			(void)tch_nvt_write8(NVT_SW_RESET_ADDR, 0x69);
++			delay(35 * 1000);
++			(void)tch_novatek_info();
++			tch_fw_dead = 0;
++			tch_hang_hits = 0;
++			tch_quiet_checks = 0;
++			last_frames = tch_valid_frames;
++			silent = 0;
++			continue;
++		}
++		if (running) {
++			if (silent >= 3) {
++				printf("LIUQIN TOUCH: panel answers again, no reset needed\n");
++			}
++			silent = 0;
++			continue;
++		}
++		silent++;
++		if (silent < 3) {
++			printf("LIUQIN TOUCH: panel silent (check %d of 3)\n", silent);
++			continue;
++		}
++		if (rounds >= 3) {
++			printf("LIUQIN TOUCH: recovery gave up after %d rounds\n", rounds);
++			return;
++		}
++		rounds++;
++		printf("LIUQIN TOUCH: recovery %d: panel silent for %d checks, waking it\n",
++		    rounds, silent);
++		(void)tch_int_wake();
++		delay(20 * 1000);
++		if (tch_panel_running()) {
++			printf("LIUQIN TOUCH: recovery %d: awake after the poke\n", rounds);
++			silent = 0;
++			continue;
++		}
++		if (!tch_id_reads()) {
++			printf("LIUQIN TOUCH: recovery %d: no answer at all, pulsing reset\n",
++			    rounds);
++			tch_bb_dir(tch.pin_reset, true, 0);
++			delay(100 * 1000);
++			tch_bb_dir(tch.pin_reset, true, 1);
++			delay(200 * 1000);
++			for (int i = 0; i < 10 && !tch_id_reads(); i++) {
++				delay(20 * 1000);
++			}
++		} else {
++			printf("LIUQIN TOUCH: recovery %d: part answers, software reset and "
++			    "download\n", rounds);
++		}
++		(void)tch_novatek_info();
++		silent = 0;
++	}
+ }
+ 
+ static void
+@@ -2594,6 +3580,9 @@
+ 	} else {
+ 		printf("LIUQIN TOUCH: report thread not started\n");
+ 	}
++	if (kernel_thread_start(liuqin_touch_recover_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ }
+ 
+ void
+@@ -2605,15 +3594,19 @@
+ 		return;
+ 	}
+ 	{
+-		int div = 16, swap = 0, flip = 0;
++		int div = 32, swap = 0, flip = 0, dlpace = (int)tch_dl_pace;
+ 
+ 		(void)PE_parse_boot_argn("liuqintouchdiv", &div, sizeof(div));
+ 		(void)PE_parse_boot_argn("liuqintouchswap", &swap, sizeof(swap));
+ 		(void)PE_parse_boot_argn("liuqintouchflip", &flip, sizeof(flip));
++		(void)PE_parse_boot_argn("liuqintouchdlpace", &dlpace, sizeof(dlpace));
+ 		tch.div = div < 2 ? 2 : (div > (int)CLK_DIV_MSK ? CLK_DIV_MSK : (uint32_t)div);
+ 		tch.swap = swap != 0;
+ 		tch.flip_x = (flip & 1) != 0;
+ 		tch.flip_y = (flip & 2) != 0;
++		if (dlpace >= 1 && dlpace <= 50) {
++			tch_dl_pace = (uint32_t)dlpace;
++		}
+ 	}
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	vm_offset_t tlmm = ml_io_map(TLMM_PA, TLMM_SIZE);

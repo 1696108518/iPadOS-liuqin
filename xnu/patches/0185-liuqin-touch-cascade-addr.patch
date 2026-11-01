@@ -1,0 +1,50 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -1168,9 +1168,12 @@
+  *   NVT_TRANSFER_LEN = 0xfc00, container = 12-byte ILM/DLM records from 0 and
+  *   16-byte info records from 0x30 (cascade uses end/2 for the info count).
+  */
+-#define NVT_BOOT_RDY_ADDR       0x1f141u
+-#define NVT_POR_CD_ADDR         0x1f61cu
+-#define NVT_EVENT_BASE          0x11a00u
++/* Cascade part: NT36523-family map.  The 0x1f1xx/0x1f6xx addresses belong to
++ * NT36525/NT36772 and never woke this chip. */
++#define NVT_BOOT_RDY_ADDR       0x3f10du
++#define NVT_TX_AUTO_COPY_EN     0x3f7e8u
++#define NVT_SPI_DMA_TX_INFO     0x3f7f1u
++#define NVT_EVENT_BASE          0x2fe00u
+ #define NVT_FW_CHUNK            0xfc00u
+ 
+ static uint32_t
+@@ -1273,6 +1276,9 @@
+ 
+ 	(void)tch_nvt_write8(0x00000, 0x69);            /* bootloader reset */
+ 	delay(35 * 1000);
++	/* cascade: enable the TX auto-copy engine before feeding the SRAM */
++	(void)tch_nvt_write8(NVT_TX_AUTO_COPY_EN, 0x69);
++	printf("LIUQIN TOUCH: tx auto copy mode enabled\n");
+ 
+ 	for (uint32_t i = 0; i < parts; i++) {
+ 		uint32_t bin, sram, len;
+@@ -1304,10 +1310,20 @@
+ 		}
+ 	}
+ 
++	/* cascade: wait for the auto-copy engine to report the transfer done */
++	for (unsigned i = 0; i < 200; i++) {
++		uint8_t info[2] = { 0 };
++
++		(void)tch_nvt_read(NVT_SPI_DMA_TX_INFO, info, sizeof(info));
++		if (info[0] == 0x00) {
++			printf("LIUQIN TOUCH: dma tx info clear after %u polls\n", i);
++			break;
++		}
++		delay(1000);
++	}
+ 	(void)tch_nvt_write8(NVT_BOOT_RDY_ADDR, 1);
+ 	delay(5 * 1000);
+ 	(void)tch_nvt_write8(NVT_BOOT_RDY_ADDR, 0);
+-	(void)tch_nvt_write8(NVT_POR_CD_ADDR, 0xa0);
+ 
+ 	for (unsigned i = 0; i < 10; i++) {
+ 		if (tch_fw_state_ready()) {

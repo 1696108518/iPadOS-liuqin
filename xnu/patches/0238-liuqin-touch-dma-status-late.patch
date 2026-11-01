@@ -1,0 +1,179 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -401,6 +401,22 @@
+ static int tch_opcode;
+ /* True once any engine-side receive route returns the ROM trim id. */
+ static bool tch_rx_ok;
++/*
++ * touch168: a completed transfer whose DMA status bits are late.  touch167's
++ * DMA #8 reported M_CMD_DONE, no error bit and LEN_IN tx 8 rx 8, while
++ * TX/RX_DMA_DONE both read zero - and the very next command on the same engine
++ * worked, so the bytes had moved and only the status was missing.  Counting
++ * both new acceptance routes keeps the log honest about which one is used.
++ */
++static unsigned tch_dma_late;
++static unsigned tch_dma_lenin;
++/* Failure lines already printed: a download can fail hundreds of times and the
++ * ring log is small, so the first ones are printed and the rest suppressed. */
++static unsigned tch_dma_fail_lines;
++/* Last transfer the engine rejected, for the chunk writer's one-line verdict. */
++static uint32_t tch_dma_last_irq;
++static uint32_t tch_dma_last_len;
++static uint32_t tch_dma_last_cmd;
+ 
+ static uint32_t
+ tch_duplex_opcode(void)
+@@ -764,6 +780,12 @@
+ 	const uint32_t irq = tch_run_cmd(((assert ? SPI_CS_ASSERT : SPI_CS_DEASSERT) << M_OPCODE_SHFT),
+ 	    NULL, 0, NULL, 0, NULL, 20);
+ 	if ((irq & M_CMD_DONE_EN) == 0) {
++		if (tch_dma_fail_lines < 24) {
++			tch_dma_fail_lines++;
++			printf("LIUQIN TOUCH: CS %s failed irq 0x%08x status 0x%08x\n",
++			    assert ? "assert" : "deassert", irq,
++			    tch_rd(tch.se, SE_GENI_STATUS));
++		}
+ 		return -1;
+ 	}
+ 	if (assert && tch_cs_dly != 0) {
+@@ -1663,9 +1685,52 @@
+ 	tch.dma_tx_status = txst;
+ 	tch.dma_rx_status = rxst;
+ 	tch.last_irq = irq;
++	tch_dma_last_irq = irq;
++	tch_dma_last_len = (uint32_t)len;
++	tch_dma_last_cmd = cmd;
+ 	ok = (irq & M_CMD_DONE_EN) != 0 && (irq & TCH_IRQ_ERRS) == 0 &&
+ 	    (tx == NULL || (txst & TX_DMA_DONE) != 0) &&
+ 	    (rx == NULL || (rxst & RX_DMA_DONE) != 0);
++	/*
++	 * touch168: the status bits can land after the command completion.  Poll
++	 * them for another 2 ms, and if they never appear, fall back on what the
++	 * engine cannot fake: the command is done, no error bit fired, and both
++	 * LEN_IN counters reached the length - every TX byte was fetched from
++	 * memory and every RX byte was written back to it.  touch167 lost the
++	 * firmware download to exactly this: chunk 0 "write failed" twice while
++	 * the counters said the bytes had gone out.  Callers verify the data
++	 * (chunk read-back, firmware CRC), so a wrong acceptance cannot ship a
++	 * corrupt image without saying so.
++	 */
++	if (!ok && (irq & M_CMD_DONE_EN) != 0 && (irq & TCH_IRQ_ERRS) == 0) {
++		for (unsigned late = 0; late < 40 && !ok; late++) {
++			delay(50);
++			txst = tx != NULL ? tch_rd(tch.se, SE_DMA_TX_IRQ_STAT) : 0;
++			rxst = rx != NULL ? tch_rd(tch.se, SE_DMA_RX_IRQ_STAT) : 0;
++			ok = (tx == NULL || (txst & TX_DMA_DONE) != 0) &&
++			    (rx == NULL || (rxst & RX_DMA_DONE) != 0);
++			if (ok) {
++				tch_dma_late++;
++				if (tch_dma_late <= 4) {
++					printf("LIUQIN TOUCH: DMA #%u status latched %u "
++					    "polls after the command (tx 0x%08x rx "
++					    "0x%08x)\n", tch_dma_count, late + 1,
++					    txst, rxst);
++				}
++			}
++		}
++		if (!ok && (tx == NULL || txin == len) &&
++		    (rx == NULL || rxin >= len)) {
++			ok = true;
++			tch_dma_lenin++;
++			if (tch_dma_lenin <= 4) {
++				printf("LIUQIN TOUCH: DMA #%u accepted on command done + "
++				    "len_in (cmd %u len %u, tx %u rx %u, status tx "
++				    "0x%08x rx 0x%08x)\n", tch_dma_count, cmd,
++				    (unsigned)len, txin, rxin, txst, rxst);
++			}
++		}
++	}
+ 	if (tx != NULL && txst != 0) {
+ 		tch_wr(tch.se, SE_DMA_TX_IRQ_CLR, txst);
+ 	}
+@@ -1676,11 +1741,14 @@
+ 		tch_wr(tch.se, SE_GENI_M_IRQ_CLEAR, irq);
+ 	}
+ 	if (!ok) {
+-		if (tch_dma_count <= 8) {
+-			printf("LIUQIN TOUCH: DMA failed: status 0x%08x irq 0x%08x tx 0x%08x "
+-			    "rx 0x%08x after %u polls, dma_mode_en 0x%08x general_cfg 0x%08x\n",
+-			    tch_rd(tch.se, SE_GENI_STATUS), irq, txst, rxst, i,
+-			    tch_rd(tch.se, SE_GENI_DMA_MODE_EN),
++		if (tch_dma_fail_lines < 24) {
++			tch_dma_fail_lines++;
++			printf("LIUQIN TOUCH: DMA #%u failed: cmd %u len %u status 0x%08x "
++			    "irq 0x%08x tx 0x%08x rx 0x%08x len_in tx %u rx %u after %u "
++			    "polls, dma_mode_en 0x%08x general_cfg 0x%08x\n",
++			    tch_dma_count, cmd, (unsigned)len,
++			    tch_rd(tch.se, SE_GENI_STATUS), irq, txst, rxst, txin, rxin,
++			    i, tch_rd(tch.se, SE_GENI_DMA_MODE_EN),
+ 			    tch_rd(tch.se, SE_DMA_GENERAL_CFG));
+ 		}
+ 		/*
+@@ -2810,15 +2878,19 @@
+ 	}
+ 	err = tch_xfer(hdr, NULL, 1);
+ 	/*
+-	 * tch_xfer() caps a single call at 256 bytes; the payload goes out
+-	 * in pieces inside the same chip-select window, which is one SPI
+-	 * message to the controller either way.
++	 * A chip-select window feeds the payload in pieces.  The pads take 256
++	 * bytes per call and no more; the engine's staging page holds
++	 * TCH_DMA_MAX (16128) per command, and touch167 showed that every extra
++	 * command is another chance to hit what made the download fail - 252
++	 * commands per 63 KiB chunk become four.
+ 	 */
+ 	for (uint32_t sent = 0; err == 0 && sent < len; ) {
++		const uint32_t piece = (tch.bitbang || tch.fifo_capable) ?
++		    256u : TCH_DMA_MAX;
+ 		uint32_t n = len - sent;
+ 
+-		if (n > 256) {
+-			n = 256;
++		if (n > piece) {
++			n = piece;
+ 		}
+ 		err = tch_xfer(data + sent, NULL, n);
+ 		sent += n;
+@@ -2854,8 +2926,10 @@
+ 
+ 			err = tch_fw_chunk_write_locked(img + off + done, addr, len);
+ 			if (err != 0) {
+-				printf("LIUQIN TOUCH: fw chunk @0x%05x write failed (try %d)\n",
+-				    addr, attempt);
++				printf("LIUQIN TOUCH: fw chunk @0x%05x write failed "
++				    "(try %d, last dma cmd %u len %u irq 0x%08x)\n",
++				    addr, attempt, tch_dma_last_cmd,
++				    tch_dma_last_len, tch_dma_last_irq);
+ 				continue;
+ 			}
+ 			(void)tch_nvt_read_locked(addr, back, check);
+@@ -3063,13 +3137,27 @@
+ 	 * a single bit of the download.  4 us is the first setting that has not
+ 	 * produced a wrong ILM checksum. */
+ 	tch.bb_pace_us = tch_dl_pace;
+-	printf("LIUQIN TOUCH: fw dl bit-bang pace %u us (2 us was the corrupt one)\n",
+-	    tch_dl_pace);
++	if (tch.bitbang) {
++		printf("LIUQIN TOUCH: fw dl bit-bang pace %u us (2 us was the "
++		    "corrupt one)\n", tch_dl_pace);
++	}
++	/* touch168: say which bus the download actually runs on.  touch167's log
++	 * printed "bit-bang pace" while the engine was live, which made a DMA
++	 * failure look like a pads problem. */
++	printf("LIUQIN TOUCH: fw dl path %s\n", tch.bitbang ? "pads (bit-bang)" :
++	    (tch.fifo_capable ? "serial engine, FIFO" : "serial engine, DMA"));
+ 	t0 = mach_absolute_time();
+ 
+ retry:
+ 	have_header = false;
+ 	tch.bb_pace_us = tch_dl_pace;
++	/*
++	 * touch168: start the per-transfer log over at every attempt.  The first
++	 * eight transfers of a download are the ones that failed in touch167, and
++	 * the counter had long passed eight during engine bring-up, so the log
++	 * that mattered was silent exactly where it was needed.
++	 */
++	tch_dma_count = 0;
+ 	/* nvt_bootloader_reset(): 0x69 to the software-reset register (0x1fb43e on
+ 	 * this part, the vendor's swrst_sif address) - 0x00000, which the
+ 	 * NT36523-family flow uses, is not it. */

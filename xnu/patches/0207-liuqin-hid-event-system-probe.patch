@@ -1,0 +1,107 @@
+--- a/iokit/Kernel/arm/hid/LiuqinHID.cpp
++++ b/iokit/Kernel/arm/hid/LiuqinHID.cpp
+@@ -626,7 +626,88 @@
+ IOHIDDevice::getProperty(const char *aKey) const
+ {
+ 	IOLog("LIUQIN HID: IOHIDDevice property get %s\n", aKey ? aKey : "?");
++	return super::getProperty(aKey);
++}
++
++/*
++ * The userland's HID stack contains the class name "IOHIDEventSystem"; nothing
++ * in this kernel publishes such a service.  Publish a stub with that name and a
++ * logging user client: if anything opens it, this is the object the HID stack
++ * waits for, and the connect type + selector log tells us what it must do.
++ */
++class IOHIDEventSystem : public IOService
++{
++	OSDeclareDefaultStructors(IOHIDEventSystem)
++
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
++	    OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++	virtual OSObject *getProperty(const OSSymbol *aKey) const APPLE_KEXT_OVERRIDE;
++	virtual OSObject *getProperty(const char *aKey) const APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IOHIDEventSystem, IOService)
++
++bool
++IOHIDEventSystem::start(IOService *provider)
++{
++	if (!super::start(provider)) {
++		return false;
++	}
++	IOLog("LIUQIN HID: IOHIDEventSystem stub started\n");
++	registerService();
++	return true;
++}
++
++OSObject *
++IOHIDEventSystem::getProperty(const OSSymbol *aKey) const
++{
++	if (aKey) {
++		IOLog("LIUQIN HID: IOHIDEventSystem property get %s\n", aKey->getCStringNoCopy());
++	}
++	return super::getProperty(aKey);
++}
++
++OSObject *
++IOHIDEventSystem::getProperty(const char *aKey) const
++{
++	IOLog("LIUQIN HID: IOHIDEventSystem property get %s\n", aKey ? aKey : "?");
+ 	return super::getProperty(aKey);
++}
++
++IOReturn
++IOHIDEventSystem::newUserClient(task_t owningTask, void *securityID, UInt32 type,
++    OSDictionary *properties, IOUserClient **handler)
++{
++	proc_t proc = (proc_t)get_bsdtask_info(owningTask);
++	char pname[64] = "?";
++	IOUserClient *client;
++
++	if (proc) {
++		proc_name(proc_pid(proc), pname, sizeof(pname));
++	}
++	IOLog("LIUQIN HID: IOHIDEventSystem newUserClient type 0x%x by %s\n",
++	    (unsigned)type, pname);
++	client = OSTypeAlloc(LiuqinHIDDeviceUserClient);
++	if (client && !client->initWithTask(owningTask, securityID, type, properties)) {
++		client->release();
++		client = NULL;
++	}
++	if (client && !client->attach(this)) {
++		client->release();
++		client = NULL;
++	}
++	if (client && !client->start(this)) {
++		client->detach(this);
++		client->release();
++		client = NULL;
++	}
++	if (!client) {
++		return kIOReturnNoResources;
++	}
++	*handler = client;
++	return kIOReturnSuccess;
+ }
+ 
+ IOReturn
+@@ -698,6 +779,15 @@
+ 		buttons->release();
+ 	}
+ 
++	{
++		IOHIDEventSystem *sys = OSTypeAlloc(IOHIDEventSystem);
++
++		if (sys && sys->init() && sys->attach(nub) && sys->start(nub)) {
++			IOLog("LIUQIN HID: IOHIDEventSystem relaunched\n");
++		} else if (sys) {
++			sys->release();
++		}
++	}
+ 	{
+ 		AppleMultitouchDevice *dev = OSTypeAlloc(AppleMultitouchDevice);
+ 

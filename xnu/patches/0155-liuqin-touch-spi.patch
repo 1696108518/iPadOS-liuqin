@@ -1,0 +1,827 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -1,5 +1,5 @@
+ /*
+- * LIUQIN touchscreen: step 1 - read-only state audit.
++ * LIUQIN touchscreen: Novatek NT36532 on GENI SPI4.
+  *
+  * The panel's touch controller is a Novatek NT36532 on GENI SPI4 (QUPv3
+  * wrapper 0, serial engine 4, spi@0x990000), chip select 0, with its
+@@ -8,24 +8,46 @@
+  * (yzddmr6/linux-sm8450-liuqin, branch liuqin-6.17, sm8475-xiaomi-liuqin.dts
+  * and sm8450.dtsi, which in turn quotes the vendor bootloader's FDT).
+  *
+- * Nothing here writes a register: the point is to learn what `fastboot boot`
+- * leaves behind - whether ABL already clocked the wrapper and muxed the pins
+- * (it may have, since the vendor chain drives the same controller), and to
+- * validate the base addresses before a single write is made.  Serial engine
+- * registers are only touched when the GCC side says the engine's clocks are
+- * running: an access to a gated QUP block hangs the bus.
++ * Boot arg liuqintouch:
++ *   0 off (default), 1 read-only audit, 2 + clocks and pin mux,
++ *   3 + SPI master, Novatek trim id and the 10-finger report thread.
+  *
+- * Boot arg liuqintouch: 0 off (default), 1 audit, higher values will add the
+- * clock/pin programming and the SPI transfers.
++ * Stages 1 and 2 never touch a register that the previous stage did not
++ * prove reachable: serial engine registers are only accessed when the GCC
++ * side says the engine's clocks are running, because an access to a gated
++ * QUP block hangs the bus.
++ *
++ * Stage 3 programs the SE the way drivers/spi/spi-geni-qcom.c does in
++ * spi_geni_init() and setup_fifo_params(): geni_se_init(), FIFO mode, 8-bit
++ * words with byte packing, SPI mode 0, chip select 0, and the SE clock
++ * (BI_TCXO, 19.2 MHz, no prescaler) divided down by GENI_SER_M_CLK_CFG.
++ * Transfers are polled FIFO transfers, with chip select driven by hand
++ * (SPI_CS_ASSERT / SPI_CS_DEASSERT), because there is no SPI core here.
++ *
++ * Optional stage-3 boot args, all for on-device debugging:
++ *   liuqintouchdiv=N    SE clock divider, SCLK = 19.2 MHz / N (default 16,
++ *                       i.e. 1.2 MHz; the part is rated for 9.6 MHz)
++ *   liuqintouchpoll=1   read the event buffer every tick instead of waiting
++ *                       for gpio21 to assert
++ *   liuqintouchswap=1   exchange the controller's x and y
++ *   liuqintouchflip=N   bit 0 mirrors x, bit 1 mirrors y
+  */
+ #if defined(ARM64_BOARD_CONFIG_LIUQIN)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/kernel.h>
+ #include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <libkern/libkern.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++/* iokit/Kernel/arm/hid/LiuqinHID.cpp: a no-op when the HID service is absent. */
++extern void liuqin_hid_touch(int finger, int down, int x, int y);
+ 
+ #define GCC_PA          0x00100000
+ #define GCC_SIZE        0x00100000
+@@ -33,6 +55,11 @@
+ #define TLMM_SIZE       0x00200000
+ #define SE4_PA          0x00990000
+ #define SE4_SIZE        0x00004000
++/* geniqup@9c0000: the wrapper's own registers, of which only the QUP
++ * hardware version (offset 0x4) is needed.  The SEs sit at 0x980000 + 0x4000
++ * * n, so SE4 is 0x990000 and the wrapper core is 0x30000 above it. */
++#define QUP0_PA         0x009c0000
++#define QUP0_SIZE       0x00002000
+ 
+ /* QUPv3 wrapper 0 branch enables: one register, one bit per clock. */
+ #define GCC_QUPV3_WRAP0_CBCR    0x62008
+@@ -56,24 +83,704 @@
+ 
+ /* TLMM: one 0x1000 block per pin (pinctrl-sm8450.c PINGROUP). */
+ #define TLMM_CTL(pin)           (0x1000u * (pin))
++/* TLMM GPIO_IN_OUT (pinctrl-msm): SM8450 sets .in_bit = 0 and .out_bit = 1,
++ * the opposite way round from the older SoCs this register layout is usually
++ * quoted for (pinctrl-sm8450.c PINGROUP). */
++#define TLMM_IN_OUT             0x4
++#define TLMM_IN_BIT             (1u << 0)
++#define TLMM_OUT_BIT            (1u << 1)
+ #define TLMM_MUX(v)             (((v) >> 2) & 7u)
+ #define TLMM_PULL(v)            ((v) & 3u)
+ #define TLMM_DRIVE(v)           (((v) >> 6) & 7u)
+ 
+-/* GENI SE registers (include/linux/soc/qcom/geni-se.h). */
++/* Common GENI SE registers (include/linux/soc/qcom/geni-se.h). */
++#define GENI_FORCE_DEFAULT_REG  0x20
++#define GENI_OUTPUT_CTRL        0x24
++#define GENI_CGC_CTRL           0x28
++#define QUP_HW_VER_REG          0x04
+ #define SE_GENI_STATUS          0x40
++#define GENI_SER_M_CLK_CFG      0x48
+ #define GENI_FW_REVISION_RO     0x68
++#define SE_GENI_CLK_SEL         0x7c
++#define SE_GENI_CFG_SEQ_START   0x84
++#define SE_GENI_BYTE_GRAN       0x254
++#define SE_GENI_DMA_MODE_EN     0x258
++#define SE_GENI_TX_PACKING_CFG0 0x260
++#define SE_GENI_TX_PACKING_CFG1 0x264
++#define SE_GENI_RX_PACKING_CFG0 0x284
++#define SE_GENI_RX_PACKING_CFG1 0x288
++#define SE_GENI_M_CMD0          0x600
++#define SE_GENI_M_CMD_CTRL_REG  0x604
++#define SE_GENI_M_IRQ_STATUS    0x610
++#define SE_GENI_M_IRQ_EN        0x614
++#define SE_GENI_M_IRQ_CLEAR     0x618
+ #define SE_GENI_S_CMD0          0x630
+ #define SE_GENI_S_IRQ_STATUS    0x640
++#define SE_GENI_S_IRQ_EN        0x644
++#define SE_GENI_S_IRQ_CLEAR     0x648
++#define SE_GENI_TX_FIFOn        0x700
++#define SE_GENI_RX_FIFOn        0x780
++#define SE_GENI_TX_FIFO_STATUS  0x800
++#define SE_GENI_RX_FIFO_STATUS  0x804
++#define SE_GENI_TX_WATERMARK_REG 0x80c
++#define SE_GENI_RX_WATERMARK_REG 0x810
++#define SE_GENI_RX_RFR_WATERMARK_REG 0x814
++#define SE_DMA_TX_IRQ_CLR       0xc44
++#define SE_DMA_RX_IRQ_CLR       0xd44
++#define SE_GSI_EVENT_EN         0xe18
++#define SE_IRQ_EN               0xe1c
++#define SE_HW_PARAM_0           0xe24
++#define SE_HW_PARAM_1           0xe28
++#define SE_DMA_GENERAL_CFG      0xe30
+ 
++/* GENI_FORCE_DEFAULT_REG / GENI_OUTPUT_CTRL / GENI_CGC_CTRL fields. */
++#define FORCE_DEFAULT           1u
++#define DEFAULT_IO_OUTPUT_CTRL_MSK 0x7fu
++#define DEFAULT_CGC_EN          0x7fu
++/* SE_DMA_GENERAL_CFG: the four clock-gating enables Linux always sets. */
++#define DMA_GENERAL_CFG_DEFAULT 0xfu
++/* SE_IRQ_EN: GENI_M_IRQ_EN | GENI_S_IRQ_EN | DMA_TX_IRQ_EN | DMA_RX_IRQ_EN */
++#define SE_IRQ_EN_DEFAULT       0xfu
++/* GENI_SER_M_CLK_CFG: SER_CLK_EN, divider in bits 15:4. */
++#define SER_CLK_EN              (1u << 0)
++#define CLK_DIV_SHFT            4
++#define CLK_DIV_MSK             0xfffu
++/* GENI_SER_M_CLK_CFG source: BI_TCXO (19.2 MHz), no prescaler. */
++#define SE_CLK_HZ               19200000u
++
++/* GENI_FW_REVISION_RO: protocol in bits 15:8. */
++#define FW_REV_PROTOCOL_MSK     0x0000ff00u
++#define FW_REV_PROTOCOL_SHFT    8
++#define GENI_SE_SPI             1u
++
++/* SE_GENI_DMA_MODE_EN */
++#define GENI_DMA_MODE_EN        (1u << 0)
++
++/* GENI_M_CMD0 fields */
++#define M_OPCODE_SHFT           27
++#define M_PARAMS_MSK            0x07ffffffu
++
++/* GENI_M_CMD0 / M_CMD_CTRL opcodes and params for SPI. */
++#define SPI_TX_ONLY             1u
++#define SPI_RX_ONLY             2u
++#define SPI_TX_RX               (SPI_TX_ONLY | SPI_RX_ONLY)   /* FIFO duplex */
++#define SPI_CS_ASSERT           8u
++#define SPI_CS_DEASSERT         9u
++#define FRAGMENTATION           (1u << 2)
++
++/* GENI_M_IRQ_* fields. */
++#define M_CMD_DONE_EN           (1u << 0)
++#define M_CMD_OVERRUN_EN        (1u << 1)
++#define M_ILLEGAL_CMD_EN        (1u << 2)
++#define M_CMD_FAILURE_EN        (1u << 3)
++#define M_CMD_CANCEL_EN         (1u << 4)
++#define M_CMD_ABORT_EN          (1u << 5)
++#define M_RX_FIFO_RD_ERR_EN     (1u << 24)
++#define M_RX_FIFO_WR_ERR_EN     (1u << 25)
++#define M_RX_FIFO_WATERMARK_EN  (1u << 26)
++#define M_RX_FIFO_LAST_EN       (1u << 27)
++#define M_TX_FIFO_RD_ERR_EN     (1u << 28)
++#define M_TX_FIFO_WR_ERR_EN     (1u << 29)
++#define M_TX_FIFO_WATERMARK_EN  (1u << 30)
++#define M_COMMON_GENI_M_IRQ_EN  0x33c0007eu
++#define S_COMMON_GENI_S_IRQ_EN  0x03003e3eu
++
++/* FIFO status fields. */
++#define TX_FIFO_WC_MSK          0x0fffffffu
++#define RX_FIFO_WC_MSK          0x01ffffffu
++#define RX_LAST                 (1u << 31)
++#define RX_LAST_BYTE_VALID_MSK  0x70000000u
++#define RX_LAST_BYTE_VALID_SHFT 28
++
++/* SE_HW_PARAM_0/1: FIFO depth and width. */
++#define TX_FIFO_WIDTH_MSK       (0x3fu << 24)
++#define TX_FIFO_WIDTH_SHFT      24
++#define FIFO_DEPTH_MSK          (0x3fu << 16)          /* QUP < 3.10 */
++#define FIFO_DEPTH_MSK_256      (0xffu << 16)          /* QUP >= 3.10 */
++#define FIFO_DEPTH_SHFT         16
++
++/* SPI SE registers (drivers/spi/spi-geni-qcom.c). */
++#define SE_SPI_CPHA             0x224
++#define SE_SPI_LOOPBACK         0x22c
++#define SE_SPI_CPOL             0x230
++#define SE_SPI_DEMUX_OUTPUT_INV 0x24c
++#define SE_SPI_DEMUX_SEL        0x250
++#define SE_SPI_TRANS_CFG        0x25c
++#define CS_TOGGLE               (1u << 1)
++#define SE_SPI_WORD_LEN         0x268
++#define WORD_LEN_MSK            0x3ffu
++#define MIN_WORD_LEN            4u
++#define SE_SPI_TX_TRANS_LEN     0x26c
++#define SE_SPI_RX_TRANS_LEN     0x270
++#define TRANS_LEN_MSK           0x00ffffffu
++#define SE_SPI_SLAVE_EN         0x2bc
++
++/* Novatek NT36xxx SPI protocol (vendor nt36xxx driver, SPI variant). */
++#define NVT_CHIP_VER_TRIM_ADDR  0x3f004u
++#define NVT_EVENT_BUF_ADDR      0x2fe00u
++#define NVT_FWINFO_ADDR         (NVT_EVENT_BUF_ADDR | 0x78u)
++#define NVT_MAX_FINGERS         10
++#define NVT_POINT_LEN           65             /* event byte + 10 x 6 + 4 */
++#define NVT_BUF_MAX             72
++#define NVT_TOUCH_W             1800           /* framebuffer, LiuqinHID.cpp */
++#define NVT_TOUCH_H             2880
++
++/* What the driver needs to remember between the probe and the poll thread. */
++struct liuqin_touch {
++	vm_offset_t se;                 /* SE4 registers */
++	vm_offset_t tlmm;               /* TLMM registers */
++	uint32_t    tx_fifo_depth;      /* FIFO words */
++	uint32_t    bytes_per_fifo_word;
++	uint32_t    div;                /* SE clock divider */
++	uint32_t    spi_hz;
++	uint32_t    last_irq;           /* M_IRQ_STATUS of the last command */
++	uint32_t    max_x, max_y;       /* Novatek report space */
++	bool        swap;               /* exchange the controller's axes */
++	bool        flip_x, flip_y;
++};
++static struct liuqin_touch tch = {
++	.max_x = NVT_TOUCH_W,
++	.max_y = NVT_TOUCH_H,
++	.div = 16,
++};
++static void *liuqin_touch_chan;
++
+ static uint32_t
+ tch_rd(vm_offset_t base, uint32_t off)
+ {
+ 	uint32_t v = *(volatile uint32_t *)(base + off);
+ 	__asm__ volatile ("dmb oshld" ::: "memory");
+ 	return v;
++}
++
++static void
++tch_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dmb oshst" ::: "memory");
++}
++
++/* geni_se_irq_clear(): drop every pending interrupt source. */
++static void
++tch_irq_clear(void)
++{
++	tch_wr(tch.se, SE_GSI_EVENT_EN, 0);
++	tch_wr(tch.se, SE_GENI_M_IRQ_CLEAR, 0xffffffff);
++	tch_wr(tch.se, SE_GENI_S_IRQ_CLEAR, 0xffffffff);
++	tch_wr(tch.se, SE_DMA_TX_IRQ_CLR, 0xffffffff);
++	tch_wr(tch.se, SE_DMA_RX_IRQ_CLR, 0xffffffff);
++	tch_wr(tch.se, SE_IRQ_EN, 0xffffffff);
++}
++
++/* geni_se_select_mode(GENI_SE_FIFO): non-UART, so only the primary
++ * sequencer is interesting; DMA mode is off and the four FIFO interrupts
++ * that the polled transfer watches are on. */
++static void
++tch_fifo_mode(void)
++{
++	tch_irq_clear();
++	tch_wr(tch.se, SE_GENI_M_IRQ_EN, tch_rd(tch.se, SE_GENI_M_IRQ_EN) |
++	    M_CMD_DONE_EN | M_TX_FIFO_WATERMARK_EN |
++	    M_RX_FIFO_WATERMARK_EN | M_RX_FIFO_LAST_EN);
++	tch_wr(tch.se, SE_GENI_DMA_MODE_EN,
++	    tch_rd(tch.se, SE_GENI_DMA_MODE_EN) & ~GENI_DMA_MODE_EN);
++}
++
++/* geni_se_config_packing(), reduced to byte-aligned words (8 bits here):
++ * each 8-bit word is one packing vector, MSB first, and the FIFO word takes
++ * `pack_words` of them. */
++static void
++tch_config_packing(uint32_t bpw, uint32_t pack_words)
++{
++	uint32_t cfg[4] = { 0, 0, 0, 0 };
++	const uint32_t ceil_bpw = (bpw + 7) & ~7u;
++	const uint32_t iter = (ceil_bpw * pack_words) / 8;
++	const int idx_start = (int)bpw - 1;             /* msb_to_lsb */
++	int32_t temp_bpw = (int32_t)bpw;
++	int idx = idx_start;
++
++	if (iter == 0 || iter > 4) {
++		return;
++	}
++	for (uint32_t i = 0; i < iter; i++) {
++		const int len = (temp_bpw < 8 ? temp_bpw : 8) - 1;
++		cfg[i] = ((uint32_t)idx << 5) | (1u << 4) | ((uint32_t)len << 1);
++		if (temp_bpw <= 8) {
++			idx = (int)((i + 1) * 8) + idx_start;
++			temp_bpw = (int32_t)bpw;
++		} else {
++			idx -= 8;
++			temp_bpw -= 8;
++		}
++	}
++	cfg[iter - 1] |= 1u;                            /* PACKING_STOP_BIT */
++	tch_wr(tch.se, SE_GENI_TX_PACKING_CFG0, cfg[0] | (cfg[1] << 10));
++	tch_wr(tch.se, SE_GENI_TX_PACKING_CFG1, cfg[2] | (cfg[3] << 10));
++	tch_wr(tch.se, SE_GENI_RX_PACKING_CFG0, cfg[0] | (cfg[1] << 10));
++	tch_wr(tch.se, SE_GENI_RX_PACKING_CFG1, cfg[2] | (cfg[3] << 10));
++	/* Protocol words per FIFO entry: 0 = 4x8, 1 = 2x16, 2 = 1x32. */
++	tch_wr(tch.se, SE_GENI_BYTE_GRAN, (bpw / 16) & 3u);
++}
++
++/* Pull whatever the RX FIFO holds into rx[].  Called while a command runs so
++ * that a transfer longer than the FIFO cannot overflow it. */
++static void
++tch_drain_rx(uint8_t *rx, size_t rxlen, size_t *rxgot)
++{
++	uint32_t wc = tch_rd(tch.se, SE_GENI_RX_FIFO_STATUS) & RX_FIFO_WC_MSK;
++
++	while (wc-- > 0) {
++		const uint32_t word = tch_rd(tch.se, SE_GENI_RX_FIFOn);
++		for (uint32_t b = 0; b < tch.bytes_per_fifo_word; b++) {
++			if (*rxgot < rxlen) {
++				rx[(*rxgot)++] = (uint8_t)(word >> (8 * b));
++			}
++		}
++	}
++}
++
++static uint32_t
++tch_status(void)
++{
++	return tch_rd(tch.se, SE_GENI_M_IRQ_STATUS);
++}
++
++/* Issue one M_CMD0 opcode and wait for it, feeding the TX FIFO from tx[] and
++ * draining the RX FIFO into rx[] meanwhile.  Returns the final
++ * M_IRQ_STATUS; M_CMD_DONE_EN set means the command completed. */
++static uint32_t
++tch_run_cmd(uint32_t cmd, const uint8_t *tx, size_t txlen,
++    uint8_t *rx, size_t rxlen, size_t *rxgot, unsigned ms)
++{
++	const uint32_t errs = M_CMD_OVERRUN_EN | M_ILLEGAL_CMD_EN |
++	    M_CMD_FAILURE_EN | M_CMD_CANCEL_EN | M_CMD_ABORT_EN |
++	    M_RX_FIFO_RD_ERR_EN | M_RX_FIFO_WR_ERR_EN |
++	    M_TX_FIFO_RD_ERR_EN | M_TX_FIFO_WR_ERR_EN;
++	size_t txdone = 0;
++	uint32_t irq = 0;
++
++	tch_wr(tch.se, SE_GENI_M_CMD0, cmd);
++	for (unsigned i = 0; i < ms * 20; i++) {
++		if (tx != NULL && txdone < txlen) {
++			const uint32_t wc = tch_rd(tch.se, SE_GENI_TX_FIFO_STATUS) & TX_FIFO_WC_MSK;
++			uint32_t room = tch.tx_fifo_depth > wc ? tch.tx_fifo_depth - wc : 0;
++
++			while (room > 0 && txdone < txlen) {
++				uint32_t word = 0;
++
++				for (uint32_t b = 0; b < tch.bytes_per_fifo_word && txdone < txlen; b++) {
++					word |= (uint32_t)tx[txdone++] << (8 * b);
++				}
++				tch_wr(tch.se, SE_GENI_TX_FIFOn, word);
++				room--;
++			}
++		}
++		if (rx != NULL) {
++			tch_drain_rx(rx, rxlen, rxgot);
++		}
++		irq = tch_status();
++		if (irq & (M_CMD_DONE_EN | errs)) {
++			break;
++		}
++		delay(50);
++	}
++	if (rx != NULL) {
++		tch_drain_rx(rx, rxlen, rxgot);
++	}
++	tch_wr(tch.se, SE_GENI_M_IRQ_CLEAR, irq ? irq : 0xffffffff);
++	tch.last_irq = irq;
++	return irq;
++}
++
++/* One SPI transfer with chip select held: mode 0, 8-bit words, both
++ * directions when rx is given (the FIFO duplex opcode is TX|RX). */
++static int
++tch_xfer(const uint8_t *tx, uint8_t *rx, size_t len)
++{
++	uint32_t cmd = 0;
++	size_t got = 0;
++
++	if (len == 0 || len > TRANS_LEN_MSK) {
++		return -1;
++	}
++	if (tx != NULL) {
++		tch_wr(tch.se, SE_SPI_TX_TRANS_LEN, (uint32_t)len & TRANS_LEN_MSK);
++		cmd |= SPI_TX_ONLY;
++	}
++	if (rx != NULL) {
++		tch_wr(tch.se, SE_SPI_RX_TRANS_LEN, (uint32_t)len & TRANS_LEN_MSK);
++		cmd |= SPI_RX_ONLY;
++	}
++	tch_fifo_mode();
++	const uint32_t irq = tch_run_cmd((cmd << M_OPCODE_SHFT) | FRAGMENTATION,
++	    tx, tx != NULL ? len : 0, rx, rx != NULL ? len : 0, &got, 50);
++	if ((irq & M_CMD_DONE_EN) == 0) {
++		return -1;
++	}
++	if (rx != NULL && got < len) {
++		return -1;
++	}
++	return 0;
++}
++
++/* SPI_CS_ASSERT (8) / SPI_CS_DEASSERT (9); the transfer itself does not
++ * toggle the line because CS_TOGGLE was cleared at init. */
++static int
++tch_cs(bool assert)
++{
++	tch_fifo_mode();
++	const uint32_t irq = tch_run_cmd(((assert ? SPI_CS_ASSERT : SPI_CS_DEASSERT) << M_OPCODE_SHFT),
++	    NULL, 0, NULL, 0, NULL, 20);
++	return (irq & M_CMD_DONE_EN) ? 0 : -1;
++}
++
++/* Novatek page/address framing: three bytes set the page, then the address
++ * with bit 7 clear selects a read, the part returns one dummy byte and then
++ * the data.  Mirrors nvt_spi_read() in the vendor driver (and the
++ * tools/touch-novatek harness). */
++static int
++tch_nvt_read(uint32_t addr, uint8_t *out, size_t len)
++{
++	uint8_t page[3];
++	uint8_t tx[NVT_BUF_MAX];
++	uint8_t rx[NVT_BUF_MAX];
++	int err = -1;
++
++	if (len + 2 > sizeof(tx) || len == 0) {
++		return -1;
++	}
++	if (tch_cs(true) != 0) {
++		return -1;
++	}
++	page[0] = 0xff;                                 /* set page */
++	page[1] = (uint8_t)((addr >> 15) & 0xff);
++	page[2] = (uint8_t)((addr >> 7) & 0xff);
++	if (tch_xfer(page, NULL, sizeof(page)) == 0) {
++		memset(tx, 0, len + 2);
++		memset(rx, 0, len + 2);
++		tx[0] = (uint8_t)(addr & 0x7f);         /* address, read */
++		if (tch_xfer(tx, rx, len + 2) == 0) {
++			memcpy(out, rx + 2, len);
++			err = 0;
++		}
++	}
++	if (tch_cs(false) != 0) {
++		err = -1;
++	}
++	return err;
++}
++
++static const char *
++tch_chip_name(const uint8_t id[6])
++{
++	/* The last three trim-id bytes are the model: 0x23 0x65 0x03 encodes
++	 * "2365" (NT36523), 0x32 0x65 0x03 "3265" (NT36532).  The mapping for
++	 * the 36532 follows the shape of the vendor's trim table, not a table
++	 * entry we have seen, so the raw bytes are logged as well. */
++	if (id[3] == 0x32 && id[4] == 0x65 && id[5] == 0x03) {
++		return "NT36532";
++	}
++	if (id[3] == 0x23 && id[4] == 0x65 && id[5] == 0x03) {
++		return "NT36523";
++	}
++	return NULL;
++}
++
++/* spi_geni_init() + setup_fifo_params(), in the same order as the Linux
++ * driver, then the Novatek trim id. */
++static int
++liuqin_touch_spi_setup(void)
++{
++	const uint32_t fwrev = tch_rd(tch.se, GENI_FW_REVISION_RO);
++	const uint32_t proto = (fwrev & FW_REV_PROTOCOL_MSK) >> FW_REV_PROTOCOL_SHFT;
++
++	printf("LIUQIN TOUCH: SE4 GENI protocol %u (%s) fwrev 0x%08x\n", proto,
++	    proto == GENI_SE_SPI ? "SPI" : "not SPI", fwrev);
++	if (proto != GENI_SE_SPI) {
++		return -1;
++	}
++	vm_offset_t wrap = ml_io_map(QUP0_PA, QUP0_SIZE);
++	if (wrap == 0) {
++		printf("LIUQIN TOUCH: QUP wrapper map failed\n");
++		return -1;
++	}
++	const uint32_t hw = tch_rd(wrap, QUP_HW_VER_REG);
++	const uint32_t major = (hw >> 28) & 0xf;
++	const uint32_t minor = (hw >> 16) & 0xfff;
++	const uint32_t param0 = tch_rd(tch.se, SE_HW_PARAM_0);
++	const uint32_t param1 = tch_rd(tch.se, SE_HW_PARAM_1);
++	const uint32_t depth_msk = ((major == 3 && minor >= 10) || major > 3) ?
++	    FIFO_DEPTH_MSK_256 : FIFO_DEPTH_MSK;
++	const uint32_t width = (param0 & TX_FIFO_WIDTH_MSK) >> TX_FIFO_WIDTH_SHFT;
++
++	tch.tx_fifo_depth = (param0 & depth_msk) >> FIFO_DEPTH_SHFT;
++	printf("LIUQIN TOUCH: QUP hw 0x%08x (v%u.%u) TX fifo %u words x %u bit, RX fifo %u words\n",
++	    hw, major, minor, tch.tx_fifo_depth, width,
++	    (param1 & depth_msk) >> FIFO_DEPTH_SHFT);
++	if (width == 0 || tch.tx_fifo_depth < 4) {
++		printf("LIUQIN TOUCH: unusable FIFO geometry, SPI not started\n");
++		return -1;
++	}
++	tch.bytes_per_fifo_word = width / 8;
++	if (tch.bytes_per_fifo_word == 0) {
++		tch.bytes_per_fifo_word = 1;
++	}
++
++	/* geni_se_init(se, tx_fifo_depth - 3, tx_fifo_depth - 2) and
++	 * geni_se_io_init()/geni_se_io_set_mode(). */
++	tch_irq_clear();
++	tch_wr(tch.se, GENI_CGC_CTRL, tch_rd(tch.se, GENI_CGC_CTRL) | DEFAULT_CGC_EN);
++	tch_wr(tch.se, SE_DMA_GENERAL_CFG,
++	    tch_rd(tch.se, SE_DMA_GENERAL_CFG) | DMA_GENERAL_CFG_DEFAULT);
++	tch_wr(tch.se, GENI_OUTPUT_CTRL, DEFAULT_IO_OUTPUT_CTRL_MSK);
++	tch_wr(tch.se, GENI_FORCE_DEFAULT_REG, FORCE_DEFAULT);
++	tch_wr(tch.se, SE_IRQ_EN, tch_rd(tch.se, SE_IRQ_EN) | SE_IRQ_EN_DEFAULT);
++	tch_wr(tch.se, SE_GENI_DMA_MODE_EN,
++	    tch_rd(tch.se, SE_GENI_DMA_MODE_EN) & ~GENI_DMA_MODE_EN);
++	tch_wr(tch.se, SE_GSI_EVENT_EN, 0);
++	tch_wr(tch.se, SE_GENI_RX_WATERMARK_REG, tch.tx_fifo_depth - 3);
++	tch_wr(tch.se, SE_GENI_RX_RFR_WATERMARK_REG, tch.tx_fifo_depth - 2);
++	tch_wr(tch.se, SE_GENI_M_IRQ_EN,
++	    tch_rd(tch.se, SE_GENI_M_IRQ_EN) | M_COMMON_GENI_M_IRQ_EN);
++	tch_wr(tch.se, SE_GENI_S_IRQ_EN,
++	    tch_rd(tch.se, SE_GENI_S_IRQ_EN) | S_COMMON_GENI_S_IRQ_EN);
++
++	/* FIFO mode, and "we always control CS manually". */
++	tch_fifo_mode();
++	tch_wr(tch.se, SE_SPI_TRANS_CFG, tch_rd(tch.se, SE_SPI_TRANS_CFG) & ~CS_TOGGLE);
++
++	/* setup_fifo_params(): 8-bit words, SPI mode 0, chip select 0. */
++	const uint32_t pack_words = (width % 8) ? 1 : width / 8;
++	tch_config_packing(8, pack_words);
++	tch_wr(tch.se, SE_SPI_WORD_LEN, (8 - MIN_WORD_LEN) & WORD_LEN_MSK);
++	tch_wr(tch.se, SE_SPI_LOOPBACK, 0);
++	tch_wr(tch.se, SE_SPI_DEMUX_SEL, 0);
++	tch_wr(tch.se, SE_SPI_CPHA, 0);
++	tch_wr(tch.se, SE_SPI_CPOL, 0);
++	tch_wr(tch.se, SE_SPI_DEMUX_OUTPUT_INV, 0);
++
++	/* geni_spi_set_clock_and_bw(): the SE clock is BI_TCXO (19.2 MHz) with
++	 * no prescaler, so SER_M_CLK_CFG's divider is the whole story. */
++	tch_wr(tch.se, SE_GENI_CLK_SEL, 0);
++	tch_wr(tch.se, GENI_SER_M_CLK_CFG, ((tch.div & CLK_DIV_MSK) << CLK_DIV_SHFT) | SER_CLK_EN);
++	tch.spi_hz = SE_CLK_HZ / tch.div;
++	printf("LIUQIN TOUCH: SPI master mode 0, 8-bit words, CS0, %u kHz (19.2 MHz / %u), "
++	    "fifo %u byte/word, trans_cfg 0x%08x slave_en 0x%08x\n",
++	    tch.spi_hz / 1000, tch.div, tch.bytes_per_fifo_word,
++	    tch_rd(tch.se, SE_SPI_TRANS_CFG), tch_rd(tch.se, SE_SPI_SLAVE_EN));
++	return 0;
++}
++
++static void
++tch_novatek_info(void)
++{
++	uint8_t id[6] = { 0 };
++	const int have_id = tch_nvt_read(NVT_CHIP_VER_TRIM_ADDR, id, sizeof(id)) == 0;
++	const char *name = have_id ? tch_chip_name(id) : NULL;
++
++	printf("LIUQIN TOUCH: Novatek trim id %02x %02x %02x %02x %02x %02x (%s) irq 0x%08x\n",
++	    id[0], id[1], id[2], id[3], id[4], id[5],
++	    have_id ? (name != NULL ? name : "unknown id") : "read failed",
++	    tch.last_irq);
++
++	uint8_t fw[16] = { 0 };
++	if (tch_nvt_read(NVT_FWINFO_ADDR, fw, sizeof(fw)) == 0) {
++		const uint32_t max_x = ((uint32_t)fw[4] << 8) | fw[5];
++		const uint32_t max_y = ((uint32_t)fw[6] << 8) | fw[7];
++		const bool sane = ((fw[0] + fw[1]) & 0xff) == 0xff &&
++		    max_x > 0 && max_y > 0 && max_x <= 4096 && max_y <= 4096;
++
++		if (sane) {
++			tch.max_x = max_x;
++			tch.max_y = max_y;
++		}
++		printf("LIUQIN TOUCH: fwinfo %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x "
++		    "%02x %02x %02x %02x %02x %02x (%s)\n",
++		    fw[0], fw[1], fw[2], fw[3], fw[4], fw[5], fw[6], fw[7],
++		    fw[8], fw[9], fw[10], fw[11], fw[12], fw[13], fw[14], fw[15],
++		    sane ? "valid" : "broken, using the panel size");
++		printf("LIUQIN TOUCH: report space %ux%u, %u fingers, %u buttons, chip 0x%02x\n",
++		    tch.max_x, tch.max_y, fw[9], fw[10], fw[14]);
++	} else {
++		printf("LIUQIN TOUCH: fwinfo read failed, report space %ux%u\n",
++		    tch.max_x, tch.max_y);
++	}
++}
++
++static uint32_t
++tch_scale(uint32_t v, uint32_t max, uint32_t out)
++{
++	const uint32_t r = max ? (uint32_t)(((uint64_t)v * out) / max) : 0;
++
++	return r >= out ? out - 1 : r;
++}
++
++/* A frame with no finger record at all is not news: the buffer can read back
++ * as zeros or 0xff between reports, and treating that as a lift would release
++ * a finger that is still down.  Novatek sends an explicit release record
++ * (event 3) when a finger lifts, so real lifts always decode. */
++static bool
++tch_frame_valid(const uint8_t *frame)
++{
++	for (int i = 0; i < NVT_MAX_FINGERS; i++) {
++		const uint8_t *p = frame + 1 + 6 * i;
++		const unsigned id = p[0] >> 3;
++		const unsigned event = p[0] & 7u;
++
++		if (id >= 1 && id <= NVT_MAX_FINGERS && event >= 1 && event <= 3) {
++			return true;
++		}
++	}
++	return false;
+ }
+ 
++/* One frame: 65 bytes at 0x2fe00, event byte first, then ten 6-byte records
++ * (id << 3 | event, x high, y high, x low nibble << 4 | y low nibble,
++ * weight, pressure).  Finger ids are 1-based and become HID slots 0..9.
++ * Returns how many fingers the frame reports. */
++static int
++tch_frame_decode(const uint8_t *frame, bool *down)
++{
++	uint32_t mask = 0;
++
++	for (int i = 0; i < NVT_MAX_FINGERS; i++) {
++		const uint8_t *p = frame + 1 + 6 * i;
++		const unsigned id = p[0] >> 3;
++		const unsigned event = p[0] & 7u;
++
++		if (id == 0 || id > NVT_MAX_FINGERS) {
++			continue;
++		}
++		if (event != 1 && event != 2) {         /* 3 = release, 0/4+ invalid */
++			continue;
++		}
++		unsigned x = ((unsigned)p[1] << 4) | (p[3] >> 4);
++		unsigned y = ((unsigned)p[2] << 4) | (p[3] & 0x0fu);
++		uint32_t rx = tch.max_x, ry = tch.max_y;
++
++		if (tch.swap) {
++			const unsigned t = x;
++
++			x = y;
++			y = t;
++			rx = tch.max_y;
++			ry = tch.max_x;
++		}
++		if (x > rx || y > ry) {
++			continue;
++		}
++		unsigned sx = tch_scale(x, rx, NVT_TOUCH_W);
++		unsigned sy = tch_scale(y, ry, NVT_TOUCH_H);
++
++		if (tch.flip_x) {
++			sx = NVT_TOUCH_W - 1 - sx;
++		}
++		if (tch.flip_y) {
++			sy = NVT_TOUCH_H - 1 - sy;
++		}
++		mask |= 1u << (id - 1);
++		liuqin_hid_touch((int)id - 1, 1, (int)sx, (int)sy);
++	}
++	for (int slot = 0; slot < NVT_MAX_FINGERS; slot++) {
++		if (down[slot] && !(mask & (1u << slot))) {
++			liuqin_hid_touch(slot, 0, 0, 0);
++		}
++		down[slot] = (mask & (1u << slot)) != 0;
++	}
++	return __builtin_popcount(mask);
++}
++
++static void
++tch_dump_frame(const char *what, const uint8_t *frame)
++{
++	printf("LIUQIN TOUCH: %s %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
++	    what, frame[0], frame[1], frame[2], frame[3], frame[4],
++	    frame[5], frame[6], frame[7], frame[8], frame[9]);
++	printf("LIUQIN TOUCH: %s %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
++	    what, frame[10], frame[11], frame[12], frame[13], frame[14],
++	    frame[15], frame[16], frame[17], frame[18], frame[19]);
++}
++
++static void
++liuqin_touch_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint8_t frame[NVT_POINT_LEN];
++	uint8_t last[NVT_POINT_LEN];
++	bool down[NVT_MAX_FINGERS] = { false };
++	unsigned errors = 0;
++	unsigned idle = 0;
++	int force_poll = 0;
++	bool saw_gpio = false;
++	bool dumped = false;
++
++	PE_parse_boot_argn("liuqintouchpoll", &force_poll, sizeof(force_poll));
++	memset(frame, 0, sizeof(frame));
++	memset(last, 0, sizeof(last));
++	printf("LIUQIN TOUCH: report thread up, %s\n",
++	    force_poll ? "event-buffer polling" : "INT on gpio21");
++
++	for (;;) {
++		const int ticks = hz / 100 > 0 ? hz / 100 : 1;
++		const uint32_t gpio = tch_rd(tch.tlmm, TLMM_CTL(21) + TLMM_IN_OUT);
++		bool go = force_poll || (gpio & TLMM_IN_BIT) != 0;
++
++		if (!saw_gpio) {
++			saw_gpio = true;
++			printf("LIUQIN TOUCH: gpio21 in/out 0x%08x (in %u out %u) mux %u pull %u\n",
++			    gpio, (gpio & TLMM_IN_BIT) ? 1 : 0, (gpio & TLMM_OUT_BIT) ? 1 : 0,
++			    TLMM_MUX(tch_rd(tch.tlmm, TLMM_CTL(21))),
++			    TLMM_PULL(tch_rd(tch.tlmm, TLMM_CTL(21))));
++		}
++		if (!go) {
++			/* Once a second, read anyway: that keeps the path alive
++			 * if the interrupt line reads wrong, and the frame
++			 * comparison below makes a stale buffer harmless. */
++			if (++idle < 64) {
++				(void)tsleep(&liuqin_touch_chan, PZERO, "liuqintouch", ticks);
++				continue;
++			}
++			idle = 0;
++		}
++		const bool health = !go;
++		if (tch_nvt_read(NVT_EVENT_BUF_ADDR, frame, sizeof(frame)) != 0) {
++			if (errors++ < 4) {
++				printf("LIUQIN TOUCH: event read failed (irq 0x%08x)\n", tch.last_irq);
++			}
++		} else if (tch_frame_valid(frame)) {
++			if (memcmp(frame, last, sizeof(frame)) != 0) {
++				if (!dumped) {
++					dumped = true;
++					tch_dump_frame("first frame", frame);
++				}
++				memcpy(last, frame, sizeof(frame));
++				const int fingers = tch_frame_decode(frame, down);
++
++				if (health && !force_poll && fingers > 0) {
++					/* A touch arrived without the interrupt line
++					 * asserting: wrong pin read, wrong polarity or
++					 * no INT at all.  Poll from now on. */
++					force_poll = 1;
++					printf("LIUQIN TOUCH: gpio21 did not assert for a touch, "
++					    "polling the event buffer\n");
++				}
++			}
++		}
++		(void)tsleep(&liuqin_touch_chan, PZERO, "liuqintouch", ticks);
++	}
++}
++
++static void
++liuqin_touch_reports_start(void)
++{
++	thread_t thread;
++
++	if (kernel_thread_start(liuqin_touch_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("LIUQIN TOUCH: report thread not started\n");
++	}
++}
++
+ void
+ liuqin_touch_probe(void)
+ {
+@@ -82,12 +789,24 @@
+ 	if (level <= 0) {
+ 		return;
+ 	}
++	{
++		int div = 16, swap = 0, flip = 0;
++
++		(void)PE_parse_boot_argn("liuqintouchdiv", &div, sizeof(div));
++		(void)PE_parse_boot_argn("liuqintouchswap", &swap, sizeof(swap));
++		(void)PE_parse_boot_argn("liuqintouchflip", &flip, sizeof(flip));
++		tch.div = div < 2 ? 2 : (div > (int)CLK_DIV_MSK ? CLK_DIV_MSK : (uint32_t)div);
++		tch.swap = swap != 0;
++		tch.flip_x = (flip & 1) != 0;
++		tch.flip_y = (flip & 2) != 0;
++	}
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	vm_offset_t tlmm = ml_io_map(TLMM_PA, TLMM_SIZE);
+ 	if (gcc == 0 || tlmm == 0) {
+ 		printf("LIUQIN TOUCH: map failed (gcc %d tlmm %d)\n", gcc != 0, tlmm != 0);
+ 		return;
+ 	}
++	tch.tlmm = tlmm;
+ 
+ 	/* --- GCC: is the wrapper clocked at all? --- */
+ 	const uint32_t cbcr = tch_rd(gcc, GCC_QUPV3_WRAP0_CBCR);
+@@ -172,8 +891,19 @@
+ 		printf("LIUQIN TOUCH: SE4 map failed\n");
+ 		return;
+ 	}
++	tch.se = se;
+ 	printf("LIUQIN TOUCH: SE4 status 0x%08x fwrev 0x%08x s_cmd 0x%08x s_irq 0x%08x\n",
+ 	    tch_rd(se, SE_GENI_STATUS), tch_rd(se, GENI_FW_REVISION_RO),
+ 	    tch_rd(se, SE_GENI_S_CMD0), tch_rd(se, SE_GENI_S_IRQ_STATUS));
++
++	/* --- stage 3: SPI master, Novatek chip id, report thread --- */
++	if (level >= 3) {
++		if (liuqin_touch_spi_setup() != 0) {
++			printf("LIUQIN TOUCH: SPI master not started\n");
++			return;
++		}
++		tch_novatek_info();
++		liuqin_touch_reports_start();
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_LIUQIN */
