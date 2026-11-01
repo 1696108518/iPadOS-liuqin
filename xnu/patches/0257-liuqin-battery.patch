@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/LiuqinBattery.cpp
 +++ b/iokit/Kernel/arm/LiuqinBattery.cpp
-@@ -0,0 +1,568 @@
+@@ -0,0 +1,570 @@
 +/*
 + * LIUQIN: the battery the iOS UI reads.
 + *
@@ -40,7 +40,6 @@
 +#include <libkern/c++/OSBoolean.h>
 +#include <libkern/c++/OSNumber.h>
 +#include <libkern/c++/OSSymbol.h>
-+#include <libkern/c++/OSString.h>
 +
 +extern "C" {
 +#include <sys/systm.h>
@@ -91,9 +90,7 @@
 +#define ADC_USR_STATUS1         0x08u
 +#define ADC_USR_STATUS1_EOC     (1u << 0)
 +#define ADC_USR_DIG_PARAM       0x42u
-+#define ADC_USR_FAST_AVG_CTL    0x43u
 +#define ADC_USR_CH_SEL_CTL      0x44u
-+#define ADC_USR_DELAY_CTL       0x45u
 +#define ADC_USR_EN_CTL1         0x46u
 +#define ADC_USR_EN_CTL1_EN      (1u << 7)
 +#define ADC_USR_CONV_REQ        0x47u
@@ -107,8 +104,7 @@
 +static vm_offset_t batt_core, batt_cfg0, batt_cfg1, batt_obs, batt_chnls;
 +static uint32_t batt_bus0_apids, batt_bus1_apids;
 +static uint32_t batt_adc_apid = (uint32_t)-1;
-+static int liuqin_batt_chan;
-+static OSSymbol *gKeyNominal;
++static const OSSymbol *gKeyNominal;
 +
 +static inline uint32_t
 +brd(vm_offset_t base, uint32_t off)
@@ -317,13 +313,43 @@
 +	virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
 +};
 +
++/* The manager first: its methods need super == IOService. */
 +#define super IOService
 +OSDefineMetaClassAndStructors(AppleSmartBatteryManager, IOService);
++
++bool
++AppleSmartBatteryManager::start(IOService *provider)
++{
++	AppleSmartBattery *batt;
++
++	if (!super::start(provider)) {
++		return false;
++	}
++	batt = OSTypeAlloc(AppleSmartBattery);
++	if (batt == NULL || !batt->init() || !batt->attach(this) ||
++	    !batt->start(this)) {
++		printf("LIUQIN BATT: battery child failed\n");
++		if (batt != NULL) {
++			batt->release();
++		}
++		return true;   /* the manager itself is still up */
++	}
++	registerService();
++	printf("LIUQIN BATT: AppleSmartBatteryManager published (id 0x%llx)\n",
++	    (unsigned long long)getRegistryEntryID());
++	return true;
++}
++
++void
++AppleSmartBatteryManager::stop(IOService *provider)
++{
++	super::stop(provider);
++}
 +#undef super
 +
++/* The battery: super == IOPMPowerSource from here to the end. */
 +#define super IOPMPowerSource
 +OSDefineMetaClassAndStructors(AppleSmartBattery, IOPMPowerSource);
-+#undef super
 +
 +bool
 +AppleSmartBattery::start(IOService *provider)
@@ -347,15 +373,15 @@
 +	setCycleCount(1);
 +	setAdapterInfo(0);
 +	setLocation(0);
-+	setErrorCondition(OSSymbol::withCString("Normal"));
-+	setManufacturer(OSSymbol::withCString("SMP"));
-+	setModel(OSSymbol::withCString("BM58"));
-+	setSerial(OSSymbol::withCString("LIUQIN"));
++	setErrorCondition(const_cast<OSSymbol *>(OSSymbol::withCString("Normal")));
++	setManufacturer(const_cast<OSSymbol *>(OSSymbol::withCString("SMP")));
++	setModel(const_cast<OSSymbol *>(OSSymbol::withCString("BM58")));
++	setSerial(const_cast<OSSymbol *>(OSSymbol::withCString("LIUQIN")));
 +	gKeyNominal = OSSymbol::withCString("NominalChargeCapacity");
 +	setPSProperty(OSSymbol::withCString("FullyCharged"),
-+	    OSBoolean::withBooleanValue(false));
++	    OSBoolean::withBoolean(false));
 +	setPSProperty(OSSymbol::withCString("BatteryType"),
-+	    OSSymbol::withCString("InternalBattery"));
++	    const_cast<OSSymbol *>(OSSymbol::withCString("InternalBattery")));
 +	setPSProperty(OSSymbol::withCString("DesignCapacity"),
 +	    OSNumber::withNumber((unsigned long long)LIUQIN_BATT_MAX_MAH, 32));
 +	setPSProperty(gKeyNominal,
@@ -364,8 +390,10 @@
 +	    OSNumber::withNumber(0ull, 32));
 +	updateStatus();
 +
-+	fTimer = IOTimerEventSource::timerEventSource(this, &AppleSmartBattery::timerFired);
-+	if (fTimer != NULL && getWorkLoop()->addEventSource(fTimer) == kIOReturnSuccess) {
++	fTimer = IOTimerEventSource::timerEventSource(this,
++	    &AppleSmartBattery::timerFired);
++	if (fTimer != NULL &&
++	    getWorkLoop()->addEventSource(fTimer) == kIOReturnSuccess) {
 +		fTimer->setTimeoutMS(5000);
 +	} else {
 +		printf("LIUQIN BATT: no refresh timer\n");
@@ -435,35 +463,7 @@
 +	    (LIUQIN_BATT_MAX_MAH * pct / 100), 32));
 +	updateStatus();
 +}
-+
-+bool
-+AppleSmartBatteryManager::start(IOService *provider)
-+{
-+	AppleSmartBattery *batt;
-+
-+	if (!super::start(provider)) {
-+		return false;
-+	}
-+	batt = OSTypeAlloc(AppleSmartBattery);
-+	if (batt == NULL || !batt->init() || !batt->attach(this) ||
-+	    !batt->start(this)) {
-+		printf("LIUQIN BATT: battery child failed\n");
-+		if (batt != NULL) {
-+			batt->release();
-+		}
-+		return true;   /* the manager itself is still up */
-+	}
-+	registerService();
-+	printf("LIUQIN BATT: AppleSmartBatteryManager published (id 0x%llx)\n",
-+	    (unsigned long long)getRegistryEntryID());
-+	return true;
-+}
-+
-+void
-+AppleSmartBatteryManager::stop(IOService *provider)
-+{
-+	super::stop(provider);
-+}
++#undef super
 +
 +/* ---------------------------------------------------------------- bring-up */
 +
@@ -554,6 +554,8 @@
 +	printf("LIUQIN BATT: up\n");
 +}
 +
++extern "C" void
++liuqin_battery_start(void);
 +extern "C" void
 +liuqin_battery_start(void)
 +{
