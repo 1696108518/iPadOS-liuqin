@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/LiuqinBattery.cpp
 +++ b/iokit/Kernel/arm/LiuqinBattery.cpp
-@@ -0,0 +1,661 @@
+@@ -0,0 +1,644 @@
 +/*
 + * LIUQIN: the battery the iOS UI reads.
 + *
@@ -536,13 +536,15 @@
 +	}
 +
 +	/*
-+	 * The v7 APID->PPID table is per bus: bus0's lives at core + 0x2000
-+	 * (the view 0243/nts2 proved out), bus1's at cfg1 + 0x2000, with
-+	 * bus1's entries indexed from its first global APID (count).  SID 3
-+	 * (PM8350B, the battery ADC) hangs off bus1 - nts3's first attempt
-+	 * scanned bus0 only and never saw ppid 0x331.
++	 * The v7 APID->PPID table is ONE global array at core + 0x2000,
++	 * 1024 entries; bus1's APIDs are numbered 768..1023 but their map
++	 * entries sit at core + 0x2000 + 4 * global_apid like everybody
++	 * else's (0243's note, and nts2/nts4 both proved it empirically).
++	 * The nts4 attempt that scanned a separate "bus1 table" at
++	 * cfg1 + 0x2000 found nothing because no such table exists.
 +	 */
-+	for (uint32_t apid = 0; apid < count; apid++) {
++	for (uint32_t apid = 0; apid < count + batt_bus1_apids &&
++	    apid < SPMI_APID_MAX; apid++) {
 +		const uint32_t m = brd(batt_core, SPMI_APID_MAP(apid));
 +		const uint32_t ppid = (m >> 8) & SPMI_PPID_MASK;
 +
@@ -551,35 +553,16 @@
 +		}
 +		if (ppid == LIUQIN_ADCB_PPID) {
 +			batt_adcb_apid = apid;
-+			printf("LIUQIN BATT: PM8350B ADC7 (ppid 0x331) at apid %u\n",
-+			    apid);
++			printf("LIUQIN BATT: PM8350B ADC7 (ppid 0x331) at apid %u%s\n",
++			    apid, apid >= count ? " (bus1)" : "");
 +		}
 +		if (ppid == LIUQIN_ADCC_PPID) {
 +			batt_adcc_apid = apid;
-+			printf("LIUQIN BATT: PM8350 ADC7 (ppid 0x131) at apid %u\n",
-+			    apid);
++			printf("LIUQIN BATT: PM8350 ADC7 (ppid 0x131) at apid %u%s\n",
++			    apid, apid >= count ? " (bus1)" : "");
 +		}
-+	}
-+	for (uint32_t i = 0; i < batt_bus1_apids; i++) {
-+		const uint32_t apid = count + i;
-+		const uint32_t m = brd(batt_cfg1, SPMI_APID_MAP(i));
-+		const uint32_t ppid = (m >> 8) & SPMI_PPID_MASK;
-+
-+		if (m == 0) {
-+			continue;
-+		}
-+		if (ppid == LIUQIN_ADCB_PPID) {
-+			batt_adcb_apid = apid;
-+			printf("LIUQIN BATT: PM8350B ADC7 (ppid 0x331) at apid %u "
-+			    "(bus1)\n", apid);
-+		}
-+		if (ppid == LIUQIN_ADCC_PPID) {
-+			batt_adcc_apid = apid;
-+			printf("LIUQIN BATT: PM8350 ADC7 (ppid 0x131) at apid %u "
-+			    "(bus1)\n", apid);
-+		}
-+		/* one-time diagnostic: every ADC-ish peripheral on either bus */
-+		if ((ppid & 0xffu) == 0x31u || ppid == LIUQIN_ADCC_PPID) {
++		/* diagnostic: every ADC-root-shaped peripheral on the map */
++		if ((ppid & 0xffu) == 0x31u) {
 +			printf("LIUQIN BATT: map dump: apid %u ppid 0x%03x\n",
 +			    apid, ppid);
 +		}
