@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/LiuqinBattery.cpp
 +++ b/iokit/Kernel/arm/LiuqinBattery.cpp
-@@ -0,0 +1,686 @@
+@@ -0,0 +1,724 @@
 +/*
 + * LIUQIN: the battery the iOS UI reads.
 + *
@@ -617,13 +617,51 @@
 +	}
 +
 +	/*
-+	 * Calibration ladder before trusting anything:
-+	 *   ref_gnd  (SID 0, ch 0x00) -> code ~0
-+	 *   vref_1p25(SID 0, ch 0x01) -> 1250 mV, code ~19267
-+	 * Both are internal to the ADC root - no APP_SID routing involved.
-+	 * Their outcome splits "the ADC core is broken" from "the remote
-+	 * channel routing is wrong".
++	 * Calibration ladder + write-path forensics:
++	 *   1. write the channel-select block, read it back - proves or
++	 *      refutes that our SPMI writes reach the ADC at all;
++	 *   2. log the APID's owner EE from the arbiter table (cfg0+4*apid);
++	 *      if the ADSP owns it, steal it for EE 0 (nothing else runs
++	 *      here) and log whether the table is writable;
++	 *   3. ref_gnd -> ~0, vref_1p25 -> ~1250 mV if the conversion
++	 *      pipeline works end to end.
 +	 */
++	{
++		uint8_t r[4];
++
++		if (batt_spmi_read(batt_adc_apid, ADC_USR_DIG_PARAM, r, 4) == 0) {
++			r[1] = (uint8_t)((r[1] & ~0x7u) & 0xffu);
++			r[2] = 0x8fu;                      /* vbat_sns channel */
++			r[3] = (uint8_t)(r[3] & ~0xfu);
++			if (batt_spmi_write(batt_adc_apid, ADC_USR_DIG_PARAM,
++			    r, 4) == 0 &&
++			    batt_spmi_read(batt_adc_apid, ADC_USR_DIG_PARAM,
++			    r, 4) == 0) {
++				printf("LIUQIN BATT: dig write/readback: "
++				    "%02x %02x %02x %02x (want ch 0x8f in [2])\n",
++				    r[0], r[1], r[2], r[3]);
++			} else {
++				printf("LIUQIN BATT: dig write or readback "
++				    "failed\n");
++			}
++		}
++		{
++			const uint32_t own0 = brd(batt_cfg0,
++			    4u * batt_adc_apid) & 0x7u;
++
++			printf("LIUQIN BATT: apid %u owner EE %u\n",
++			    batt_adc_apid, own0);
++			if (own0 != 0) {
++				uint32_t w = brd(batt_cfg0, 4u * batt_adc_apid);
++
++				bwr(batt_cfg0, 4u * batt_adc_apid,
++				    w & ~0x7u);
++				w = brd(batt_cfg0, 4u * batt_adc_apid);
++				printf("LIUQIN BATT: owner steal -> now EE %u "
++				    "(raw 0x%08x)\n", w & 0x7u, w);
++			}
++		}
++	}
 +	{
 +		const int gnd = batt_read_mv(0, 0x00u, 1, NULL);
 +		const int ref = batt_read_mv(0, 0x01u, 1, NULL);
