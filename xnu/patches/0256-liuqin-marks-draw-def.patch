@@ -1,0 +1,13 @@
+--- a/bsd/dev/liuqin_touch.c
++++ b/bsd/dev/liuqin_touch.c
+@@ -58,6 +58,10 @@
+  * draw a line anyway (osfmk/console/serial_console.c). */
+ extern void liuqin_boot_mark(const char *what);
+ extern int liuqin_console_force;
++/* The framebuffer side used to own the on-screen boot-marks flag; that
++ * definition never made it into the series, so the default (marks off)
++ * lives here next to the declarations that use it. */
++int liuqin_marks_draw = 0;
+ /* iokit/Kernel/arm/hid/LiuqinHID.cpp: a no-op when the HID service is absent. */
+ extern void liuqin_hid_touch(int finger, int down, int x, int y);
+ 
