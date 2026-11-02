@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/LiuqinBattery.cpp
 +++ b/iokit/Kernel/arm/LiuqinBattery.cpp
-@@ -0,0 +1,996 @@
+@@ -0,0 +1,1049 @@
 +/*
 + * LIUQIN: the battery the iOS UI reads.
 + *
@@ -350,6 +350,57 @@
 +	} else {
 +		printf("LIUQIN BATT: data static for 3 s (no autonomous "
 +		    "conversions)\n");
++	}
++}
++
++/*
++ * Read-only hunt for a battery value the AP can actually see.
++ *
++ * The charger inside PM8350B (SID 3) has its own hardware ADCs and status
++ * registers; SPMI *reads* work from here even though writes do not.  Dump
++ * every readable byte of the plausibly-charger SID 3 peripherals and let
++ * the known live voltage (TWRP: 4.43 V with USB in) identify the register:
++ * look for 4430 (0x114E) or scaled relatives in the dump.
++ */
++static void
++batt_dump_sid3(void)
++{
++	static const uint8_t want[] = { 0x10, 0x11, 0x12, 0x13, 0x14, 0x16, 0x1c, 0x1d };
++	const uint32_t total = batt_bus0_apids + batt_bus1_apids;
++
++	printf("LIUQIN BATT: scanning SID 3 peripherals...\n");
++	for (unsigned w = 0; w < sizeof(want); w++) {
++		const uint32_t target_ppid = (3u << 8) | want[w];
++		uint32_t apid = (uint32_t)-1;
++
++		for (uint32_t a = 0; a < total && a < SPMI_APID_MAX; a++) {
++			const uint32_t m = brd(batt_core, SPMI_APID_MAP(a));
++
++			if (m != 0 && ((m >> 8) & SPMI_PPID_MASK) ==
++			    target_ppid) {
++				apid = a;
++				break;
++			}
++		}
++		if (apid == (uint32_t)-1) {
++			continue;
++		}
++		printf("LIUQIN BATT: sid3 periph 0x%02x -> apid %u\n",
++		    want[w], apid);
++		for (uint32_t off = 0; off < 0x100u; off += 16u) {
++			uint8_t b[16];
++			unsigned i;
++
++			if (batt_spmi_read(apid, off, b, sizeof(b)) != 0) {
++				printf("LIUQIN BATT:  %02x: read failed\n", off);
++				continue;
++			}
++			printf("LIUQIN BATT:  %02x:", off);
++			for (i = 0; i < 16; i++) {
++				printf(" %02x", b[i]);
++			}
++			printf("\n");
++		}
 +	}
 +}
 +
@@ -908,6 +959,8 @@
 +	/* Does the arbiter see our writes at all? */
 +	batt_cfg_control();
 +	batt_arb_regback();
++	/* Read-only: is there a battery value the AP can see without writes? */
++	batt_dump_sid3();
 +
 +	/* Wake the slave: a sleeping peripheral drops writes silently. */
 +	batt_adc_sleepctl(6u, "wakeup");
