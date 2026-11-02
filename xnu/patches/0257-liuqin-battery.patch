@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/LiuqinBattery.cpp
 +++ b/iokit/Kernel/arm/LiuqinBattery.cpp
-@@ -0,0 +1,724 @@
+@@ -0,0 +1,825 @@
 +/*
 + * LIUQIN: the battery the iOS UI reads.
 + *
@@ -103,7 +103,9 @@
 +#define ADC_APP_SID_MASK        0x0fu
 +#define ADC_USR_STATUS1         0x08u
 +#define ADC_USR_STATUS1_EOC     (1u << 0)
++#define ADC_USR_STATUS2         0x09u
 +#define ADC_USR_DIG_PARAM       0x42u
++#define ADC_USR_FAST_AVG        0x43u
 +#define ADC_USR_EN_CTL1         0x46u
 +#define ADC_USR_EN_CTL1_EN      (1u << 7)
 +#define ADC_USR_CONV_REQ        0x47u
@@ -129,6 +131,9 @@
 +static uint32_t batt_adc_apid = (uint32_t)-1;
 +static const OSSymbol *gKeyNominal;
 +static int batt_trace = 1;   /* log the internal-reference cal readings */
++static int batt_write_path = -1;   /* set by batt_write_probe() */
++
++static int batt_adc_write(uint32_t addr, const uint8_t *buf, size_t len);
 +
 +static inline uint32_t
 +brd(vm_offset_t base, uint32_t off)
@@ -224,6 +229,125 @@
 +}
 +
 +/*
++ * Raw SPMI write on a caller-chosen channel region and opcode, with the
++ * status bytes that follow the command logged.  Used by the probe below:
++ * in this environment the arbiter reports DONE for writes that never
++ * reach the ADC (nts9: channel byte read back as the pre-boot value), so
++ * the probe finds which (region, opcode) the hardware actually honours.
++ */
++static void
++batt_raw_write(vm_offset_t region, uint32_t page, unsigned opc,
++    uint32_t addr, const uint8_t *buf, size_t len, uint32_t *st0_out,
++    uint32_t *st1_out)
++{
++	const uint32_t cmd = ((uint32_t)opc << 27) |
++	    ((addr & 0xffu) << 4) | (uint32_t)(len - 1);
++	uint32_t w0 = 0, w1 = 0, st;
++
++	for (unsigned i = 0; i < len; i++) {
++		if (i < 4) {
++			w0 |= (uint32_t)buf[i] << (8 * i);
++		} else {
++			w1 |= (uint32_t)buf[i] << (8 * (i - 4));
++		}
++	}
++	bwr(region, page + SPMI_CH_WDATA0, w0);
++	if (len > 4) {
++		bwr(region, page + SPMI_CH_WDATA0 + 4u, w1);
++	}
++	bwr(region, page + SPMI_CH_CMD, cmd);
++	st = brd(region, page + SPMI_CH_STATUS);
++	if (st0_out != NULL) {
++		*st0_out = st;
++	}
++	for (unsigned i = 0; i < 2000; i++) {
++		st = brd(region, page + SPMI_CH_STATUS);
++		if ((st & SPMI_ST_DONE) != 0) {
++			break;
++		}
++		delay(1);
++	}
++	if (st1_out != NULL) {
++		*st1_out = st;
++	}
++}
++
++/*
++ * Find a write path that actually lands.  Three candidates, each probed
++ * against the ADC's FAST_AVG_CTL byte (0x43, harmless: only the averaging
++ * count) with a 0x5A pattern and a readback through the (known good)
++ * observer path:
++ *   A: chnls page, opcode 14 (WRITE)   - the Linux driver's choice
++ *   B: chnls page, opcode 2  (EXT_WRITE)
++ *   C: observer page, opcode 14
++ */
++static int batt_write_path;    /* 0 = chnls/14, 1 = chnls/2, 2 = obs/14, -1 = none */
++
++static void
++batt_write_probe(void)
++{
++	static const char *const names[] = { "chnls/op14", "chnls/op2", "obs/op14" };
++	uint8_t orig = 0, back = 0, w = 0x5A;
++
++	if (batt_spmi_read(batt_adc_apid, ADC_USR_FAST_AVG, &orig, 1) != 0) {
++		printf("LIUQIN BATT: probe: cannot read FAST_AVG\n");
++		return;
++	}
++	printf("LIUQIN BATT: probe: FAST_AVG orig 0x%02x\n", orig);
++	for (int p = 0; p < 3; p++) {
++		vm_offset_t region = (p == 2) ? batt_obs : batt_chnls;
++		uint32_t page = (p == 2) ? (0x20u * batt_adc_apid) :
++		    (0x1000u * batt_adc_apid);
++		unsigned opc = (p == 1) ? 2u : (unsigned)SPMI_OP_WRITE;
++		uint32_t st0 = 0, st1 = 0;
++
++		w = 0x5A;
++		batt_raw_write(region, page, opc, ADC_USR_FAST_AVG, &w, 1,
++		    &st0, &st1);
++		delay(2000);
++		back = 0;
++		(void)batt_spmi_read(batt_adc_apid, ADC_USR_FAST_AVG, &back, 1);
++		printf("LIUQIN BATT: probe %s: status 0x%02x -> 0x%02x, "
++		    "readback 0x%02x %s\n", names[p], st0, st1, back,
++		    back == 0x5A ? "LANDED" : "dropped");
++		if (back == 0x5A && batt_write_path < 0) {
++			batt_write_path = p;
++		}
++		/* restore whatever the probe left */
++		w = orig;
++		batt_raw_write(region, page, opc, ADC_USR_FAST_AVG, &w, 1,
++		    NULL, NULL);
++		delay(1000);
++	}
++	if (batt_write_path >= 0) {
++		printf("LIUQIN BATT: probe: using %s\n", names[batt_write_path]);
++	} else {
++		printf("LIUQIN BATT: probe: NO write path lands - the ADC "
++		    "cannot be driven from this kernel\n");
++	}
++}
++
++/* Write through the path the probe selected. */
++static int
++batt_adc_write(uint32_t addr, const uint8_t *buf, size_t len)
++{
++	switch (batt_write_path) {
++	case 0:
++		return batt_spmi_write(batt_adc_apid, addr, buf, len);
++	case 1:
++		batt_raw_write(batt_chnls, 0x1000u * batt_adc_apid, 2u, addr,
++		    buf, len, NULL, NULL);
++		return 0;
++	case 2:
++		batt_raw_write(batt_obs, 0x20u * batt_adc_apid,
++		    (unsigned)SPMI_OP_WRITE, addr, buf, len, NULL, NULL);
++		return 0;
++	default:
++		return -1;
++	}
++}
++
++/*
 + * One ADC7 conversion of `chan` on target PMIC `sid`, scaled with the
 + * channel's internal divider `div`: mV = code * 1875 * div / 0x70e4.
 + * Sequence is the vendor's adc7_configure() verbatim: masked APP_SID
@@ -252,7 +376,7 @@
 +		return -1;
 +	}
 +	r[0] = (uint8_t)((r[0] & ~ADC_APP_SID_MASK) | (sid & ADC_APP_SID_MASK));
-+	if (batt_spmi_write(batt_adc_apid, ADC_APP_SID, r, 1) != 0) {
++	if (batt_adc_write(ADC_APP_SID, r, 1) != 0) {
 +		return -1;
 +	}
 +	if (batt_spmi_read(batt_adc_apid, ADC_USR_DIG_PARAM, r, 4) != 0) {
@@ -261,10 +385,10 @@
 +	r[1] = (uint8_t)((r[1] & ~0x7u) & 0xffu);  /* fast avg: 1 sample  */
 +	r[2] = chan;                               /* channel select      */
 +	r[3] = (uint8_t)(r[3] & ~0xfu);            /* no hw settle delay  */
-+	if (batt_spmi_write(batt_adc_apid, ADC_USR_DIG_PARAM, r, 4) != 0) {
++	if (batt_adc_write(ADC_USR_DIG_PARAM, r, 4) != 0) {
 +		return -1;
 +	}
-+	if (batt_spmi_write(batt_adc_apid, ADC_USR_CONV_REQ, &conv, 1) != 0) {
++	if (batt_adc_write(ADC_USR_CONV_REQ, &conv, 1) != 0) {
 +		return -1;
 +	}
 +	/* EOC should clear (converting) and set again (done) - but a fast
@@ -617,50 +741,27 @@
 +	}
 +
 +	/*
-+	 * Calibration ladder + write-path forensics:
-+	 *   1. write the channel-select block, read it back - proves or
-+	 *      refutes that our SPMI writes reach the ADC at all;
-+	 *   2. log the APID's owner EE from the arbiter table (cfg0+4*apid);
-+	 *      if the ADSP owns it, steal it for EE 0 (nothing else runs
-+	 *      here) and log whether the table is writable;
-+	 *   3. ref_gnd -> ~0, vref_1p25 -> ~1250 mV if the conversion
-+	 *      pipeline works end to end.
++	 * Find a write path the ADC actually honours, then look at the ADC's
++	 * own state (revision, STATUS1/STATUS2 fault bits) before trusting a
++	 * conversion.  nts9 proved the arbiter answers DONE for writes that
++	 * never change the register, so a landing write is a prerequisite.
 +	 */
++	batt_write_probe();
 +	{
-+		uint8_t r[4];
++		uint8_t rev[2] = { 0, 0 };
++		uint8_t s1 = 0, s2 = 0;
 +
-+		if (batt_spmi_read(batt_adc_apid, ADC_USR_DIG_PARAM, r, 4) == 0) {
-+			r[1] = (uint8_t)((r[1] & ~0x7u) & 0xffu);
-+			r[2] = 0x8fu;                      /* vbat_sns channel */
-+			r[3] = (uint8_t)(r[3] & ~0xfu);
-+			if (batt_spmi_write(batt_adc_apid, ADC_USR_DIG_PARAM,
-+			    r, 4) == 0 &&
-+			    batt_spmi_read(batt_adc_apid, ADC_USR_DIG_PARAM,
-+			    r, 4) == 0) {
-+				printf("LIUQIN BATT: dig write/readback: "
-+				    "%02x %02x %02x %02x (want ch 0x8f in [2])\n",
-+				    r[0], r[1], r[2], r[3]);
-+			} else {
-+				printf("LIUQIN BATT: dig write or readback "
-+				    "failed\n");
-+			}
++		if (batt_spmi_read(batt_adc_apid, 0x00u, rev, 2) == 0 &&
++		    batt_spmi_read(batt_adc_apid, ADC_USR_STATUS1, &s1, 1) == 0 &&
++		    batt_spmi_read(batt_adc_apid, ADC_USR_STATUS2, &s2, 1) == 0) {
++			printf("LIUQIN BATT: adc rev %02x %02x status1 0x%02x "
++			    "status2 0x%02x\n", rev[0], rev[1], s1, s2);
 +		}
-+		{
-+			const uint32_t own0 = brd(batt_cfg0,
-+			    4u * batt_adc_apid) & 0x7u;
-+
-+			printf("LIUQIN BATT: apid %u owner EE %u\n",
-+			    batt_adc_apid, own0);
-+			if (own0 != 0) {
-+				uint32_t w = brd(batt_cfg0, 4u * batt_adc_apid);
-+
-+				bwr(batt_cfg0, 4u * batt_adc_apid,
-+				    w & ~0x7u);
-+				w = brd(batt_cfg0, 4u * batt_adc_apid);
-+				printf("LIUQIN BATT: owner steal -> now EE %u "
-+				    "(raw 0x%08x)\n", w & 0x7u, w);
-+			}
-+		}
++	}
++	if (batt_write_path < 0) {
++		printf("LIUQIN BATT: no working write path, stopping - "
++		    "no battery published\n");
++		return;
 +	}
 +	{
 +		const int gnd = batt_read_mv(0, 0x00u, 1, NULL);
