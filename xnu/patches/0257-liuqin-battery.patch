@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/LiuqinBattery.cpp
 +++ b/iokit/Kernel/arm/LiuqinBattery.cpp
-@@ -0,0 +1,909 @@
+@@ -0,0 +1,938 @@
 +/*
 + * LIUQIN: the battery the iOS UI reads.
 + *
@@ -351,6 +351,27 @@
 +		printf("LIUQIN BATT: data static for 3 s (no autonomous "
 +		    "conversions)\n");
 +	}
++}
++
++/*
++ * SPMI sleep/wakeup control.  A sleeping slave freezes its register file:
++ * writes are dropped, reads return the frozen image and the revision reads
++ * 0 - exactly what the ADC shows (en_ctl1 0x00, rev 00 00, writes dropped
++ * with a DONE status).  The arbiter's SLEEP(4)/RESET(3)/WAKEUP(6) opcodes
++ * are addressed to the peripheral itself; send them through the same write
++ * channel and log the status.
++ */
++static void
++batt_adc_sleepctl(unsigned opc, const char *what)
++{
++	uint8_t z = 0;
++	uint32_t st0 = 0, st1 = 0;
++
++	batt_raw_write(batt_chnls, 0x1000u * batt_adc_apid, opc, 0x00u, &z, 1,
++	    &st0, &st1);
++	printf("LIUQIN BATT: %s (op %u): status 0x%02x -> 0x%02x\n", what, opc,
++	    st0, st1);
++	delay(2000);
 +}
 +
 +/*
@@ -830,7 +851,15 @@
 +	 */
 +	batt_owner_scan();
 +	batt_adc_state();
++	/* Wake the slave: a sleeping peripheral drops writes silently. */
++	batt_adc_sleepctl(6u, "wakeup");
 +	batt_write_probe();
++	if (batt_write_path < 0) {
++		/* Still frozen: reset the peripheral, then wake it again. */
++		batt_adc_sleepctl(3u, "reset");
++		batt_adc_sleepctl(6u, "wakeup again");
++		batt_write_probe();
++	}
 +	{
 +		uint8_t rev[2] = { 0, 0 };
 +		uint8_t s1 = 0, s2 = 0;
