@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/LiuqinBattery.cpp
 +++ b/iokit/Kernel/arm/LiuqinBattery.cpp
-@@ -0,0 +1,1049 @@
+@@ -0,0 +1,1052 @@
 +/*
 + * LIUQIN: the battery the iOS UI reads.
 + *
@@ -387,8 +387,10 @@
 +		}
 +		printf("LIUQIN BATT: sid3 periph 0x%02x -> apid %u\n",
 +		    want[w], apid);
-+		for (uint32_t off = 0; off < 0x100u; off += 16u) {
-+			uint8_t b[16];
++		/* 8 bytes per transaction: the arbiter's byte-count field is
++		 * 3 bits, and RDATA holds only 8 bytes. */
++		for (uint32_t off = 0; off < 0x100u; off += 8u) {
++			uint8_t b[8];
 +			unsigned i;
 +
 +			if (batt_spmi_read(apid, off, b, sizeof(b)) != 0) {
@@ -396,7 +398,7 @@
 +				continue;
 +			}
 +			printf("LIUQIN BATT:  %02x:", off);
-+			for (i = 0; i < 16; i++) {
++			for (i = 0; i < 8; i++) {
 +				printf(" %02x", b[i]);
 +			}
 +			printf("\n");
@@ -410,7 +412,7 @@
 + * back, restore.  If this sticks while the ADC register write does not,
 + * MMIO writes are fine and the loss is inside the SPMI write channel.
 + */
-+static void
++static void __unused
 +batt_cfg_control(void)
 +{
 +	uint32_t spare = (uint32_t)-1;
@@ -442,7 +444,7 @@
 + * written the arbiter received them and the loss is downstream (the PMIC
 + * slave); if they read 0 the writes never reach the chnls region at all.
 + */
-+static void
++static void __unused
 +batt_arb_regback(void)
 +{
 +	const uint32_t page = 0x1000u * batt_adc_apid;
@@ -956,11 +958,12 @@
 +	 */
 +	batt_owner_scan();
 +	batt_adc_state();
-+	/* Does the arbiter see our writes at all? */
-+	batt_cfg_control();
-+	batt_arb_regback();
-+	/* Read-only: is there a battery value the AP can see without writes? */
++	/*
++	 * Read-only: is there a battery value the AP can see without writes?
++	 * (runs first - pure reads cannot wedge the arbiter)
++	 */
 +	batt_dump_sid3();
++	/* Does the arbiter see our writes at all? */
 +
 +	/* Wake the slave: a sleeping peripheral drops writes silently. */
 +	batt_adc_sleepctl(6u, "wakeup");
