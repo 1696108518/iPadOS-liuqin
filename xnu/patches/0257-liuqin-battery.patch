@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/LiuqinBattery.cpp
 +++ b/iokit/Kernel/arm/LiuqinBattery.cpp
-@@ -0,0 +1,963 @@
+@@ -0,0 +1,996 @@
 +/*
 + * LIUQIN: the battery the iOS UI reads.
 + *
@@ -350,6 +350,38 @@
 +	} else {
 +		printf("LIUQIN BATT: data static for 3 s (no autonomous "
 +		    "conversions)\n");
++	}
++}
++
++/*
++ * Control write: the arbiter's own owner table (plain MMIO, no SPMI
++ * transaction).  Pick an APID with no mapping, set its owner to 3, read
++ * back, restore.  If this sticks while the ADC register write does not,
++ * MMIO writes are fine and the loss is inside the SPMI write channel.
++ */
++static void
++batt_cfg_control(void)
++{
++	uint32_t spare = (uint32_t)-1;
++
++	for (uint32_t apid = batt_bus0_apids; apid < SPMI_APID_MAX; apid++) {
++		if (brd(batt_core, SPMI_APID_MAP(apid)) == 0) {
++			spare = apid;
++			break;
++		}
++	}
++	if (spare == (uint32_t)-1 || batt_cfg0 == 0) {
++		printf("LIUQIN BATT: cfg control: no spare APID\n");
++		return;
++	}
++	{
++		const uint32_t off = 4u * spare;
++		const uint32_t was = brd(batt_cfg0, off);
++
++		bwr(batt_cfg0, off, (was & ~0x7u) | 0x3u);
++		printf("LIUQIN BATT: cfg control apid %u: 0x%08x -> 0x%08x "
++		    "(want owner 3)\n", spare, was, brd(batt_cfg0, off));
++		bwr(batt_cfg0, off, was);
 +	}
 +}
 +
@@ -874,6 +906,7 @@
 +	batt_owner_scan();
 +	batt_adc_state();
 +	/* Does the arbiter see our writes at all? */
++	batt_cfg_control();
 +	batt_arb_regback();
 +
 +	/* Wake the slave: a sleeping peripheral drops writes silently. */
