@@ -1,52 +1,37 @@
 --- a/iokit/Kernel/arm/LiuqinBattery.cpp
 +++ b/iokit/Kernel/arm/LiuqinBattery.cpp
-@@ -0,0 +1,1092 @@
+@@ -0,0 +1,216 @@
 +/*
-+ * LIUQIN: the battery the iOS UI reads.
++ * LIUQIN: the battery the iOS UI reads - PLACEHOLDER.
 + *
-+ * iOS shows the charge level from an "AppleSmartBattery" IOService (a
-+ * subclass of the in-kernel IOPMPowerSource) whose registry properties are
-+ * the kIOPMPS*Key dictionary; BatteryCenter/powerlogd read the properties
-+ * straight from the registry, and the IOKit IOPS* API matches a service
-+ * named "AppleSmartBatteryManager".  This port has neither, so the status
-+ * bar shows nothing.
++ * iOS shows the charge level from an "AppleSmartBattery" IOService (an
++ * IOPMPowerSource subclass) whose registry properties are the kIOPMPS*
++ * dictionary; BatteryCenter/powerlogd read them straight from the
++ * registry and the IOKit IOPS* API matches "AppleSmartBatteryManager".
++ * This port had neither, so the status bar showed nothing.
 + *
-+ * This file publishes both, named exactly like the Apple classes:
++ * Why this is a placeholder: on liuqin the battery is measured by the PMIC
++ * ADC, but from the application processor that peripheral cannot be
++ * driven - every SPMI write to it is silently dropped (all three arbiter
++ * write paths, wakeup and reset included; ownership is ours, EE 0, and
++ * TWRP's own vendor kernel cannot configure it either), its DATA register
++ * is frozen, and the PM8350B charger block reads back a static shadow
++ * (byte-identical over two independent 6-minute sampling runs).  The real
++ * numbers are produced by the ADSP charger firmware and published over
++ * pmic_glink, which this port does not run.
 + *
-+ *   AppleSmartBatteryManager : IOService      (the IOPS-visible manager)
-+ *   AppleSmartBattery        : IOPMPowerSource (the battery; its child)
++ * So this service reports a fixed, sane level instead of a measurement:
++ * a value that keeps the UI usable and does not trip low-battery
++ * behaviour.  Nothing here is a reading - do not trust it for power
++ * management.
 + *
-+ * ADC7 - what the stock tablet measures and how (all from the official
-+ * dtbo overlay + drivers/iio/adc/qcom-spmi-adc5.c, cross-checked against
-+ * the stock kernel's IIO sysfs in TWRP):
-+ *
-+ *   - ONE ADC7 root exists in the APID map: pmk8350 vadc@3100 (PPID
-+ *     0x031, SID 0).  Every PMIC's battery channels mux through it; the
-+ *     target PMIC is selected per conversion with the ADC_APP_SID
-+ *     register (0x40, bits 3:0) - a conversion without this write
-+ *     measures SID 0's unconnected mux and returns junk.
-+ *   - battery voltage: SID 3 (PM8350B), channel 0x8f (VBAT_SNS),
-+ *     pre-scaling 1/3 (the DT overrides the driver's table!) -> mV =
-+ *     code * 1875 * 3 / 28900.
-+ *   - USB present:    SID 3, channel 0x11 (USB_IN_V_16), 1/16.
-+ *   - fallback rail:  SID 1 (PM8350), channel 0x8e (VPH_PWR), 1/3.
-+ *
-+ * One conversion = APP_SID, then write DIG_PARAM..CONV_REQ
-+ * (0x42..0x47), poll STATUS1 EOC, read DATA0/DATA1 (LSB/MSB; full scale
-+ * 0x70e4 = 1.875 V at the ADC input).  Same SPMI arbiter as the keys
-+ * driver (0243); writes go through the arbiter's "chnls" region
-+ * (0x0c500000), one 0x1000 page per APID (Linux
-+ * drivers/spmi/spmi-pmic-arb.c, pmic_arb_offset_v7()).
-+ *
-+ * The stock charger stack runs on the ADSP (charger_pd over pmic-glink)
-+ * and is unreachable, so IsCharging is "USB voltage present" and the
-+ * percentage is an open-circuit voltage estimate.
-+ *
-+ * Boot arg liuqinbatt=0 disables.  Every line greps as "LIUQIN BATT:".
++ * Boot args:
++ *   liuqinbattpct=N      reported level, 1..100 (default 50)
++ *   liuqinbattcharging=1 report external power / charging
++ *   liuqinbatt=0         do not publish the service at all
 + */
 +#include <IOKit/IOLib.h>
 +#include <IOKit/IOService.h>
-+#include <IOKit/IOTimerEventSource.h>
 +#include <IOKit/pwr_mgt/IOPMPowerSource.h>
 +#include <pexpert/pexpert.h>
 +#include <libkern/c++/OSBoolean.h>
@@ -57,696 +42,34 @@
 +#include <sys/systm.h>
 +#include <kern/clock.h>
 +#include <kern/thread.h>
-+uint64_t mach_absolute_time(void);
-+vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 +void thread_deallocate(thread_t);
-+void delay(int);
 +}
 +
-+/* ------------------------------------------------------------------ SPMI */
-+#define SPMI_CORE_PA            0x0c400000u
-+#define SPMI_CORE_SIZE          0x3000u
-+#define SPMI_CFG0_PA            0x0c42d000u
-+#define SPMI_CFG1_PA            0x0c432000u
-+#define SPMI_CFG_SIZE           0x10000u
-+#define SPMI_OBS_PA             0x0c440000u
-+#define SPMI_OBS_SIZE           0x80000u
-+#define SPMI_CHNLS_PA           0x0c500000u
-+#define SPMI_CHNLS_SIZE         0x400000u
-+
-+#define SPMI_REG_VERSION        0x0000u
-+#define SPMI_REG_FEATURES0      0x0004u
-+#define SPMI_REG_FEATURES1      0x0008u
-+#define SPMI_FEATURES_MASK      0x7ffu
-+#define SPMI_APID_MAP(i)        (0x2000u + 4u * (i))
-+#define SPMI_APID_MAX           1024u
-+#define SPMI_PPID_MASK          0x0fffu
-+
-+#define SPMI_CH_CMD             0x00u
-+#define SPMI_CH_STATUS          0x08u
-+#define SPMI_CH_RDATA0          0x18u
-+#define SPMI_CH_WDATA0          0x10u
-+#define SPMI_CH_STRIDE          0x20u
-+#define SPMI_OP_READ            15u
-+#define SPMI_OP_WRITE           14u
-+#define SPMI_ST_DONE            (1u << 0)
-+#define SPMI_ST_ERR             0x7eu
-+
-+/* The one ADC7 root in the APID map: pmk8350 vadc@3100 (SID 0). */
-+#define LIUQIN_ADC_PPID         0x031u
 +#define LIUQIN_BATT_MAX_MAH     8600u   /* BM58, datasheet typical */
++#define LIUQIN_BATT_DEFAULT_PCT 50
 +
-+/* ADC7 user-channel registers, offsets inside the root peripheral
-+ * (drivers/iio/adc/qcom-spmi-adc5.c). */
-+#define ADC_APP_SID             0x40u   /* target PMIC SID, bits 3:0 */
-+#define ADC_APP_SID_MASK        0x0fu
-+#define ADC_USR_STATUS1         0x08u
-+#define ADC_USR_STATUS1_EOC     (1u << 0)
-+#define ADC_USR_STATUS2         0x09u
-+#define ADC_USR_DIG_PARAM       0x42u
-+#define ADC_USR_FAST_AVG        0x43u
-+#define ADC_USR_EN_CTL1         0x46u
-+#define ADC_USR_EN_CTL1_EN      (1u << 7)
-+#define ADC_USR_CONV_REQ        0x47u
-+#define ADC_USR_CONV_REQ_REQ    (1u << 7)
-+#define ADC_USR_DATA0           0x50u
-+#define ADC_USR_DATA1           0x51u
-+#define ADC7_FULL_SCALE         0x70e4u
-+#define ADC7_DATA_CHECK         0xffffu
-+
-+/* Channels, exactly as the official dtbo overlay instantiates them. */
-+#define LIUQIN_BATT_SID         3u      /* PM8350B */
-+#define LIUQIN_BATT_CHAN        0x8fu   /* VBAT_SNS, 1/3 */
-+#define LIUQIN_BATT_DIV         3u
-+#define LIUQIN_USB_SID          3u      /* PM8350B */
-+#define LIUQIN_USB_CHAN         0x11u   /* USB_IN_V_16, 1/16 */
-+#define LIUQIN_USB_DIV          16u
-+#define LIUQIN_VPH_SID          1u      /* PM8350 fallback */
-+#define LIUQIN_VPH_CHAN         0x8eu   /* VPH_PWR, 1/3 */
-+#define LIUQIN_VPH_DIV          3u
-+
-+static vm_offset_t batt_core, batt_cfg0, batt_cfg1, batt_obs, batt_chnls;
-+static uint32_t batt_bus0_apids, batt_bus1_apids;
-+static uint32_t batt_adc_apid = (uint32_t)-1;
 +static const OSSymbol *gKeyNominal;
-+static int batt_trace = 1;   /* log the internal-reference cal readings */
-+static int batt_write_path = -1;   /* set by batt_write_probe() */
-+
-+static int batt_adc_write(uint32_t addr, const uint8_t *buf, size_t len);
-+
-+static inline uint32_t
-+brd(vm_offset_t base, uint32_t off)
-+{
-+	return *(volatile uint32_t *)(base + off);
-+}
-+
-+static inline void
-+bwr(vm_offset_t base, uint32_t off, uint32_t v)
-+{
-+	*(volatile uint32_t *)(base + off) = v;
-+}
-+
-+static uint64_t
-+batt_ns_since(uint64_t t0)
-+{
-+	uint64_t ns = 0;
-+
-+	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
-+	return ns;
-+}
-+
-+/* One SPMI register read through the observer channel (0243's format). */
-+static int
-+batt_spmi_read(uint32_t apid, uint32_t addr, uint8_t *buf, size_t len)
-+{
-+	const uint32_t ch = apid * SPMI_CH_STRIDE;
-+	const uint32_t cmd = (SPMI_OP_READ << 27) |
-+	    ((addr & 0xffu) << 4) | (uint32_t)(len - 1);
-+	const uint64_t t0 = mach_absolute_time();
-+	uint32_t st = 0;
-+	unsigned i;
-+
-+	bwr(batt_obs, ch + SPMI_CH_CMD, cmd);
-+	for (i = 0; i < 100000; i++) {
-+		st = brd(batt_obs, ch + SPMI_CH_STATUS);
-+		if ((st & SPMI_ST_DONE) != 0) {
-+			break;
-+		}
-+		if (batt_ns_since(t0) >= 20ull * 1000 * 1000) {
-+			break;
-+		}
-+		delay(1);
-+	}
-+	if ((st & SPMI_ST_DONE) == 0 || (st & SPMI_ST_ERR) != 0) {
-+		return -1;
-+	}
-+	for (i = 0; i < len; i++) {
-+		const uint32_t r = brd(batt_obs,
-+		    ch + (i < 4 ? SPMI_CH_RDATA0 : SPMI_CH_RDATA0 + 4u));
-+		buf[i] = (uint8_t)((r >> (8 * (i & 3))) & 0xff);
-+	}
-+	return 0;
-+}
-+
-+/* One SPMI register write through the arbiter's own chnls page. */
-+static int
-+batt_spmi_write(uint32_t apid, uint32_t addr, const uint8_t *buf, size_t len)
-+{
-+	const uint32_t base = 0x1000u * apid;
-+	const uint32_t cmd = (SPMI_OP_WRITE << 27) |
-+	    ((addr & 0xffu) << 4) | (uint32_t)(len - 1);
-+	const uint64_t t0 = mach_absolute_time();
-+	uint32_t w0 = 0, w1 = 0, st = 0;
-+	unsigned i;
-+
-+	for (i = 0; i < len; i++) {
-+		if (i < 4) {
-+			w0 |= (uint32_t)buf[i] << (8 * i);
-+		} else {
-+			w1 |= (uint32_t)buf[i] << (8 * (i - 4));
-+		}
-+	}
-+	bwr(batt_chnls, base + SPMI_CH_WDATA0, w0);
-+	if (len > 4) {
-+		bwr(batt_chnls, base + SPMI_CH_WDATA0 + 4u, w1);
-+	}
-+	bwr(batt_chnls, base + SPMI_CH_CMD, cmd);
-+	for (i = 0; i < 100000; i++) {
-+		st = brd(batt_chnls, base + SPMI_CH_STATUS);
-+		if ((st & SPMI_ST_DONE) != 0) {
-+			break;
-+		}
-+		if (batt_ns_since(t0) >= 20ull * 1000 * 1000) {
-+			break;
-+		}
-+		delay(1);
-+	}
-+	if ((st & SPMI_ST_DONE) == 0 || (st & SPMI_ST_ERR) != 0) {
-+		return -1;
-+	}
-+	return 0;
-+}
-+
-+/*
-+ * Raw SPMI write on a caller-chosen channel region and opcode, with the
-+ * status bytes that follow the command logged.  Used by the probe below:
-+ * in this environment the arbiter reports DONE for writes that never
-+ * reach the ADC (nts9: channel byte read back as the pre-boot value), so
-+ * the probe finds which (region, opcode) the hardware actually honours.
-+ */
-+static void
-+batt_raw_write(vm_offset_t region, uint32_t page, unsigned opc,
-+    uint32_t addr, const uint8_t *buf, size_t len, uint32_t *st0_out,
-+    uint32_t *st1_out)
-+{
-+	const uint32_t cmd = ((uint32_t)opc << 27) |
-+	    ((addr & 0xffu) << 4) | (uint32_t)(len - 1);
-+	uint32_t w0 = 0, w1 = 0, st;
-+
-+	for (unsigned i = 0; i < len; i++) {
-+		if (i < 4) {
-+			w0 |= (uint32_t)buf[i] << (8 * i);
-+		} else {
-+			w1 |= (uint32_t)buf[i] << (8 * (i - 4));
-+		}
-+	}
-+	bwr(region, page + SPMI_CH_WDATA0, w0);
-+	if (len > 4) {
-+		bwr(region, page + SPMI_CH_WDATA0 + 4u, w1);
-+	}
-+	bwr(region, page + SPMI_CH_CMD, cmd);
-+	st = brd(region, page + SPMI_CH_STATUS);
-+	if (st0_out != NULL) {
-+		*st0_out = st;
-+	}
-+	for (unsigned i = 0; i < 2000; i++) {
-+		st = brd(region, page + SPMI_CH_STATUS);
-+		if ((st & SPMI_ST_DONE) != 0) {
-+			break;
-+		}
-+		delay(1);
-+	}
-+	if (st1_out != NULL) {
-+		*st1_out = st;
-+	}
-+}
-+
-+/*
-+ * Ownership forensics.  The stock system's ADSP charger firmware owns the
-+ * PMIC peripherals it drives (TWRP's own kernel log shows "disallowed SPMI
-+ * write to sid=3, addr=0x8941" for PM8350B's GPIOs), and the vendor Linux
-+ * kernel cannot configure the ADC either ("Error applying setting, reverse
-+ * things back") - the battery numbers on this tablet come from the ADSP
-+ * over GLINK, not from the AP.
-+ *
-+ * This scan prints every peripheral another EE owns (calibration: SID 3
-+ * peripherals must show up, which proves our owner-table read matches the
-+ * driver's), then tries to take the ADC's channel for EE 0.
-+ */
-+static void
-+batt_owner_scan(void)
-+{
-+	uint32_t owned = 0;
-+
-+	for (uint32_t apid = 0; apid < batt_bus0_apids + batt_bus1_apids &&
-+	    apid < SPMI_APID_MAX; apid++) {
-+		const vm_offset_t reg = (apid < batt_bus0_apids) ?
-+		    batt_cfg0 : batt_cfg1;
-+		const uint32_t off = (apid < batt_bus0_apids) ? (4u * apid) :
-+		    (4u * (apid - batt_bus0_apids));
-+		const uint32_t m = brd(batt_core, SPMI_APID_MAP(apid));
-+		uint32_t w;
-+
-+		if (m == 0 || reg == 0) {
-+			continue;
-+		}
-+		w = brd(reg, off);
-+		if ((w & 0x7u) != 0) {
-+			if (owned < 12) {
-+				printf("LIUQIN BATT: owner: apid %u ppid 0x%03x "
-+				    "-> EE %u (raw 0x%08x)\n", apid,
-+				    (m >> 8) & SPMI_PPID_MASK, w & 0x7u, w);
-+			}
-+			owned++;
-+		}
-+	}
-+	printf("LIUQIN BATT: owner: %u peripherals belong to another EE\n",
-+	    owned);
-+
-+	if (batt_cfg0 != 0) {
-+		const uint32_t off = 4u * batt_adc_apid;
-+		const uint32_t w = brd(batt_cfg0, off);
-+
-+		printf("LIUQIN BATT: owner adc apid %u: raw 0x%08x (EE %u)\n",
-+		    batt_adc_apid, w, w & 0x7u);
-+		if ((w & 0x7u) != 0) {
-+			bwr(batt_cfg0, off, w & ~0x7u);
-+			printf("LIUQIN BATT: owner steal -> raw 0x%08x (EE %u)\n",
-+			    brd(batt_cfg0, off), brd(batt_cfg0, off) & 0x7u);
-+		}
-+	}
-+}
-+
-+/* The ADC's own enable/request/SID state, and whether DATA moves alone. */
-+static void
-+batt_adc_state(void)
-+{
-+	uint8_t en = 0, cq = 0, sid = 0, d0a = 0, d1a = 0, d0b = 0, d1b = 0;
-+
-+	(void)batt_spmi_read(batt_adc_apid, ADC_USR_EN_CTL1, &en, 1);
-+	(void)batt_spmi_read(batt_adc_apid, ADC_USR_CONV_REQ, &cq, 1);
-+	(void)batt_spmi_read(batt_adc_apid, ADC_APP_SID, &sid, 1);
-+	(void)batt_spmi_read(batt_adc_apid, ADC_USR_DATA0, &d0a, 1);
-+	(void)batt_spmi_read(batt_adc_apid, ADC_USR_DATA1, &d1a, 1);
-+	printf("LIUQIN BATT: adc en_ctl1 0x%02x conv_req 0x%02x app_sid 0x%02x "
-+	    "data 0x%02x%02x\n", en, cq, sid, d1a, d0a);
-+	delay(3000);
-+	(void)batt_spmi_read(batt_adc_apid, ADC_USR_DATA0, &d0b, 1);
-+	(void)batt_spmi_read(batt_adc_apid, ADC_USR_DATA1, &d1b, 1);
-+	if (d0a != d0b || d1a != d1b) {
-+		printf("LIUQIN BATT: data moved on its own -> 0x%02x%02x "
-+		    "(something else is converting)\n", d1b, d0b);
-+	} else {
-+		printf("LIUQIN BATT: data static for 3 s (no autonomous "
-+		    "conversions)\n");
-+	}
-+}
-+
-+/*
-+ * Differential sampler: re-read the charger block (SID 3 periph 0x16) every
-+ * 15 s for ~6 minutes and print the live registers.  Run it with the cable
-+ * plugged, then unplugged, then plugged again: registers that follow the
-+ * cable are VBUS-related, the one that only drifts is the battery.
-+ * Read-only by design (writes to this arbiter can wedge the boot).
-+ */
-+static void
-+batt_sample_loop(uint32_t apid)
-+{
-+	for (int n = 0; n < 24; n++) {
-+		for (uint32_t off = 0x40u; off < 0x60u; off += 8u) {
-+			uint8_t b[8];
-+
-+			if (batt_spmi_read(apid, off, b, sizeof(b)) == 0) {
-+				printf("LIUQIN BATT: s%02d %02x: %02x %02x %02x "
-+				    "%02x %02x %02x %02x %02x\n", n, off, b[0],
-+				    b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
-+			}
-+		}
-+		for (uint32_t off = 0x80u; off < 0xa0u; off += 8u) {
-+			uint8_t b[8];
-+
-+			if (batt_spmi_read(apid, off, b, sizeof(b)) == 0) {
-+				printf("LIUQIN BATT: s%02d %02x: %02x %02x %02x "
-+				    "%02x %02x %02x %02x %02x\n", n, off, b[0],
-+				    b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
-+			}
-+		}
-+		for (int ms = 0; ms < 1500; ms++) {
-+			delay(10);
-+		}
-+	}
-+}
-+
-+/*
-+ * Read-only hunt for a battery value the AP can actually see.
-+ *
-+ * The charger inside PM8350B (SID 3) has its own hardware ADCs and status
-+ * registers; SPMI *reads* work from here even though writes do not.  Dump
-+ * every readable byte of the plausibly-charger SID 3 peripherals and let
-+ * the known live voltage (TWRP: 4.43 V with USB in) identify the register:
-+ * look for 4430 (0x114E) or scaled relatives in the dump.
-+ */
-+static void
-+batt_dump_sid3(void)
-+{
-+	static const uint8_t want[] = { 0x10, 0x11, 0x12, 0x13, 0x14, 0x16, 0x1c, 0x1d };
-+	const uint32_t total = batt_bus0_apids + batt_bus1_apids;
-+
-+	printf("LIUQIN BATT: scanning SID 3 peripherals...\n");
-+	for (unsigned w = 0; w < sizeof(want); w++) {
-+		const uint32_t target_ppid = (3u << 8) | want[w];
-+		uint32_t apid = (uint32_t)-1;
-+
-+		for (uint32_t a = 0; a < total && a < SPMI_APID_MAX; a++) {
-+			const uint32_t m = brd(batt_core, SPMI_APID_MAP(a));
-+
-+			if (m != 0 && ((m >> 8) & SPMI_PPID_MASK) ==
-+			    target_ppid) {
-+				apid = a;
-+				break;
-+			}
-+		}
-+		if (apid == (uint32_t)-1) {
-+			continue;
-+		}
-+		printf("LIUQIN BATT: sid3 periph 0x%02x -> apid %u\n",
-+		    want[w], apid);
-+		/* 8 bytes per transaction: the arbiter's byte-count field is
-+		 * 3 bits, and RDATA holds only 8 bytes. */
-+		for (uint32_t off = 0; off < 0x100u; off += 8u) {
-+			uint8_t b[8];
-+			unsigned i;
-+
-+			if (batt_spmi_read(apid, off, b, sizeof(b)) != 0) {
-+				printf("LIUQIN BATT:  %02x: read failed\n", off);
-+				continue;
-+			}
-+			printf("LIUQIN BATT:  %02x:", off);
-+			for (i = 0; i < 8; i++) {
-+				printf(" %02x", b[i]);
-+			}
-+			printf("\n");
-+		}
-+		if (want[w] == 0x16u) {
-+			/* the charger block: sample it while the user plugs
-+			 * and unplugs the cable */
-+			batt_sample_loop(apid);
-+		}
-+	}
-+}
-+
-+/*
-+ * Control write: the arbiter's own owner table (plain MMIO, no SPMI
-+ * transaction).  Pick an APID with no mapping, set its owner to 3, read
-+ * back, restore.  If this sticks while the ADC register write does not,
-+ * MMIO writes are fine and the loss is inside the SPMI write channel.
-+ */
-+static void __unused
-+batt_cfg_control(void)
-+{
-+	uint32_t spare = (uint32_t)-1;
-+
-+	for (uint32_t apid = batt_bus0_apids; apid < SPMI_APID_MAX; apid++) {
-+		if (brd(batt_core, SPMI_APID_MAP(apid)) == 0) {
-+			spare = apid;
-+			break;
-+		}
-+	}
-+	if (spare == (uint32_t)-1 || batt_cfg0 == 0) {
-+		printf("LIUQIN BATT: cfg control: no spare APID\n");
-+		return;
-+	}
-+	{
-+		const uint32_t off = 4u * spare;
-+		const uint32_t was = brd(batt_cfg0, off);
-+
-+		bwr(batt_cfg0, off, (was & ~0x7u) | 0x3u);
-+		printf("LIUQIN BATT: cfg control apid %u: 0x%08x -> 0x%08x "
-+		    "(want owner 3)\n", spare, was, brd(batt_cfg0, off));
-+		bwr(batt_cfg0, off, was);
-+	}
-+}
-+
-+/*
-+ * Does the arbiter itself see our writes?  Write a recognisable word to
-+ * the channel's WDATA0 and to CMD, read both back.  If they read back as
-+ * written the arbiter received them and the loss is downstream (the PMIC
-+ * slave); if they read 0 the writes never reach the chnls region at all.
-+ */
-+static void __unused
-+batt_arb_regback(void)
-+{
-+	const uint32_t page = 0x1000u * batt_adc_apid;
-+	const uint32_t wpat = 0x5AA5C33Cu;
-+	const uint32_t cpat = (SPMI_OP_WRITE << 27) | (0x42u << 4) | 3u;
-+
-+	bwr(batt_chnls, page + SPMI_CH_WDATA0, wpat);
-+	bwr(batt_chnls, page + SPMI_CH_CMD, cpat);
-+	printf("LIUQIN BATT: arb regback: WDATA 0x%08x (wrote 0x%08x), "
-+	    "CMD 0x%08x (wrote 0x%08x), STATUS 0x%08x\n",
-+	    brd(batt_chnls, page + SPMI_CH_WDATA0), wpat,
-+	    brd(batt_chnls, page + SPMI_CH_CMD), cpat,
-+	    brd(batt_chnls, page + SPMI_CH_STATUS));
-+	/* the same two registers in the observer region, for comparison */
-+	{
-+		const uint32_t opage = 0x20u * batt_adc_apid;
-+
-+		bwr(batt_obs, opage + SPMI_CH_CMD, cpat);
-+		printf("LIUQIN BATT: arb regback obs: CMD 0x%08x, STATUS 0x%08x\n",
-+		    brd(batt_obs, opage + SPMI_CH_CMD),
-+		    brd(batt_obs, opage + SPMI_CH_STATUS));
-+	}
-+}
-+static void
-+batt_adc_sleepctl(unsigned opc, const char *what)
-+{
-+	uint8_t z = 0;
-+	uint32_t st0 = 0, st1 = 0;
-+
-+	batt_raw_write(batt_chnls, 0x1000u * batt_adc_apid, opc, 0x00u, &z, 1,
-+	    &st0, &st1);
-+	printf("LIUQIN BATT: %s (op %u): status 0x%02x -> 0x%02x\n", what, opc,
-+	    st0, st1);
-+	delay(2000);
-+}
-+
-+/*
-+ * Find a write path that actually lands.  Three candidates, each probed
-+ * against the ADC's FAST_AVG_CTL byte (0x43, harmless: only the averaging
-+ * count) with a 0x5A pattern and a readback through the (known good)
-+ * observer path:
-+ *   A: chnls page, opcode 14 (WRITE)   - the Linux driver's choice
-+ *   B: chnls page, opcode 2  (EXT_WRITE)
-+ *   C: observer page, opcode 14
-+ */
-+/* (batt_write_path is declared with the other globals above) */
-+static void
-+batt_write_probe(void)
-+{
-+	static const char *const names[] = { "chnls/op14", "chnls/op2", "obs/op14" };
-+	uint8_t orig = 0, back = 0, w = 0x5A;
-+
-+	if (batt_spmi_read(batt_adc_apid, ADC_USR_FAST_AVG, &orig, 1) != 0) {
-+		printf("LIUQIN BATT: probe: cannot read FAST_AVG\n");
-+		return;
-+	}
-+	printf("LIUQIN BATT: probe: FAST_AVG orig 0x%02x\n", orig);
-+	for (int p = 0; p < 3; p++) {
-+		vm_offset_t region = (p == 2) ? batt_obs : batt_chnls;
-+		uint32_t page = (p == 2) ? (0x20u * batt_adc_apid) :
-+		    (0x1000u * batt_adc_apid);
-+		unsigned opc = (p == 1) ? 2u : (unsigned)SPMI_OP_WRITE;
-+		uint32_t st0 = 0, st1 = 0;
-+
-+		w = 0x5A;
-+		batt_raw_write(region, page, opc, ADC_USR_FAST_AVG, &w, 1,
-+		    &st0, &st1);
-+		delay(2000);
-+		back = 0;
-+		(void)batt_spmi_read(batt_adc_apid, ADC_USR_FAST_AVG, &back, 1);
-+		printf("LIUQIN BATT: probe %s: status 0x%02x -> 0x%02x, "
-+		    "readback 0x%02x %s\n", names[p], st0, st1, back,
-+		    back == 0x5A ? "LANDED" : "dropped");
-+		if (back == 0x5A && batt_write_path < 0) {
-+			batt_write_path = p;
-+		}
-+		/* restore whatever the probe left */
-+		w = orig;
-+		batt_raw_write(region, page, opc, ADC_USR_FAST_AVG, &w, 1,
-+		    NULL, NULL);
-+		delay(1000);
-+	}
-+	if (batt_write_path >= 0) {
-+		printf("LIUQIN BATT: probe: using %s\n", names[batt_write_path]);
-+	} else {
-+		printf("LIUQIN BATT: probe: NO write path lands - the ADC "
-+		    "cannot be driven from this kernel\n");
-+	}
-+}
-+
-+/* Write through the path the probe selected. */
-+static int
-+batt_adc_write(uint32_t addr, const uint8_t *buf, size_t len)
-+{
-+	switch (batt_write_path) {
-+	case 0:
-+		return batt_spmi_write(batt_adc_apid, addr, buf, len);
-+	case 1:
-+		batt_raw_write(batt_chnls, 0x1000u * batt_adc_apid, 2u, addr,
-+		    buf, len, NULL, NULL);
-+		return 0;
-+	case 2:
-+		batt_raw_write(batt_obs, 0x20u * batt_adc_apid,
-+		    (unsigned)SPMI_OP_WRITE, addr, buf, len, NULL, NULL);
-+		return 0;
-+	default:
-+		return -1;
-+	}
-+}
-+
-+/*
-+ * One ADC7 conversion of `chan` on target PMIC `sid`, scaled with the
-+ * channel's internal divider `div`: mV = code * 1875 * div / 0x70e4.
-+ * Sequence is the vendor's adc7_configure() verbatim: masked APP_SID
-+ * write, 4-byte DIG_PARAM..DELAY update, then a SEPARATE 1-byte
-+ * CONV_REQ.  EOC handling: after the request the hardware clears EOC
-+ * while converting and sets it when done - but a conversion finishes in
-+ * a few hundred microseconds, often before the first status poll, so
-+ * both waits are advisory and DATA is read regardless.  The caller
-+ * judges plausibility of the result.
-+ */
-+static int
-+batt_read_mv(unsigned sid, uint8_t chan, unsigned div, uint32_t *code_out)
-+{
-+	uint8_t r[4];
-+	uint8_t stb;
-+	uint8_t d0, d1;
-+	uint32_t code;
-+	uint8_t conv = ADC_USR_CONV_REQ_REQ;
-+	int cleared = 0;
-+
-+	if (batt_adc_apid == (uint32_t)-1) {
-+		return -1;
-+	}
-+	/* select the target PMIC for this conversion */
-+	if (batt_spmi_read(batt_adc_apid, ADC_APP_SID, r, 1) != 0) {
-+		return -1;
-+	}
-+	r[0] = (uint8_t)((r[0] & ~ADC_APP_SID_MASK) | (sid & ADC_APP_SID_MASK));
-+	if (batt_adc_write(ADC_APP_SID, r, 1) != 0) {
-+		return -1;
-+	}
-+	if (batt_spmi_read(batt_adc_apid, ADC_USR_DIG_PARAM, r, 4) != 0) {
-+		return -1;
-+	}
-+	r[1] = (uint8_t)((r[1] & ~0x7u) & 0xffu);  /* fast avg: 1 sample  */
-+	r[2] = chan;                               /* channel select      */
-+	r[3] = (uint8_t)(r[3] & ~0xfu);            /* no hw settle delay  */
-+	if (batt_adc_write(ADC_USR_DIG_PARAM, r, 4) != 0) {
-+		return -1;
-+	}
-+	if (batt_adc_write(ADC_USR_CONV_REQ, &conv, 1) != 0) {
-+		return -1;
-+	}
-+	/* EOC should clear (converting) and set again (done) - but a fast
-+	 * conversion can complete before the first status read, so both
-+	 * waits are best-effort and their outcome is logged only once. */
-+	for (unsigned i = 0; i < 200; i++) {
-+		if (batt_spmi_read(batt_adc_apid, ADC_USR_STATUS1, &stb, 1) != 0) {
-+			return -1;
-+		}
-+		if ((stb & ADC_USR_STATUS1_EOC) == 0) {
-+			cleared = 1;
-+			break;
-+		}
-+		delay(1);
-+	}
-+	for (unsigned i = 0; i < 2000; i++) {
-+		if (batt_spmi_read(batt_adc_apid, ADC_USR_STATUS1, &stb, 1) != 0) {
-+			return -1;
-+		}
-+		if ((stb & ADC_USR_STATUS1_EOC) != 0) {
-+			break;
-+		}
-+		delay(1);
-+		if (i == 1999) {
-+			printf("LIUQIN BATT: ADC7 EOC timeout ch 0x%02x "
-+			    "(status 0x%02x)\n", chan, stb);
-+			return -1;
-+		}
-+	}
-+	if (batt_spmi_read(batt_adc_apid, ADC_USR_DATA0, &d0, 1) != 0 ||
-+	    batt_spmi_read(batt_adc_apid, ADC_USR_DATA1, &d1, 1) != 0) {
-+		return -1;
-+	}
-+	code = (uint32_t)d0 | ((uint32_t)d1 << 8);
-+	if (code_out != NULL) {
-+		*code_out = code;
-+	}
-+	if (batt_trace && sid == 0 && (chan == 0x00u || chan == 0x01u)) {
-+		printf("LIUQIN BATT: cal ch 0x%02x sid %u: code %u (0x%04x), "
-+		    "eoc-cleared %d, status 0x%02x\n", chan, sid, code, code,
-+		    cleared, stb);
-+	}
-+	if (code == ADC7_DATA_CHECK) {
-+		return -1;
-+	}
-+	return (int)((code * 1875u * div) / ADC7_FULL_SCALE);
-+}
-+
-+/* Battery voltage: VBAT_SNS on PM8350B (/3), VPH on PM8350 fallback (/3). */
-+static int
-+batt_read_vbat_mv(uint32_t *code_out)
-+{
-+	int mv = batt_read_mv(LIUQIN_BATT_SID, LIUQIN_BATT_CHAN,
-+	    LIUQIN_BATT_DIV, code_out);
-+
-+	if (mv > 0) {
-+		return mv;
-+	}
-+	printf("LIUQIN BATT: vbat_sns unavailable, falling back to vph_pwr\n");
-+	return batt_read_mv(LIUQIN_VPH_SID, LIUQIN_VPH_CHAN, LIUQIN_VPH_DIV,
-+	    NULL);
-+}
-+
-+/* USB present: USB_IN_V_16 on PM8350B (/16).  ~5000 mV on a charger. */
-+static int
-+batt_read_vbus_mv(void)
-+{
-+	return batt_read_mv(LIUQIN_USB_SID, LIUQIN_USB_CHAN, LIUQIN_USB_DIV,
-+	    NULL);
-+}
-+
-+/*
-+ * Open-circuit estimate for the BM58 LiPo (full 4.45 V, empty 3.5 V under
-+ * the light load this port draws).  VBAT_SNS sits a little below the
-+ * cell's open-circuit voltage under load, so the curve reads slightly
-+ * conservative - fine for a status bar.
-+ */
-+static const struct batt_curve_pt {
-+	int mv;
-+	int pct;
-+} batt_curve[] = {
-+	{ 4450, 100 }, { 4400, 95 }, { 4350, 89 }, { 4300, 82 },
-+	{ 4250, 74 },  { 4200, 66 }, { 4150, 58 }, { 4100, 50 },
-+	{ 4050, 42 },  { 4000, 35 }, { 3950, 28 }, { 3900, 22 },
-+	{ 3850, 17 },  { 3800, 13 }, { 3750, 9 },  { 3700, 6 },
-+	{ 3650, 4 },   { 3600, 2 },  { 3550, 1 },  { 3500, 0 },
-+};
 +
 +static int
-+batt_pct_from_mv(int mv)
++liuqin_batt_pct(void)
 +{
-+	const unsigned n = sizeof(batt_curve) / sizeof(batt_curve[0]);
++	int pct = 0;
 +
-+	if (mv <= 0) {
-+		return -1;
++	if (PE_parse_boot_argn("liuqinbattpct", &pct, sizeof(pct)) &&
++	    pct >= 1 && pct <= 100) {
++		return pct;
 +	}
-+	if (mv >= batt_curve[0].mv) {
-+		return 100;
-+	}
-+	for (unsigned i = 1; i < n; i++) {
-+		if (mv >= batt_curve[i].mv) {
-+			const int hi_mv = batt_curve[i - 1].mv;
-+			const int lo_mv = batt_curve[i].mv;
-+			const int hi_pct = batt_curve[i - 1].pct;
-+			const int lo_pct = batt_curve[i].pct;
-+			return lo_pct + ((mv - lo_mv) * (hi_pct - lo_pct)) /
-+			    (hi_mv - lo_mv);
-+		}
-+	}
-+	return 0;
++	return LIUQIN_BATT_DEFAULT_PCT;
++}
++
++static bool
++liuqin_batt_charging(void)
++{
++	int on = 0;
++
++	return PE_parse_boot_argn("liuqinbattcharging", &on, sizeof(on)) &&
++	    on != 0;
 +}
 +
 +/* ---------------------------------------------------------------- classes */
@@ -755,11 +78,6 @@
 +	OSDeclareDefaultStructors(AppleSmartBattery);
 +public:
 +	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
-+	virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
-+	void refresh();
-+private:
-+	IOTimerEventSource *fTimer;
-+	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
 +};
 +
 +class AppleSmartBatteryManager : public IOService {
@@ -810,22 +128,26 @@
 +bool
 +AppleSmartBattery::start(IOService *provider)
 +{
++	const int pct = liuqin_batt_pct();
++	const bool ext = liuqin_batt_charging();
++	const unsigned mAh = (unsigned)((unsigned long)LIUQIN_BATT_MAX_MAH *
++	    (unsigned long)pct / 100u);
++
 +	if (!super::start(provider)) {
 +		return false;
 +	}
-+	fTimer = NULL;
 +
 +	setBatteryInstalled(true);
-+	setExternalConnected(false);
++	setExternalConnected(ext);
 +	setExternalChargeCapable(true);
-+	setIsCharging(false);
-+	setAtWarnLevel(false);
++	setIsCharging(ext && pct < 100);
++	setAtWarnLevel(false);      /* never - the value is not a measurement */
 +	setAtCriticalLevel(false);
-+	setCurrentCapacity(0);
++	setCurrentCapacity(mAh);
 +	setMaxCapacity(LIUQIN_BATT_MAX_MAH);
-+	setTimeRemaining(-1);
++	setTimeRemaining(-1);       /* computing runtime would be fiction */
 +	setAmperage(0);
-+	setVoltage(0);
++	setVoltage(3900);           /* nominal only, not measured */
 +	setCycleCount(1);
 +	setAdapterInfo(0);
 +	setLocation(0);
@@ -835,96 +157,22 @@
 +	setSerial(const_cast<OSSymbol *>(OSSymbol::withCString("LIUQIN")));
 +	gKeyNominal = OSSymbol::withCString("NominalChargeCapacity");
 +	setPSProperty(OSSymbol::withCString("FullyCharged"),
-+	    OSBoolean::withBoolean(false));
++	    OSBoolean::withBoolean(pct >= 100));
 +	setPSProperty(OSSymbol::withCString("BatteryType"),
 +	    const_cast<OSSymbol *>(OSSymbol::withCString("InternalBattery")));
 +	setPSProperty(OSSymbol::withCString("DesignCapacity"),
 +	    OSNumber::withNumber((unsigned long long)LIUQIN_BATT_MAX_MAH, 32));
 +	setPSProperty(gKeyNominal,
-+	    OSNumber::withNumber((unsigned long long)LIUQIN_BATT_MAX_MAH, 32));
++	    OSNumber::withNumber((unsigned long long)mAh, 32));
 +	setPSProperty(OSSymbol::withCString("PermanentFailureStatus"),
 +	    OSNumber::withNumber(0ull, 32));
 +	updateStatus();
 +
-+	fTimer = IOTimerEventSource::timerEventSource(this,
-+	    &AppleSmartBattery::timerFired);
-+	if (fTimer != NULL &&
-+	    getWorkLoop()->addEventSource(fTimer) == kIOReturnSuccess) {
-+		fTimer->setTimeoutMS(5000);
-+	} else {
-+		printf("LIUQIN BATT: no refresh timer\n");
-+	}
-+
 +	registerService();
-+	printf("LIUQIN BATT: AppleSmartBattery published (id 0x%llx)\n",
-+	    (unsigned long long)getRegistryEntryID());
++	printf("LIUQIN BATT: AppleSmartBattery published (id 0x%llx): "
++	    "PLACEHOLDER %d%% (no fuel gauge reachable from the AP)\n",
++	    (unsigned long long)getRegistryEntryID(), pct);
 +	return true;
-+}
-+
-+void
-+AppleSmartBattery::stop(IOService *provider)
-+{
-+	if (fTimer != NULL) {
-+		getWorkLoop()->removeEventSource(fTimer);
-+		fTimer->release();
-+		fTimer = NULL;
-+	}
-+	super::stop(provider);
-+}
-+
-+void
-+AppleSmartBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
-+{
-+	AppleSmartBattery *self = OSDynamicCast(AppleSmartBattery, owner);
-+
-+	if (self != NULL) {
-+		self->refresh();
-+		if (sender != NULL) {
-+			sender->setTimeoutMS(20000);
-+		}
-+	}
-+}
-+
-+void
-+AppleSmartBattery::refresh()
-+{
-+	int mv = 0, sum = 0, good = 0, pct;
-+	int vbus = 0;
-+	uint32_t code = 0;
-+
-+	for (int i = 0; i < 4; i++) {
-+		mv = batt_read_vbat_mv(&code);
-+		if (mv > 0) {
-+			sum += mv;
-+			good++;
-+		}
-+		delay(1000);
-+	}
-+	if (good == 0) {
-+		printf("LIUQIN BATT: no ADC answer this round\n");
-+		return;
-+	}
-+	mv = sum / good;
-+	pct = batt_pct_from_mv(mv);
-+	if (pct < 0) {
-+		return;
-+	}
-+	vbus = batt_read_vbus_mv();
-+	const bool ext = vbus > 4000;
-+	printf("LIUQIN BATT: vbat %d mV (code %u, %d/4 ok), vbus %d mV -> %d%%%s\n",
-+	    mv, code, good, vbus, pct, ext ? " external" : "");
-+
-+	setVoltage((unsigned int)mv);
-+	setCurrentCapacity((unsigned int)(LIUQIN_BATT_MAX_MAH * pct / 100));
-+	setTimeRemaining(pct * 7);          /* ~11.7 h at 100 % */
-+	setAtWarnLevel(pct <= 15);
-+	setAtCriticalLevel(pct <= 5);
-+	setExternalConnected(ext);
-+	setIsCharging(ext && pct < 100);
-+	setPSProperty(gKeyNominal,
-+	    OSNumber::withNumber((unsigned long long)
-+	    (LIUQIN_BATT_MAX_MAH * pct / 100), 32));
-+	updateStatus();
 +}
 +#undef super
 +
@@ -933,132 +181,8 @@
 +static void
 +liuqin_battery_thread(__unused void *arg, __unused wait_result_t wr)
 +{
-+	uint32_t mv, code = 0;
-+	int mv4 = 0, good = 0;
 +	IOService *res;
 +	AppleSmartBatteryManager *mgr;
-+
-+	/* Map the arbiter and find the ADC7 root in the APID table. */
-+	batt_core = ml_io_map(SPMI_CORE_PA, SPMI_CORE_SIZE);
-+	batt_cfg0 = ml_io_map(SPMI_CFG0_PA, SPMI_CFG_SIZE);
-+	batt_cfg1 = ml_io_map(SPMI_CFG1_PA, SPMI_CFG_SIZE);
-+	batt_obs = ml_io_map(SPMI_OBS_PA, SPMI_OBS_SIZE);
-+	batt_chnls = ml_io_map(SPMI_CHNLS_PA, SPMI_CHNLS_SIZE);
-+	if (batt_core == 0 || batt_obs == 0 || batt_chnls == 0) {
-+		printf("LIUQIN BATT: SPMI map failed\n");
-+		return;
-+	}
-+	{
-+		const uint32_t arb_version = brd(batt_core, SPMI_REG_VERSION);
-+		const uint32_t features0 = brd(batt_core, SPMI_REG_FEATURES0);
-+		const uint32_t features1 = brd(batt_core, SPMI_REG_FEATURES1);
-+		uint32_t count = features0 & SPMI_FEATURES_MASK;
-+
-+		batt_bus0_apids = count;
-+		batt_bus1_apids = features1 & SPMI_FEATURES_MASK;
-+		printf("LIUQIN BATT: arbiter 0x%08x, bus0 %u apids, bus1 %u\n",
-+		    arb_version, batt_bus0_apids, batt_bus1_apids);
-+		if (arb_version < 0x70000000u || arb_version >= 0x80000000u) {
-+			printf("LIUQIN BATT: not a v7 arbiter\n");
-+			return;
-+		}
-+		if (count == 0 || count > SPMI_APID_MAX) {
-+			printf("LIUQIN BATT: bad bus0 APID count\n");
-+			return;
-+		}
-+		if (batt_bus1_apids > SPMI_APID_MAX - count) {
-+			batt_bus1_apids = SPMI_APID_MAX - count;
-+		}
-+		/* one global table at core + 0x2000, all 1024 APIDs */
-+		for (uint32_t apid = 0; apid < count + batt_bus1_apids &&
-+		    apid < SPMI_APID_MAX; apid++) {
-+			const uint32_t m = brd(batt_core, SPMI_APID_MAP(apid));
-+			const uint32_t ppid = (m >> 8) & SPMI_PPID_MASK;
-+
-+			if (m != 0 && ppid == LIUQIN_ADC_PPID) {
-+				batt_adc_apid = apid;
-+				printf("LIUQIN BATT: ADC7 root (ppid 0x031) at apid %u\n",
-+				    apid);
-+				break;
-+			}
-+		}
-+	}
-+	if (batt_adc_apid == (uint32_t)-1) {
-+		printf("LIUQIN BATT: no ADC7 root in the APID map, stopping\n");
-+		return;
-+	}
-+
-+	/*
-+	 * Diagnostics, in the order that separates the hypotheses:
-+	 *   1. who owns the peripherals (calibrated against the SID 3
-+	 *      peripherals TWRP's own kernel refuses to write);
-+	 *   2. the ADC's enable/request/SID state and whether its DATA
-+	 *      updates on its own (an ADSP left running would convert);
-+	 *   3. whether any write path lands, and if not, stop.
-+	 */
-+	batt_owner_scan();
-+	batt_adc_state();
-+	/*
-+	 * Read-only: is there a battery value the AP can see without writes?
-+	 * (runs first - pure reads cannot wedge the arbiter)
-+	 */
-+	batt_dump_sid3();
-+	/* Does the arbiter see our writes at all? */
-+
-+	/* Wake the slave: a sleeping peripheral drops writes silently. */
-+	batt_adc_sleepctl(6u, "wakeup");
-+	batt_write_probe();
-+	if (batt_write_path < 0) {
-+		/* Still frozen: reset the peripheral, then wake it again. */
-+		batt_adc_sleepctl(3u, "reset");
-+		batt_adc_sleepctl(6u, "wakeup again");
-+		batt_write_probe();
-+	}
-+	{
-+		uint8_t rev[2] = { 0, 0 };
-+		uint8_t s1 = 0, s2 = 0;
-+
-+		if (batt_spmi_read(batt_adc_apid, 0x00u, rev, 2) == 0 &&
-+		    batt_spmi_read(batt_adc_apid, ADC_USR_STATUS1, &s1, 1) == 0 &&
-+		    batt_spmi_read(batt_adc_apid, ADC_USR_STATUS2, &s2, 1) == 0) {
-+			printf("LIUQIN BATT: adc rev %02x %02x status1 0x%02x "
-+			    "status2 0x%02x\n", rev[0], rev[1], s1, s2);
-+		}
-+	}
-+	if (batt_write_path < 0) {
-+		printf("LIUQIN BATT: no working write path, stopping - "
-+		    "no battery published\n");
-+		return;
-+	}
-+	{
-+		const int gnd = batt_read_mv(0, 0x00u, 1, NULL);
-+		const int ref = batt_read_mv(0, 0x01u, 1, NULL);
-+		printf("LIUQIN BATT: cal ref_gnd %d mV, vref_1p25 %d mV "
-+		    "(expect 0 / 1250)\n", gnd, ref);
-+	}
-+
-+	/* Probe the battery channel before publishing anything. */
-+	for (int i = 0; i < 4; i++) {
-+		mv = (uint32_t)batt_read_vbat_mv(&code);
-+		if ((int)mv > 0) {
-+			mv4 += mv;
-+			good++;
-+		}
-+		delay(1000);
-+	}
-+	if (good == 0) {
-+		printf("LIUQIN BATT: ADC7 probe failed, stopping - "
-+		    "no battery published\n");
-+		return;
-+	}
-+	mv4 /= good;
-+	printf("LIUQIN BATT: probe vbat %d mV -> %d%%\n", mv4,
-+	    batt_pct_from_mv(mv4));
-+	if (mv4 < 2500 || mv4 > 4600) {
-+		printf("LIUQIN BATT: probe implausible (%d mV), stopping - "
-+		    "no battery published\n", mv4);
-+		return;
-+	}
 +
 +	res = IOService::waitForService(IOService::serviceMatching("IOResources"));
 +	if (res == NULL) {
