@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/LiuqinBattery.cpp
 +++ b/iokit/Kernel/arm/LiuqinBattery.cpp
-@@ -0,0 +1,1052 @@
+@@ -0,0 +1,1092 @@
 +/*
 + * LIUQIN: the battery the iOS UI reads.
 + *
@@ -354,6 +354,41 @@
 +}
 +
 +/*
++ * Differential sampler: re-read the charger block (SID 3 periph 0x16) every
++ * 15 s for ~6 minutes and print the live registers.  Run it with the cable
++ * plugged, then unplugged, then plugged again: registers that follow the
++ * cable are VBUS-related, the one that only drifts is the battery.
++ * Read-only by design (writes to this arbiter can wedge the boot).
++ */
++static void
++batt_sample_loop(uint32_t apid)
++{
++	for (int n = 0; n < 24; n++) {
++		for (uint32_t off = 0x40u; off < 0x60u; off += 8u) {
++			uint8_t b[8];
++
++			if (batt_spmi_read(apid, off, b, sizeof(b)) == 0) {
++				printf("LIUQIN BATT: s%02d %02x: %02x %02x %02x "
++				    "%02x %02x %02x %02x %02x\n", n, off, b[0],
++				    b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
++			}
++		}
++		for (uint32_t off = 0x80u; off < 0xa0u; off += 8u) {
++			uint8_t b[8];
++
++			if (batt_spmi_read(apid, off, b, sizeof(b)) == 0) {
++				printf("LIUQIN BATT: s%02d %02x: %02x %02x %02x "
++				    "%02x %02x %02x %02x %02x\n", n, off, b[0],
++				    b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
++			}
++		}
++		for (int ms = 0; ms < 1500; ms++) {
++			delay(10);
++		}
++	}
++}
++
++/*
 + * Read-only hunt for a battery value the AP can actually see.
 + *
 + * The charger inside PM8350B (SID 3) has its own hardware ADCs and status
@@ -402,6 +437,11 @@
 +				printf(" %02x", b[i]);
 +			}
 +			printf("\n");
++		}
++		if (want[w] == 0x16u) {
++			/* the charger block: sample it while the user plugs
++			 * and unplugs the cable */
++			batt_sample_loop(apid);
 +		}
 +	}
 +}
