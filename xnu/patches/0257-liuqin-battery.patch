@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/LiuqinBattery.cpp
 +++ b/iokit/Kernel/arm/LiuqinBattery.cpp
-@@ -0,0 +1,938 @@
+@@ -0,0 +1,963 @@
 +/*
 + * LIUQIN: the battery the iOS UI reads.
 + *
@@ -354,13 +354,35 @@
 +}
 +
 +/*
-+ * SPMI sleep/wakeup control.  A sleeping slave freezes its register file:
-+ * writes are dropped, reads return the frozen image and the revision reads
-+ * 0 - exactly what the ADC shows (en_ctl1 0x00, rev 00 00, writes dropped
-+ * with a DONE status).  The arbiter's SLEEP(4)/RESET(3)/WAKEUP(6) opcodes
-+ * are addressed to the peripheral itself; send them through the same write
-+ * channel and log the status.
++ * Does the arbiter itself see our writes?  Write a recognisable word to
++ * the channel's WDATA0 and to CMD, read both back.  If they read back as
++ * written the arbiter received them and the loss is downstream (the PMIC
++ * slave); if they read 0 the writes never reach the chnls region at all.
 + */
++static void
++batt_arb_regback(void)
++{
++	const uint32_t page = 0x1000u * batt_adc_apid;
++	const uint32_t wpat = 0x5AA5C33Cu;
++	const uint32_t cpat = (SPMI_OP_WRITE << 27) | (0x42u << 4) | 3u;
++
++	bwr(batt_chnls, page + SPMI_CH_WDATA0, wpat);
++	bwr(batt_chnls, page + SPMI_CH_CMD, cpat);
++	printf("LIUQIN BATT: arb regback: WDATA 0x%08x (wrote 0x%08x), "
++	    "CMD 0x%08x (wrote 0x%08x), STATUS 0x%08x\n",
++	    brd(batt_chnls, page + SPMI_CH_WDATA0), wpat,
++	    brd(batt_chnls, page + SPMI_CH_CMD), cpat,
++	    brd(batt_chnls, page + SPMI_CH_STATUS));
++	/* the same two registers in the observer region, for comparison */
++	{
++		const uint32_t opage = 0x20u * batt_adc_apid;
++
++		bwr(batt_obs, opage + SPMI_CH_CMD, cpat);
++		printf("LIUQIN BATT: arb regback obs: CMD 0x%08x, STATUS 0x%08x\n",
++		    brd(batt_obs, opage + SPMI_CH_CMD),
++		    brd(batt_obs, opage + SPMI_CH_STATUS));
++	}
++}
 +static void
 +batt_adc_sleepctl(unsigned opc, const char *what)
 +{
@@ -851,6 +873,9 @@
 +	 */
 +	batt_owner_scan();
 +	batt_adc_state();
++	/* Does the arbiter see our writes at all? */
++	batt_arb_regback();
++
 +	/* Wake the slave: a sleeping peripheral drops writes silently. */
 +	batt_adc_sleepctl(6u, "wakeup");
 +	batt_write_probe();
