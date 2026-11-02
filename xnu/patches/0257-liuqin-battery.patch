@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/LiuqinBattery.cpp
 +++ b/iokit/Kernel/arm/LiuqinBattery.cpp
-@@ -0,0 +1,824 @@
+@@ -0,0 +1,909 @@
 +/*
 + * LIUQIN: the battery the iOS UI reads.
 + *
@@ -269,6 +269,87 @@
 +	}
 +	if (st1_out != NULL) {
 +		*st1_out = st;
++	}
++}
++
++/*
++ * Ownership forensics.  The stock system's ADSP charger firmware owns the
++ * PMIC peripherals it drives (TWRP's own kernel log shows "disallowed SPMI
++ * write to sid=3, addr=0x8941" for PM8350B's GPIOs), and the vendor Linux
++ * kernel cannot configure the ADC either ("Error applying setting, reverse
++ * things back") - the battery numbers on this tablet come from the ADSP
++ * over GLINK, not from the AP.
++ *
++ * This scan prints every peripheral another EE owns (calibration: SID 3
++ * peripherals must show up, which proves our owner-table read matches the
++ * driver's), then tries to take the ADC's channel for EE 0.
++ */
++static void
++batt_owner_scan(void)
++{
++	uint32_t owned = 0;
++
++	for (uint32_t apid = 0; apid < batt_bus0_apids + batt_bus1_apids &&
++	    apid < SPMI_APID_MAX; apid++) {
++		const vm_offset_t reg = (apid < batt_bus0_apids) ?
++		    batt_cfg0 : batt_cfg1;
++		const uint32_t off = (apid < batt_bus0_apids) ? (4u * apid) :
++		    (4u * (apid - batt_bus0_apids));
++		const uint32_t m = brd(batt_core, SPMI_APID_MAP(apid));
++		uint32_t w;
++
++		if (m == 0 || reg == 0) {
++			continue;
++		}
++		w = brd(reg, off);
++		if ((w & 0x7u) != 0) {
++			if (owned < 12) {
++				printf("LIUQIN BATT: owner: apid %u ppid 0x%03x "
++				    "-> EE %u (raw 0x%08x)\n", apid,
++				    (m >> 8) & SPMI_PPID_MASK, w & 0x7u, w);
++			}
++			owned++;
++		}
++	}
++	printf("LIUQIN BATT: owner: %u peripherals belong to another EE\n",
++	    owned);
++
++	if (batt_cfg0 != 0) {
++		const uint32_t off = 4u * batt_adc_apid;
++		const uint32_t w = brd(batt_cfg0, off);
++
++		printf("LIUQIN BATT: owner adc apid %u: raw 0x%08x (EE %u)\n",
++		    batt_adc_apid, w, w & 0x7u);
++		if ((w & 0x7u) != 0) {
++			bwr(batt_cfg0, off, w & ~0x7u);
++			printf("LIUQIN BATT: owner steal -> raw 0x%08x (EE %u)\n",
++			    brd(batt_cfg0, off), brd(batt_cfg0, off) & 0x7u);
++		}
++	}
++}
++
++/* The ADC's own enable/request/SID state, and whether DATA moves alone. */
++static void
++batt_adc_state(void)
++{
++	uint8_t en = 0, cq = 0, sid = 0, d0a = 0, d1a = 0, d0b = 0, d1b = 0;
++
++	(void)batt_spmi_read(batt_adc_apid, ADC_USR_EN_CTL1, &en, 1);
++	(void)batt_spmi_read(batt_adc_apid, ADC_USR_CONV_REQ, &cq, 1);
++	(void)batt_spmi_read(batt_adc_apid, ADC_APP_SID, &sid, 1);
++	(void)batt_spmi_read(batt_adc_apid, ADC_USR_DATA0, &d0a, 1);
++	(void)batt_spmi_read(batt_adc_apid, ADC_USR_DATA1, &d1a, 1);
++	printf("LIUQIN BATT: adc en_ctl1 0x%02x conv_req 0x%02x app_sid 0x%02x "
++	    "data 0x%02x%02x\n", en, cq, sid, d1a, d0a);
++	delay(3000);
++	(void)batt_spmi_read(batt_adc_apid, ADC_USR_DATA0, &d0b, 1);
++	(void)batt_spmi_read(batt_adc_apid, ADC_USR_DATA1, &d1b, 1);
++	if (d0a != d0b || d1a != d1b) {
++		printf("LIUQIN BATT: data moved on its own -> 0x%02x%02x "
++		    "(something else is converting)\n", d1b, d0b);
++	} else {
++		printf("LIUQIN BATT: data static for 3 s (no autonomous "
++		    "conversions)\n");
 +	}
 +}
 +
@@ -740,11 +821,15 @@
 +	}
 +
 +	/*
-+	 * Find a write path the ADC actually honours, then look at the ADC's
-+	 * own state (revision, STATUS1/STATUS2 fault bits) before trusting a
-+	 * conversion.  nts9 proved the arbiter answers DONE for writes that
-+	 * never change the register, so a landing write is a prerequisite.
++	 * Diagnostics, in the order that separates the hypotheses:
++	 *   1. who owns the peripherals (calibrated against the SID 3
++	 *      peripherals TWRP's own kernel refuses to write);
++	 *   2. the ADC's enable/request/SID state and whether its DATA
++	 *      updates on its own (an ADSP left running would convert);
++	 *   3. whether any write path lands, and if not, stop.
 +	 */
++	batt_owner_scan();
++	batt_adc_state();
 +	batt_write_probe();
 +	{
 +		uint8_t rev[2] = { 0, 0 };
