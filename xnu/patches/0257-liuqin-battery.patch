@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/LiuqinBattery.cpp
 +++ b/iokit/Kernel/arm/LiuqinBattery.cpp
-@@ -0,0 +1,825 @@
+@@ -0,0 +1,824 @@
 +/*
 + * LIUQIN: the battery the iOS UI reads.
 + *
@@ -281,8 +281,7 @@
 + *   B: chnls page, opcode 2  (EXT_WRITE)
 + *   C: observer page, opcode 14
 + */
-+static int batt_write_path;    /* 0 = chnls/14, 1 = chnls/2, 2 = obs/14, -1 = none */
-+
++/* (batt_write_path is declared with the other globals above) */
 +static void
 +batt_write_probe(void)
 +{
