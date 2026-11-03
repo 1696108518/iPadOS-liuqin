@@ -1,0 +1,44 @@
+--- a/iokit/NativeAdreno/RedwoodGpuGlue.cpp
++++ b/iokit/NativeAdreno/RedwoodGpuGlue.cpp
+@@ -31,6 +31,10 @@
+     const NativeAdrenoAbiDeviceInfo *info = nullptr;
+     uint32_t input_bits = 32, output_bits = 40;
+     bool ready = false;
++    /* GPU VA [0, kGuardBytes) held so user BOs never land on the address the
++     * CP refuses to fetch an indirect buffer from (see liuqin_redwood_core). */
++    NativeAdrenoMemory *guard = nullptr;
++    uint64_t guard_handle = 0;
+ };
+ RedwoodGpuCore gRedwood;
+ 
+@@ -64,6 +68,30 @@
+     gRedwood.input_bits = input_bits;
+     gRedwood.output_bits = output_bits;
+     gRedwood.ready = vm && execbuf && ring;
++    if (!gRedwood.ready) return;
++    /* The kernel's own GPU buffers start at 0x100000, and this board's CP does
++     * not retire an indirect buffer fetched from GPU address 0: the first
++     * userland submission was queued (ring commit ok, fence 4) and never
++     * completed. Hold the first MiB of the arena with a mapping the GPU never
++     * touches, so findAddress starts handing out addresses above it. */
++    const uint64_t kGuardBytes = 0x100000;
++    NativeAdrenoMemory *guard = new NativeAdrenoMemory;
++    if (guard && !guard->allocate((size_t)kGuardBytes, gRedwood.output_bits, false,
++            (size_t)kGuardBytes, false)) {
++        uint64_t handle = 0;
++        if (!gRedwood.vm->map(guard, 0, 0, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3, &handle)) {
++            gRedwood.guard = guard;
++            gRedwood.guard_handle = handle;
++        } else {
++            IOLog("RedwoodGPU: GPU VA guard 0..0x%llx could not be mapped\n",
++                (unsigned long long)kGuardBytes);
++            (void)guard->release();
++        }
++    } else if (guard) {
++        IOLog("RedwoodGPU: GPU VA guard allocation of 0x%llx failed\n",
++            (unsigned long long)kGuardBytes);
++        (void)guard->release();
++    }
+ }
+ 
+ extern "C" bool liuqin_redwood_ready(void)
