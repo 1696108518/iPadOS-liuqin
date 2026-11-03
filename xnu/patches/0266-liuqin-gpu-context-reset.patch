@@ -1,0 +1,16 @@
+--- a/iokit/NativeAdreno/RedwoodGpuGlue.cpp
++++ b/iokit/NativeAdreno/RedwoodGpuGlue.cpp
+@@ -92,6 +92,13 @@
+             (unsigned long long)kGuardBytes);
+         (void)guard->release();
+     }
++    /* Nothing has asked for the A7XX context entry on this ring yet: only
++     * NativeAdrenoUserClient::open() calls requestContextReset(), and the legacy
++     * client's open failed at boot (client=FAILED). Without the context entry
++     * the first framed prologue stopped after exactly its two-word BR/BV
++     * CP_THREAD_CONTROL (rptr 37 -> 39, no CP fault), so have the next framed
++     * submission carry the a6xx_set_pagetable() sequence first. */
++    ring->requestContextReset();
+ }
+ 
+ extern "C" bool liuqin_redwood_ready(void)
