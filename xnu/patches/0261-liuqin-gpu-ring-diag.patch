@@ -1,0 +1,50 @@
+--- a/iokit/NativeAdreno/NativeAdrenoRing.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoRing.cpp
+@@ -217,7 +217,11 @@
+     const uint32_t extra=framed?RingPrologueWords+(reset?RingResetWords:0)+RingFramedFenceWords:RingFenceWords;
+     if(word_count>size_words-extra-8)return kIOReturnNoResources;
+     uint32_t rptr=0;IOReturn status=readRptr(&rptr);
+-    if(status)return status;
++    if(status) {
++        static uint32_t once;
++        if(once++<8) IOLog("NativeAdrenoRing diag: readRptr 0x%x next=%u\n",status,(unsigned)next_);
++        return status;
++    }
+     const uint32_t used=(next_-rptr)&mask;
+     if(word_count+extra+8>size_words-used)return kIOReturnNoResources;
+     uint32_t at=next_;
+@@ -240,9 +244,31 @@
+         for(uint32_t i=0;i<112;++i)record[4+i]=i<total?ring_[(next_+i)&mask]:0;
+         native_adreno_ring_log_count=native_adreno_ring_log_count+1;
+     }
+-    if(cache_.publish(cache_.cookie,ring_,ring_bytes_))return poison();
+-    if(io_.barrier(io_.cookie))return poison();
+-    if(io_.write32(io_.cookie,RingWptr,end))return poison();
++    IOReturn publish_status=cache_.publish(cache_.cookie,ring_,ring_bytes_);
++    if(publish_status) {
++        static uint32_t once;
++        if(once++<8) IOLog("NativeAdrenoRing diag: publish 0x%x bytes %zu\n",
++            publish_status,ring_bytes_);
++        return poison();
++    }
++    IOReturn barrier_status=io_.barrier(io_.cookie);
++    if(barrier_status) {
++        static uint32_t once;
++        if(once++<8) IOLog("NativeAdrenoRing diag: barrier 0x%x\n",barrier_status);
++        return poison();
++    }
++    IOReturn doorbell_status=io_.write32(io_.cookie,RingWptr,end);
++    if(doorbell_status) {
++        static uint32_t once;
++        if(once++<8) IOLog("NativeAdrenoRing diag: wptr write 0x%x end=%u rptr=%u\n",
++            doorbell_status,(unsigned)end,(unsigned)rptr);
++        return poison();
++    }
++    {
++        static uint32_t once;
++        if(once++<8) IOLog("NativeAdrenoRing diag: commit ok end=%u rptr=%u used=%u words=%zu\n",
++            (unsigned)end,(unsigned)rptr,(unsigned)((next_-rptr)&mask),word_count);
++    }
+     next_=end;*fence=++seqno_;++submissions_;
+     if(reset)reset_pending_=false;
+     return kIOReturnSuccess;
