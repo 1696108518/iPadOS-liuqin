@@ -1,16 +1,21 @@
 --- a/iokit/NativeAdreno/NativeAdrenoRing.cpp
 +++ b/iokit/NativeAdreno/NativeAdrenoRing.cpp
-@@ -67,6 +67,9 @@
+@@ -67,6 +67,14 @@
  /* The last submissions as the CP will read them: [slot] fence, start index, end index, word count, then up to 112 ring words from the start. The board log
   * prints them, so a fence the GPU never wrote can be compared with the packets that should have written it. */
  extern "C" {volatile uint32_t native_adreno_ring_log[4][4+112];volatile uint32_t native_adreno_ring_log_count;}
-+extern "C" {volatile uint32_t native_adreno_ib_log[4][4+28];volatile uint32_t native_adreno_ib_log_count;}
-+extern "C" {volatile uint32_t native_adreno_coherence[8];}
-+extern "C" {volatile uint32_t native_adreno_wc_audit[6];volatile uint32_t native_adreno_wc_distrusted;}
++/* The submission path's records, defined in NativeAdrenoSubmit.cpp. Inside an
++ * extern "C" block a plain declaration is a definition on this tree, so these
++ * are declared with the explicit `extern "C" extern` form. */
++extern "C" extern volatile uint32_t native_adreno_ib_log[4][4+28];
++extern "C" extern volatile uint32_t native_adreno_ib_log_count;
++extern "C" extern volatile uint32_t native_adreno_coherence[8];
++extern "C" extern volatile uint32_t native_adreno_wc_audit[6];
++extern "C" extern volatile uint32_t native_adreno_wc_distrusted;
  IOReturn NativeAdrenoRing::poison()
  {
      poisoned_=true;return kIOReturnIOError;
-@@ -80,17 +83,41 @@
+@@ -80,17 +88,41 @@
      /* The CP wrote the memptrs page; drop what this CPU may still cache. */
      (void)cache_.acquire(cache_.cookie,fence_,fence_bytes_);
      uint32_t rptr=0xffffffffu,wptr=0xffffffffu,fault=0xffffffffu,cpint=0xffffffffu,rbbm=0xffffffffu;
