@@ -65,7 +65,7 @@ diff --git a/iokit/NativeAdreno/RedwoodGpuGlue.cpp b/iokit/NativeAdreno/RedwoodG
 new file mode 100644
 --- /dev/null
 +++ b/iokit/NativeAdreno/RedwoodGpuGlue.cpp
-@@ -0,0 +1,234 @@
+@@ -0,0 +1,238 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/* The RedwoodGPU face's primitives on this board (see RedwoodGpuGlue.h).
 + *
@@ -82,6 +82,10 @@ new file mode 100644
 +#include <vm/vm_kern.h>
 +#include "RedwoodGpuGlue.h"
 +#include "NativeAdrenoKernelTime.h"
++
++/* osfmk/arm/machine_routines.h, which <machine/...> does not expose to C++
++ * here; the same mapping the ladder's step 22 uses for the framebuffer. */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +
 +extern "C" {volatile uint32_t native_adreno_wc_enabled;}
 +
