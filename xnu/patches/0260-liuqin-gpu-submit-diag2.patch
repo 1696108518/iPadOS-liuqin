@@ -1,0 +1,55 @@
+--- a/iokit/NativeAdreno/NativeAdrenoRing.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoRing.cpp
+@@ -116,7 +116,12 @@
+     if(n)n=packet(words,n,RingWaitForIdle,nullptr,0);
+     if(n)n=packet(words,n,RingThreadControl,&both,1);
+     if(n)n=packet(words,n,RingSetMarker,&marker,1);
+-    if(n!=count)return poison();
++    if(n!=count) {
++        static uint32_t once;
++        if(once++<8) IOLog("NativeAdrenoRing diag: prologue n=%u count=%u reset=%u\n",
++            (unsigned)n,(unsigned)count,(unsigned)reset);
++        return poison();
++    }
+     for(uint32_t i=0;i<count;++i)ring_[(at+i)&mask]=words[i];
+     *end=(at+count)&mask;return kIOReturnSuccess;
+ }
+--- a/iokit/NativeAdreno/NativeAdrenoSubmit.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoSubmit.cpp
+@@ -2,6 +2,7 @@
+ #include "NativeAdrenoSubmit.h"
+ #include "AdrenoPM4.h"
+ #include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
+ 
+ /* CP_INDIRECT_BUFFER is opcode 0x3f with a 3-word payload: 64-bit GPU address
+  * and IB_SIZE in dwords (bits 0..19), exactly as the pinned adreno_pm4.xml
+@@ -177,7 +178,15 @@
+         for(unsigned i=0;i<28;++i)native_adreno_ib_log[slot][4+i]=head[i];
+         native_adreno_ib_log_count=native_adreno_ib_log_count+1;
+     }
+-    status=ring_->submitFramed(words,word_count,&value);
++    {
++        /* sheng-gpu-unframed=1: hand user IBs to the ring without the A7XX
++         * BR/BV thread framing (the plain path the kernel's own packets use),
++         * to tell a framing encoder problem from a ring problem. */
++        static uint32_t unframed=0xffffffffu;
++        uint32_t parsed=0;
++        if(unframed==0xffffffffu) unframed=(PE_parse_boot_argn("sheng-gpu-unframed",&parsed,sizeof(parsed))&&parsed)?1u:0u;
++        status=unframed?ring_->submit(words,word_count,&value):ring_->submitFramed(words,word_count,&value);
++    }
+     if(status) {
+         /* A poisoned ring may already have consumed the WPTR write, so the
+          * referenced buffers cannot be retired here. */
+--- a/iokit/NativeAdreno/NativeAdrenoPublish.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoPublish.cpp
+@@ -695,6 +695,9 @@
+     if(capped)refusal=kIOReturnBusy;
+     else if(!connection->mount(kernel))refusal=kIOReturnBusy;   /* every slot taken */
+     if(refusal) {
++        static uint32_t said;
++        if(said++<8) IOLog("NativeAdreno diag: mount refused 0x%x opener %s capped %u kernel %u\n",
++            refusal,opener,capped?1u:0u,kernel?1u:0u);
+         connection->release();
+         native_adreno_metal_diag.busy=native_adreno_metal_diag.busy+1;
+         IOLockLock(g.lock);
