@@ -1,0 +1,76 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -103,6 +103,10 @@
+     bool core_ready_=false;
+     struct RingCache {NativeAdrenoMemory *ring;NativeAdrenoMemory *fence;};
+     RingCache ring_cache_{};
++    /* The ring and interrupt adapters keep a pointer to the GPU register window
++     * for the whole service lifetime, so the window must not live in start()'s
++     * frame; it is allocated there once and kept (never freed: one service). */
++    NativeAdrenoGpuWindow *gpu_window_=nullptr;
+     /* The CP ring and fence are the GPU context's own buffers; their cache
+      * maintenance goes through the physical pages those buffers own. */
+     struct GpuCtxCache {
+@@ -1130,6 +1134,11 @@
+                                         fence_cpu_=fence_cpu;
+                                         IOReturn ring_status=NativeAdrenoGpuContextBuffers(b);
+                                         if(!ring_status && (!ring_cpu || !fence_cpu || !pwrup_cpu))ring_status=kIOReturnNotReady;
++                                        NativeAdrenoGpuWindow *gpu_window=new NativeAdrenoGpuWindow;
++                                        if(!ring_status && !gpu_window) {
++                                            IOLog("NativeAdreno: GPU register window allocation failed\n");
++                                            ring_status=kIOReturnNoMemory;
++                                        }
+                                         if(ring_status) {
+                                             IOLog("NativeAdreno: CP ring: buffers unavailable 0x%x\n",ring_status);
+                                         } else {
+@@ -1140,15 +1149,15 @@
+                                              * are dropped (CP_SQE_INSTR_BASE read back 0).
+                                              * Read a version register through both and keep
+                                              * the window that answers. */
+-                                            NativeAdrenoGpuWindow gpu_window={
+-                                                reinterpret_cast<volatile uint8_t *>(maps_[0]->getVirtualAddress()),
++                                            *gpu_window={reinterpret_cast<volatile uint8_t *>(maps_[0]->getVirtualAddress()),
+                                                 static_cast<size_t>(windows[0].bytes)};
++                                            gpu_window_=gpu_window;
+                                             {
+                                                 /* The GX domain needs a moment after the HFI vote. */
+                                                 IOSleep(20);
+                                                 uint32_t adt_id=0,adt_status=0,dt_id=0,dt_status=0;
+-                                                (void)gpu_read32(&gpu_window,0x0000,&adt_id);
+-                                                (void)gpu_read32(&gpu_window,0x0210,&adt_status);
++                                                (void)gpu_read32(gpu_window,0x0000,&adt_id);
++                                                (void)gpu_read32(gpu_window,0x0210,&adt_status);
+                                                 NativeAdrenoGpuWindow dt_window{nullptr,0x40000};
+                                                 IODeviceMemory *stock=IODeviceMemory::withRange(0x3d00000,0x40000);
+                                                 if(stock) {
+@@ -1167,18 +1176,18 @@
+                                                 IOLog("NativeAdreno: GPU window ADT 0x%llx id=0x%x status=0x%x | DT 0x3d00000 id=0x%x status=0x%x\n",
+                                                     (unsigned long long)windows[0].base,adt_id,adt_status,dt_id,dt_status);
+                                                 if(dt_id && !adt_id) {
+-                                                    gpu_window=dt_window;
++                                                    *gpu_window=dt_window;
+                                                     IOLog("NativeAdreno: GPU window switched to the DT address 0x3d00000\n");
+                                                 }
+                                             }
+-                                            NativeAdrenoRingIo ring_io{&gpu_window,gpu_write32,gpu_read32,gpu_barrier};
++                                            NativeAdrenoRingIo ring_io{gpu_window,gpu_write32,gpu_read32,gpu_barrier};
+                                             /* The ladder's order: the CP's AHB and the
+                                              * RBBM/UCHE setup first, then the ring
+                                              * registers, then the SQE start.  Writing
+                                              * CP_RB_* while the CP's AHB is still off
+                                              * leaves it wedged, which is what stalled the
+                                              * SQE write in every earlier attempt. */
+-                                            ring_status=startCp(gpu_window,ring_io,b,pwrup_cpu,0);
++                                            ring_status=startCp(*gpu_window,ring_io,b,pwrup_cpu,0);
+                                             if(ring_status) IOLog("NativeAdreno: CP register set stopped at 0x%x\n",ring_status);
+                                             gpu_ctx_cache_={b[1].physical,b[2].physical,
+                                                 reinterpret_cast<uintptr_t>(ring_cpu),
+@@ -1197,7 +1206,7 @@
+                                                 IOLog("NativeAdreno: CP ring attached ring 0x%llx/0x%x fence 0x%llx/0x%x\n",
+                                                     (unsigned long long)GpuRingIova,static_cast<unsigned>(b[1].bytes),
+                                                     (unsigned long long)GpuMemptrsIova,static_cast<unsigned>(b[2].bytes));
+-                                                ring_status=startCp(gpu_window,ring_io,b,pwrup_cpu,1);
++                                                ring_status=startCp(*gpu_window,ring_io,b,pwrup_cpu,1);
+                                             }
+                                         }
+                                     }
