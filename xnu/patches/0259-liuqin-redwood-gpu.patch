@@ -65,7 +65,7 @@ diff --git a/iokit/NativeAdreno/RedwoodGpuGlue.cpp b/iokit/NativeAdreno/RedwoodG
 new file mode 100644
 --- /dev/null
 +++ b/iokit/NativeAdreno/RedwoodGpuGlue.cpp
-@@ -0,0 +1,238 @@
+@@ -0,0 +1,239 @@
 +/* SPDX-License-Identifier: BSD-2-Clause */
 +/* The RedwoodGPU face's primitives on this board (see RedwoodGpuGlue.h).
 + *
@@ -87,7 +87,8 @@ new file mode 100644
 + * here; the same mapping the ladder's step 22 uses for the framebuffer. */
 +extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +
-+extern "C" {volatile uint32_t native_adreno_wc_enabled;}
++/* Defined (and initialized) by NativeAdrenoUserClient.cpp. */
++extern "C" extern volatile uint32_t native_adreno_wc_enabled;
 +
 +namespace {
 +struct RedwoodGpuCore {
