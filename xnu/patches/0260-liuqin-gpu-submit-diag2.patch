@@ -39,8 +39,8 @@
 +        status=unframed?ring_->submit(words,word_count,&value):ring_->submitFramed(words,word_count,&value);
 +    }
      if(status) {
+         {static uint32_t once;if(once++<8)IOLog("NativeAdrenoSub diag: ring submit 0x%x poisoned %u words %zu\n",status,ring_->poisoned()?1:0,word_count);}
          /* A poisoned ring may already have consumed the WPTR write, so the
-          * referenced buffers cannot be retired here. */
 --- a/iokit/NativeAdreno/NativeAdrenoPublish.cpp
 +++ b/iokit/NativeAdreno/NativeAdrenoPublish.cpp
 @@ -695,6 +695,9 @@
