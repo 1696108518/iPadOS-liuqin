@@ -1,0 +1,55 @@
+--- a/iokit/NativeAdreno/NativeAdrenoRing.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoRing.cpp
+@@ -67,6 +67,9 @@
+ /* The last submissions as the CP will read them: [slot] fence, start index, end index, word count, then up to 112 ring words from the start. The board log
+  * prints them, so a fence the GPU never wrote can be compared with the packets that should have written it. */
+ extern "C" {volatile uint32_t native_adreno_ring_log[4][4+112];volatile uint32_t native_adreno_ring_log_count;}
++extern "C" {volatile uint32_t native_adreno_ib_log[4][4+28];volatile uint32_t native_adreno_ib_log_count;}
++extern "C" {volatile uint32_t native_adreno_coherence[8];}
++extern "C" {volatile uint32_t native_adreno_wc_audit[6];volatile uint32_t native_adreno_wc_distrusted;}
+ IOReturn NativeAdrenoRing::poison()
+ {
+     poisoned_=true;return kIOReturnIOError;
+@@ -80,17 +83,41 @@
+     /* The CP wrote the memptrs page; drop what this CPU may still cache. */
+     (void)cache_.acquire(cache_.cookie,fence_,fence_bytes_);
+     uint32_t rptr=0xffffffffu,wptr=0xffffffffu,fault=0xffffffffu,cpint=0xffffffffu,rbbm=0xffffffffu;
++    uint32_t ib1_lo=0xffffffffu,ib1_hi=0xffffffffu,ib1_rem=0xffffffffu,protect=0xffffffffu;
+     (void)io_.read32(io_.cookie,RingRptr,&rptr);
+     (void)io_.read32(io_.cookie,RingWptr,&wptr);
+     (void)io_.read32(io_.cookie,0x0821,&fault);   /* CP_HW_FAULT_STATUS */
+-    (void)io_.read32(io_.cookie,0x0823,&cpint);   /* CP_INTERRUPT_STATUS */
++    (void)io_.read32(io_.cookie,0x0823,&cpint);   /* CP_INTERRUPT_STATUS (bit0 CP_OPCODE_ERROR) */
+     (void)io_.read32(io_.cookie,0x0201,&rbbm);    /* RBBM_INT_0_STATUS */
++    (void)io_.read32(io_.cookie,0x0824,&protect); /* CP_PROTECT_STATUS */
++    (void)io_.read32(io_.cookie,0x0928,&ib1_lo);  /* CP_IB1_BASE */
++    (void)io_.read32(io_.cookie,0x0929,&ib1_hi);
++    (void)io_.read32(io_.cookie,0x092a,&ib1_rem); /* CP_IB1_REM_SIZE (dwords to go) */
+     IOLog("NativeAdrenoRing diag: %s rptr=%u wptr=%u next=%u seqno=%u completed=%u "
+         "memptrs %08x %08x %08x %08x bv %08x %08x | cp_fault=%08x cp_int=%08x rbbm_int=%08x\n",
+         tag?tag:"state",(unsigned)rptr,(unsigned)wptr,(unsigned)next_,
+         (unsigned)seqno_,(unsigned)completed_,
+         (unsigned)fence_[0],(unsigned)fence_[1],(unsigned)fence_[2],(unsigned)fence_[3],
+         (unsigned)fence_[12],(unsigned)fence_[13],fault,cpint,rbbm);
++    IOLog("NativeAdrenoRing diag: cp_ib1=%08x:%08x rem=%u protect=%08x | iblog fences=%u "
++        "fence=%u iova=%08x:%08x bytes=%u head %08x %08x %08x %08x %08x %08x %08x %08x\n",
++        ib1_hi,ib1_lo,ib1_rem,protect,(unsigned)native_adreno_ib_log_count,
++        native_adreno_ib_log_count?(unsigned)native_adreno_ib_log[(native_adreno_ib_log_count-1)&3][0]:0u,
++        native_adreno_ib_log_count?(unsigned)native_adreno_ib_log[(native_adreno_ib_log_count-1)&3][2]:0u,
++        native_adreno_ib_log_count?(unsigned)native_adreno_ib_log[(native_adreno_ib_log_count-1)&3][1]:0u,
++        native_adreno_ib_log_count?(unsigned)native_adreno_ib_log[(native_adreno_ib_log_count-1)&3][3]:0u,
++        native_adreno_ib_log_count?(unsigned)native_adreno_ib_log[(native_adreno_ib_log_count-1)&3][4]:0u,
++        native_adreno_ib_log_count?(unsigned)native_adreno_ib_log[(native_adreno_ib_log_count-1)&3][5]:0u,
++        native_adreno_ib_log_count?(unsigned)native_adreno_ib_log[(native_adreno_ib_log_count-1)&3][6]:0u,
++        native_adreno_ib_log_count?(unsigned)native_adreno_ib_log[(native_adreno_ib_log_count-1)&3][7]:0u,
++        native_adreno_ib_log_count?(unsigned)native_adreno_ib_log[(native_adreno_ib_log_count-1)&3][8]:0u,
++        native_adreno_ib_log_count?(unsigned)native_adreno_ib_log[(native_adreno_ib_log_count-1)&3][9]:0u,
++        native_adreno_ib_log_count?(unsigned)native_adreno_ib_log[(native_adreno_ib_log_count-1)&3][10]:0u,
++        native_adreno_ib_log_count?(unsigned)native_adreno_ib_log[(native_adreno_ib_log_count-1)&3][11]:0u);
++    IOLog("NativeAdrenoRing diag: coherence cached=%08x before=%08x after=%08x drift=%u | wc_audit lines=%u dirty=%u stale=%u fail=%08x distrusted=%u\n",
++        native_adreno_coherence[1],native_adreno_coherence[2],native_adreno_coherence[3],
++        native_adreno_coherence[4],native_adreno_wc_audit[1],native_adreno_wc_audit[2],
++        native_adreno_wc_audit[3],native_adreno_wc_audit[4],native_adreno_wc_distrusted);
+ }
+ IOReturn NativeAdrenoRing::readRptr(uint32_t *value)
+ {
