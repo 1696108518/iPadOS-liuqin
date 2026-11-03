@@ -1,0 +1,969 @@
+diff --git a/iokit/NativeAdreno/RedwoodGpuGlue.h b/iokit/NativeAdreno/RedwoodGpuGlue.h
+new file mode 100644
+--- /dev/null
++++ b/iokit/NativeAdreno/RedwoodGpuGlue.h
+@@ -0,0 +1,58 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/* liuqin_redwood_*: the kernel half of the RedwoodGPU (msm DRM) face.
++ *
++ * RedwoodGpuService.cpp speaks Linux's msm_drm uapi to Mesa's freedreno on one
++ * side; this header is its other side, the primitives of the already-running
++ * NativeAdreno GPU context: buffers are GPU BOs of this VM (write-combined,
++ * from the BO pool), addresses come from the VM's allocator, submissions go
++ * through NativeAdrenoSubmit (A7XX framing, WC audit, TLB publish) and fences
++ * are the ring's timestamp fences, the same ones every other client waits on.
++ */
++#ifndef LIUQIN_REDWOOD_GPU_GLUE_H
++#define LIUQIN_REDWOOD_GPU_GLUE_H
++
++#include <IOKit/IOReturn.h>
++#include <stdint.h>
++#include <stddef.h>
++#include "NativeAdrenoVm.h"
++#include "NativeAdrenoRing.h"
++#include "NativeAdrenoSubmit.h"
++#include "NativeAdrenoMemory.h"
++#include "NativeAdrenoABI.h"
++
++struct RedwoodGpuIb {
++    uint64_t handle;        /* NativeAdrenoVm mapping handle (from allocate/map) */
++    uint64_t iova;          /* GPU address of the command buffer's first byte  */
++    uint32_t bytes;         /* complete indirect-buffer length                  */
++};
++
++/* Board hand-off: called once from NativeAdrenoGpuService::start() when the CP
++ * is running; registers the RedwoodGPU IOService. Also the glue's core init. */
++extern "C" IOReturn liuqin_redwood_start(NativeAdrenoVm *,NativeAdrenoSubmit *,
++    NativeAdrenoRing *,const NativeAdrenoRingClock *,const NativeAdrenoAbiDeviceInfo *,
++    uint32_t input_bits,uint32_t output_bits);
++/* Core only (the service file calls it from liuqin_redwood_start). */
++extern "C" void liuqin_redwood_core(NativeAdrenoVm *,NativeAdrenoSubmit *,
++    NativeAdrenoRing *,const NativeAdrenoRingClock *,const NativeAdrenoAbiDeviceInfo *,
++    uint32_t input_bits,uint32_t output_bits);
++
++extern "C" bool liuqin_redwood_ready(void);
++/* Allocates a GPU BO: memory.allocate(...pooled) + makeWriteCombined (when the
++ * board allows it) + vm address + vm map. On success memory/vm_handle/iova are
++ * filled in; on failure `memory` must be release()d by the caller. */
++extern "C" IOReturn liuqin_redwood_alloc(NativeAdrenoMemory *memory,uint64_t bytes,
++    uint32_t flags,uint64_t *vm_handle,uint64_t *iova);
++extern "C" void liuqin_redwood_free(NativeAdrenoMemory *memory,uint64_t vm_handle);
++/* Submission of indirect buffers (their bytes already in GPU-visible memory). */
++extern "C" IOReturn liuqin_redwood_submit(const RedwoodGpuIb *ibs,size_t count,
++    uint32_t *fence);
++extern "C" bool liuqin_redwood_fence_done(uint32_t fence);
++extern "C" bool liuqin_redwood_wait_fence(uint32_t fence,uint32_t timeout_ms);
++extern "C" uint32_t liuqin_redwood_last_fence(void);
++/* msm GET_PARAM answers, from the board's A730 facts. */
++extern "C" bool liuqin_redwood_parameter(uint32_t which,uint64_t *value);
++/* kRedwoodShow: pixels of the caller's onto the panel, for a test's result. */
++extern "C" bool liuqin_redwood_show(const void *pixels,uint32_t width,
++    uint32_t height,uint32_t rowBytes);
++
++#endif
+diff --git a/iokit/NativeAdreno/RedwoodGpuGlue.cpp b/iokit/NativeAdreno/RedwoodGpuGlue.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/NativeAdreno/RedwoodGpuGlue.cpp
+@@ -0,0 +1,234 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/* The RedwoodGPU face's primitives on this board (see RedwoodGpuGlue.h).
++ *
++ * Everything is set up once, by liuqin_redwood_start() when the CP has just
++ * started, and is read-only afterwards: the VM, the submit object and the ring
++ * are the same ones NativeAdrenoUserClient mounts, so a RedwoodGPU client is
++ * another consumer of one shared GPU context (Linux's msm draws the same line:
++ * one address space, the kernel places the buffers).
++ */
++#include <IOKit/IOLib.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <pexpert/pexpert.h>
++#include <vm/vm_kern.h>
++#include "RedwoodGpuGlue.h"
++#include "NativeAdrenoKernelTime.h"
++
++extern "C" {volatile uint32_t native_adreno_wc_enabled;}
++
++namespace {
++struct RedwoodGpuCore {
++    NativeAdrenoVm *vm = nullptr;
++    NativeAdrenoSubmit *execbuf = nullptr;
++    NativeAdrenoRing *ring = nullptr;
++    NativeAdrenoRingClock clock{};
++    const NativeAdrenoAbiDeviceInfo *info = nullptr;
++    uint32_t input_bits = 32, output_bits = 40;
++    bool ready = false;
++};
++RedwoodGpuCore gRedwood;
++
++/* msm buffer addresses are packed one allocation after another at 64 KiB
++ * (GPU_ADDRESS_GRANULE in the reference driver); the VM's own finder is used,
++ * so addresses other clients hold are never handed out again. */
++const uint64_t kGranule = 0x10000;
++/* Queue id for the msm face's submissions: bookkeeping on the one shared ring,
++ * chosen outside the ranges NativeAdrenoUserClient's slots own (0..63). */
++const uint32_t kRedwoodQueue = 0x100;
++
++uint64_t now_us(void *)
++{
++    uint64_t microseconds = 0;
++    NativeAdrenoKernelTime::now_us(nullptr, &microseconds);
++    return microseconds;
++}
++}
++
++extern "C" void liuqin_redwood_core(NativeAdrenoVm *vm, NativeAdrenoSubmit *execbuf,
++    NativeAdrenoRing *ring, const NativeAdrenoRingClock *clock,
++    const NativeAdrenoAbiDeviceInfo *info, uint32_t input_bits, uint32_t output_bits)
++{
++    if (gRedwood.ready) return;
++    gRedwood.vm = vm;
++    gRedwood.execbuf = execbuf;
++    gRedwood.ring = ring;
++    if (clock) gRedwood.clock = *clock;
++    else gRedwood.clock = NativeAdrenoRingClock{nullptr, now_us, nullptr};
++    gRedwood.info = info;
++    gRedwood.input_bits = input_bits;
++    gRedwood.output_bits = output_bits;
++    gRedwood.ready = vm && execbuf && ring;
++}
++
++extern "C" bool liuqin_redwood_ready(void)
++{
++    return gRedwood.ready;
++}
++
++extern "C" IOReturn liuqin_redwood_alloc(NativeAdrenoMemory *memory, uint64_t bytes,
++    uint32_t flags, uint64_t *vm_handle, uint64_t *iova)
++{
++    if (!gRedwood.ready || !memory || !vm_handle || !iova || !bytes) return kIOReturnBadArgument;
++    if (bytes > (UINT64_C(256) << 20)) return kIOReturnBadArgument;
++    IOReturn status = memory->allocate((size_t)bytes, gRedwood.output_bits, false,
++        (size_t)bytes, true);
++    if (!status && native_adreno_wc_enabled) status = memory->makeWriteCombined();
++    if (status) {
++        (void)memory->release();
++        return status == kIOReturnUnsupported ? kIOReturnUnsupported : status;
++    }
++    uint64_t address = 0;
++    status = gRedwood.vm->findAddress(0, (size_t)bytes, kGranule, &address);
++    if (status) {
++        (void)memory->release();
++        return kIOReturnNoMemory;
++    }
++    /* Same permissions the user client's own BOs are mapped with: GPU read and
++     * write, non-coherent (the CPU view is write-combined). */
++    uint64_t handle = 0;
++    status = gRedwood.vm->map(memory, 0, address, ArmSmmu4KRead | ArmSmmu4KWrite,
++        0, 3, &handle);
++    if (status) {
++        (void)memory->release();
++        IOLog("RedwoodGPU: map of %llu bytes at 0x%llx failed 0x%x\n",
++            (unsigned long long)bytes, (unsigned long long)address, status);
++        return status;
++    }
++    *vm_handle = handle;
++    *iova = address;
++    return kIOReturnSuccess;
++}
++
++extern "C" void liuqin_redwood_free(NativeAdrenoMemory *memory, uint64_t vm_handle)
++{
++    if (!memory) return;
++    if (gRedwood.ready && vm_handle) (void)gRedwood.vm->unmap(vm_handle);
++    (void)memory->release();
++}
++
++extern "C" IOReturn liuqin_redwood_submit(const RedwoodGpuIb *ibs, size_t count,
++    uint32_t *fence)
++{
++    if (!gRedwood.ready) return kIOReturnNotReady;
++    if (!ibs || !count || count > 16 || !fence) return kIOReturnBadArgument;
++    NativeAdrenoSubmitBuffer buffers[16];
++    for (size_t i = 0; i < count; ++i) {
++        if (!ibs[i].handle || !ibs[i].bytes || (ibs[i].bytes & 3)) return kIOReturnBadArgument;
++        buffers[i].handle = ibs[i].handle;
++        buffers[i].iova = ibs[i].iova;
++        buffers[i].bytes = ibs[i].bytes;
++    }
++    IOReturn status = gRedwood.execbuf->submit(buffers, count, kRedwoodQueue, fence);
++    if (status) {
++        static uint32_t said;
++        if (said++ < 8)
++            IOLog("RedwoodGPU: submission of %zu buffers failed 0x%x\n", count, status);
++    }
++    return status;
++}
++
++extern "C" bool liuqin_redwood_fence_done(uint32_t fence)
++{
++    if (!fence || !gRedwood.ready) return true;
++    uint32_t observed = 0;
++    return gRedwood.ring->observeFence(fence, &gRedwood.clock, 0, &observed) ==
++        NativeAdrenoRingFenceComplete;
++}
++
++extern "C" bool liuqin_redwood_wait_fence(uint32_t fence, uint32_t timeout_ms)
++{
++    if (!fence) return true;
++    if (!gRedwood.ready) return false;
++    const uint32_t microseconds = timeout_ms > 0xffffffffu / 1000u ? 0xffffffffu : timeout_ms * 1000u;
++    uint32_t observed = 0;
++    return gRedwood.ring->observeFence(fence, &gRedwood.clock, microseconds, &observed) ==
++        NativeAdrenoRingFenceComplete;
++}
++
++extern "C" uint32_t liuqin_redwood_last_fence(void)
++{
++    return gRedwood.ready ? gRedwood.ring->lastSubmitted() : 0;
++}
++
++/* Linux's adreno_get_param numbers (msm_drm.h) and the reference driver's
++ * answers (bsd/dev/redwood_adreno.c, redwood_gpu_parameter()); the chip facts
++ * are the board's A730 record (liuqin_metal_info, from the a6xx catalog). */
++extern "C" bool liuqin_redwood_parameter(uint32_t which, uint64_t *value)
++{
++    if (!value || !gRedwood.info) return false;
++    const NativeAdrenoAbiDeviceInfo &info = *gRedwood.info;
++    switch (which) {
++    case 0x01:                  /* GPU_ID: none, the chip ID says it */
++    case 0x06:                  /* GMEM_BASE */
++    case 0x08:                  /* PP_PGTABLE */
++    case 0x09:                  /* FAULTS */
++    case 0x0a:                  /* SUSPENDS */
++    case 0x11:                  /* RAYTRACING */
++        *value = 0;
++        return true;
++    case 0x02:                  /* GMEM_SIZE */
++        *value = info.gmem_bytes;
++        return true;
++    case 0x03:                  /* CHIP_ID (speed bin 0 above it) */
++        *value = info.chip_id;
++        return true;
++    case 0x04:                  /* MAX_FREQ: not known here (OPPs live in the DT) */
++        *value = 0;
++        return true;
++    case 0x05:                  /* TIMESTAMP */
++        *value = mach_absolute_time();
++        return true;
++    case 0x07:                  /* PRIORITIES */
++        *value = 1;
++        return true;
++    case 0x10:                  /* HIGHEST_BANK_BIT */
++        *value = info.highest_bank_bit;
++        return true;
++    case 0x12:                  /* UBWC_SWIZZLE: levels 2 and 3 */
++        *value = info.ubwc_swizzle;
++        return true;
++    case 0x13:                  /* MACROTILE_MODE */
++        *value = info.macrotile_mode;
++        return true;
++    case 0x0e:                  /* VA_START */
++        *value = info.va_start;
++        return true;
++    case 0x0f:                  /* VA_SIZE */
++        *value = info.va_size;
++        return true;
++    default:
++        return false;
++    }
++}
++
++/* kRedwoodShow: copies the top-left corner of a program's pixels (32 bits each,
++ * blue first - the panel's own format) onto the boot framebuffer, as the ladder's
++ * step 22 does for its three-band picture. */
++extern "C" bool liuqin_redwood_show(const void *pixels, uint32_t width,
++    uint32_t height, uint32_t rowBytes)
++{
++    if (!pixels || !width || !height || rowBytes < 4 * width || width > 4096 || height > 4096)
++        return false;
++    PE_Video video;
++    PE_current_console(&video);
++    if (!video.v_baseAddr || !video.v_rowBytes || !video.v_height || !video.v_width) return false;
++    const uint32_t rows = height < video.v_height ? height : (uint32_t)video.v_height;
++    const uint32_t columns = width < video.v_width ? width : (uint32_t)video.v_width;
++    vm_offset_t fb = ml_io_map(video.v_baseAddr, (vm_size_t)rows * video.v_rowBytes);
++    if (!fb) return false;
++    for (uint32_t y = 0; y < rows; ++y) {
++        const uint8_t *source = static_cast<const uint8_t *>(pixels) + (uint64_t)y * rowBytes;
++        uint8_t *destination = reinterpret_cast<uint8_t *>(fb) + (uint64_t)y * video.v_rowBytes;
++        for (uint32_t x = 0; x < columns; ++x) {
++            uint32_t pixel;
++            memcpy(&pixel, source + 4 * (uint64_t)x, 4);
++            *reinterpret_cast<volatile uint32_t *>(destination + 4 * (uint64_t)x) = pixel;
++        }
++    }
++    static uint32_t said;
++    if (said++ < 4)
++        IOLog("RedwoodGPU: showed %ux%u pixels on the panel (fb 0x%llx)\n",
++            columns, rows, (unsigned long long)video.v_baseAddr);
++    return true;
++}
+diff --git a/iokit/NativeAdreno/RedwoodGpuService.cpp b/iokit/NativeAdreno/RedwoodGpuService.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/NativeAdreno/RedwoodGpuService.cpp
+@@ -0,0 +1,628 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/* RedwoodGPU: the phone's Adreno for programs to draw with, as Mesa's freedreno
++ * finds it (the msm DRM driver's interface).
++ *
++ * Ported from the redwood reference driver (hackios-xnu-kernel,
++ * docs/GPU_USERLAND_PLAN.md): every request of Linux's msm interface is a call
++ * of this user client with the request's number (the low byte of the ioctl) as
++ * the selector and the request's structure passed in and back. What Linux does
++ * with mmap() is the client memory of the type that is the buffer's handle.
++ *
++ * The GPU itself is not this file's: the board brings it up (NativeAdreno,
++ * patches 0085-0146) and hands the live VM/submit/ring to
++ * liuqin_redwood_start(); RedwoodGpuGlue.cpp carries the requests from here to
++ * those objects. One request is not Linux's: a buffer that is the memory of an
++ * IOSurface (kRedwoodSurface) - v1 answers the description only, importing
++ * surface memory as a drawable arrives with the Metal side.
++ *
++ * The service is registered under the name "RedwoodGPU" (the tool that makes
++ * Mesa speak IOKit matches IOServiceNameMatching("RedwoodGPU") and opens with
++ * type 0). It is a third face next to NativeAdrenoGpu (the ABI) and the
++ * AGXAccelerator stub (Metal discovery), and does not depend on either.
++ */
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <sys/systm.h>
++#include "RedwoodGpuGlue.h"
++#include "../Kernel/arm/LiuqinSurface.h"
++
++namespace {
++
++enum {
++	kDrmGemClose            = 0x09,
++	kMsmGetParam            = 0x40,
++	kMsmSetParam            = 0x41,
++	kMsmGemNew              = 0x42,
++	kMsmGemInfo             = 0x43,
++	kMsmGemCpuPrep          = 0x44,
++	kMsmGemCpuFini          = 0x45,
++	kMsmGemSubmit           = 0x46,
++	kMsmWaitFence           = 0x47,
++	kMsmGemMadvise          = 0x48,
++	kMsmSubmitQueueNew      = 0x4a,
++	kMsmSubmitQueueClose    = 0x4b,
++	kMsmSubmitQueueQuery    = 0x4c,
++	kRedwoodGPUWorked       = 0x7d,
++	kRedwoodSurface         = 0x7e,
++	kRedwoodShow            = 0x7f,
++};
++
++struct msm_timespec {
++	int64_t seconds, nanoseconds;
++};
++struct msm_param {
++	uint32_t pipe, param;
++	uint64_t value;
++	uint32_t len, pad;
++};
++struct msm_gem_new {
++	uint64_t size;
++	uint32_t flags, handle;
++};
++struct msm_gem_info {
++	uint32_t handle, info;
++	uint64_t value;
++	uint32_t len, pad;
++};
++struct msm_gem_cpu_prep {
++	uint32_t handle, op;
++	struct msm_timespec timeout;
++};
++struct msm_gem_submit_cmd {
++	uint32_t type, submit_idx, submit_offset, size, pad, nr_relocs;
++	uint64_t relocs;
++};
++struct msm_gem_submit_bo {
++	uint32_t flags, handle;
++	uint64_t presumed;
++};
++struct msm_gem_submit {
++	uint32_t flags, fence, nr_bos, nr_cmds;
++	uint64_t bos, cmds;
++	int32_t fence_fd;
++	uint32_t queueid;
++	uint64_t in_syncobjs, out_syncobjs;
++	uint32_t nr_in_syncobjs, nr_out_syncobjs, syncobj_stride, pad;
++};
++struct msm_wait_fence {
++	uint32_t fence, flags;
++	struct msm_timespec timeout;
++	uint32_t queueid;
++};
++struct msm_gem_madvise {
++	uint32_t handle, madv, retained;
++};
++struct msm_submitqueue {
++	uint32_t flags, prio, id;
++};
++struct msm_submitqueue_query {
++	uint64_t data;
++	uint32_t id, param, len, pad;
++};
++struct drm_gem_close {
++	uint32_t handle, pad;
++};
++struct redwood_surface {
++	uint32_t surface;
++	uint32_t handle;
++	uint64_t size;
++	uint32_t offset, rowBytes;
++	uint32_t width, height, pixelFormat, planes;
++};
++struct redwood_show {
++	uint64_t pixels;
++	uint32_t width, height, rowBytes, pad;
++};
++
++#define kRedwoodDescribe        0xffffffffu
++
++#define MSM_INFO_GET_OFFSET     0
++#define MSM_INFO_GET_IOVA       1
++#define MSM_INFO_SET_NAME       2
++#define MSM_INFO_SET_IOVA       4
++#define MSM_INFO_GET_FLAGS      5
++#define MSM_PREP_NOSYNC         0x04
++#define MSM_SUBMIT_CMD_BUF      1
++#define MSM_SUBMIT_FENCE_FD_OUT 0x20000000
++
++#define GPU_BUFFERS             4096
++#define GPU_BUFFER_MAX          (256u << 20)
++#define GPU_SUBMIT_CMDS         128
++#define GPU_SUBMIT_BOS          8192
++#define GPU_PATIENCE_MS         5000
++#define GPU_LEFT                64
++
++union redwood_request {
++	struct msm_param param;
++	struct msm_gem_new gemNew;
++	struct msm_gem_info gemInfo;
++	struct msm_gem_cpu_prep cpuPrep;
++	struct msm_gem_submit submit;
++	struct msm_wait_fence waitFence;
++	struct msm_gem_madvise madvise;
++	struct msm_submitqueue queue;
++	struct msm_submitqueue_query query;
++	struct drm_gem_close close;
++	struct redwood_surface surface;
++	struct redwood_show show;
++};
++
++/* One buffer of a client: a GPU BO of the shared VM; handle n is fBuffers[n-1]. */
++struct gpu_buffer {
++	NativeAdrenoMemory memory;
++	uint64_t vm_handle;             /* the VM's mapping handle (submissions) */
++	uint64_t iova;                  /* the GPU's address for it */
++	uint64_t size;
++	uint32_t flags;
++	uint32_t fence;                 /* the last submission that names it (0: none) */
++	bool used;
++};
++/* A buffer given back while the GPU may still be at it: its slot stays taken
++ * (the NativeAdrenoMemory cannot move) until the fence says it is done. */
++struct gpu_left {
++	uint32_t index;
++	uint32_t fence;
++};
++
++uint64_t millisecondsUntil(const struct msm_timespec *when)
++{
++	uint64_t now;
++	int64_t left;
++	absolutetime_to_nanoseconds(mach_continuous_time(), &now);
++	left = when->seconds * (int64_t)NSEC_PER_SEC + when->nanoseconds - (int64_t)now;
++	if (left <= 0) return 0;
++	const uint64_t ms = (uint64_t)left / NSEC_PER_MSEC;
++	return ms > GPU_PATIENCE_MS ? GPU_PATIENCE_MS : ms;
++}
++
++} /* namespace */
++
++class RedwoodGPU : public IOService
++{
++	OSDeclareDefaultStructors(RedwoodGPU)
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(RedwoodGPU, IOService);
++
++bool RedwoodGPU::start(IOService *provider)
++{
++	if (!IOService::start(provider)) return false;
++	setProperty(kIOUserClientClassKey, "RedwoodGPUUserClient");
++	setName("RedwoodGPU");
++	registerService();
++	return true;
++}
++
++class RedwoodGPUUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(RedwoodGPUUserClient)
++
++	task_t fTask = TASK_NULL;
++	struct gpu_buffer *fBuffers = nullptr;
++	struct gpu_left fLeft[GPU_LEFT];
++	uint32_t fLeftCount = 0;
++	uint32_t fNextBuffer = 0;
++	uint32_t fQueue = 0;
++	bool fSaidSetIova = false;
++
++	struct gpu_buffer *buffer(uint32_t handle);
++	void freeBuffer(struct gpu_buffer *b);
++	void reap(void);
++	bool newBuffer(uint64_t size, uint32_t flags, struct gpu_buffer **out, uint32_t *handle);
++	IOReturn gemNew(struct msm_gem_new *request);
++	IOReturn gemInfo(struct msm_gem_info *request);
++	IOReturn submit(struct msm_gem_submit *request);
++	IOReturn cpuPrep(struct msm_gem_cpu_prep *request);
++	IOReturn waitFence(struct msm_wait_fence *request);
++	IOReturn surface(struct redwood_surface *request);
++	IOReturn show(const struct redwood_show *request);
++
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type,
++	    OSDictionary *properties) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
++	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options,
++	    IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(RedwoodGPUUserClient, IOUserClient);
++
++bool RedwoodGPUUserClient::initWithTask(task_t owningTask, void *securityID,
++    UInt32 type, OSDictionary *properties)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityID, type, properties)) return false;
++	fTask = owningTask;
++	return true;
++}
++
++void RedwoodGPUUserClient::free(void)
++{
++	if (fBuffers) {
++		IODelete(fBuffers, struct gpu_buffer, GPU_BUFFERS);
++		fBuffers = nullptr;
++	}
++	IOUserClient::free();
++}
++
++IOReturn RedwoodGPUUserClient::clientClose(void)
++{
++	if (fBuffers) {
++		for (uint32_t i = 0; i < GPU_BUFFERS; ++i) {
++			if (fBuffers[i].used) freeBuffer(&fBuffers[i]);
++		}
++		reap();
++		if (fLeftCount)
++			IOLog("RedwoodGPU: the GPU is not done with %u buffers of a program that is gone\n", fLeftCount);
++	}
++	if (!isInactive()) terminate();
++	return kIOReturnSuccess;
++}
++
++struct gpu_buffer *RedwoodGPUUserClient::buffer(uint32_t handle)
++{
++	if (handle == 0 || handle > GPU_BUFFERS || !fBuffers[handle - 1].used) {
++		static uint32_t said;
++		if (handle && said++ < 8)
++			IOLog("RedwoodGPU: buffer %u is asked for and is not there\n", handle);
++		return nullptr;
++	}
++	return &fBuffers[handle - 1];
++}
++
++bool RedwoodGPUUserClient::newBuffer(uint64_t size, uint32_t flags,
++    struct gpu_buffer **out, uint32_t *handle)
++{
++	if (!fBuffers) fBuffers = IONewZero(struct gpu_buffer, GPU_BUFFERS);
++	if (!fBuffers) return false;
++	struct gpu_buffer *b = nullptr;
++	for (uint32_t n = 0; n < GPU_BUFFERS; ++n) {
++		const uint32_t i = (fNextBuffer + n) % GPU_BUFFERS;
++		if (!fBuffers[i].used) {
++			b = &fBuffers[i];
++			*handle = i + 1;
++			fNextBuffer = i + 1;
++			break;
++		}
++	}
++	if (!b) return false;
++	b->size = size;
++	b->flags = flags;
++	b->fence = 0;
++	const IOReturn status = liuqin_redwood_alloc(&b->memory, size, flags, &b->vm_handle, &b->iova);
++	if (status) {
++		IOLog("RedwoodGPU: a buffer of %llu bytes cannot be made 0x%x\n",
++		    (unsigned long long)size, status);
++		return false;
++	}
++	b->used = true;
++	*out = b;
++	return true;
++}
++
++/* With the slot given back only when the GPU is done with it; when the
++ * deferred list is full the buffer is waited for (bounded). */
++void RedwoodGPUUserClient::freeBuffer(struct gpu_buffer *b)
++{
++	if (b->fence && !liuqin_redwood_fence_done(b->fence)) {
++		if (fLeftCount < GPU_LEFT) {
++			fLeft[fLeftCount++] = {static_cast<uint32_t>(b - fBuffers), b->fence};
++			b->fence = 0;
++			return;
++		}
++		(void)liuqin_redwood_wait_fence(b->fence, 1000);
++	}
++	liuqin_redwood_free(&b->memory, b->vm_handle);
++	b->vm_handle = 0;
++	b->iova = 0;
++	b->size = 0;
++	b->fence = 0;
++	b->used = false;
++}
++
++/* The buffers given back early that the GPU is done with now: freed. */
++void RedwoodGPUUserClient::reap(void)
++{
++	for (uint32_t i = 0; i < fLeftCount;) {
++		struct gpu_left &left = fLeft[i];
++		if (!liuqin_redwood_fence_done(left.fence)) {
++			++i;
++			continue;
++		}
++		struct gpu_buffer *b = &fBuffers[left.index];
++		liuqin_redwood_free(&b->memory, b->vm_handle);
++		b->vm_handle = 0;
++		b->iova = 0;
++		b->size = 0;
++		b->fence = 0;
++		b->used = false;
++		fLeft[i] = fLeft[--fLeftCount];
++	}
++}
++
++IOReturn RedwoodGPUUserClient::gemNew(struct msm_gem_new *request)
++{
++	const uint64_t size = (request->size + 0xfff) & ~(uint64_t)0xfff;
++	if (size == 0 || size > GPU_BUFFER_MAX) return kIOReturnBadArgument;
++	struct gpu_buffer *b = nullptr;
++	uint32_t handle = 0;
++	if (!newBuffer(size, request->flags, &b, &handle)) return kIOReturnNoMemory;
++	reap();
++	request->handle = handle;
++	return kIOReturnSuccess;
++}
++
++IOReturn RedwoodGPUUserClient::gemInfo(struct msm_gem_info *request)
++{
++	struct gpu_buffer *b = buffer(request->handle);
++	if (!b) return kIOReturnBadArgument;
++	switch (request->info) {
++	case MSM_INFO_GET_OFFSET:
++		request->value = (uint64_t)request->handle << 32;
++		return kIOReturnSuccess;
++	case MSM_INFO_GET_IOVA:
++		request->value = b->iova;
++		return kIOReturnSuccess;
++	case MSM_INFO_SET_IOVA:
++		if (!fSaidSetIova) {
++			fSaidSetIova = true;
++			IOLog("RedwoodGPU: a program asked to place buffer %u at %#llx itself: refused; "
++			    "there is one address space here, MSM_INFO_GET_IOVA is how to learn "
++			    "the address\n", request->handle, (unsigned long long)request->value);
++		}
++		return kIOReturnUnsupported;
++	case MSM_INFO_GET_FLAGS:
++		request->value = b->flags;
++		return kIOReturnSuccess;
++	case MSM_INFO_SET_NAME:
++		return kIOReturnSuccess;
++	default:
++		return kIOReturnUnsupported;
++	}
++}
++
++IOReturn RedwoodGPUUserClient::submit(struct msm_gem_submit *request)
++{
++	struct msm_gem_submit_bo *bos = nullptr;
++	struct msm_gem_submit_cmd *cmds = nullptr;
++	RedwoodGpuIb ibs[GPU_SUBMIT_CMDS];
++	uint32_t count = 0;
++	IOReturn ret = kIOReturnBadArgument;
++
++	if (request->nr_cmds == 0 || request->nr_cmds > GPU_SUBMIT_CMDS ||
++	    request->nr_bos == 0 || request->nr_bos > GPU_SUBMIT_BOS) {
++		IOLog("RedwoodGPU: a submission of %u command buffers in %u buffers: not taken\n",
++		    request->nr_cmds, request->nr_bos);
++		return kIOReturnBadArgument;
++	}
++	bos = IONew(struct msm_gem_submit_bo, request->nr_bos);
++	cmds = IONew(struct msm_gem_submit_cmd, request->nr_cmds);
++	if (!bos || !cmds) {
++		ret = kIOReturnNoMemory;
++		goto out;
++	}
++	if (copyin((user_addr_t)request->bos, bos, request->nr_bos * sizeof(*bos)) != 0 ||
++	    copyin((user_addr_t)request->cmds, cmds, request->nr_cmds * sizeof(*cmds)) != 0) {
++		ret = kIOReturnVMError;
++		goto out;
++	}
++	for (uint32_t i = 0; i < request->nr_bos; ++i) {
++		struct gpu_buffer *b = buffer(bos[i].handle);
++		if (b) b->fence = 0;
++	}
++	for (uint32_t i = 0; i < request->nr_cmds; ++i) {
++		struct gpu_buffer *b = cmds[i].submit_idx < request->nr_bos ?
++		    buffer(bos[cmds[i].submit_idx].handle) : nullptr;
++		if (cmds[i].type != MSM_SUBMIT_CMD_BUF) continue;
++		if (!b || cmds[i].nr_relocs != 0 || (cmds[i].size & 3) ||
++		    (cmds[i].submit_offset & 3) ||
++		    (uint64_t)cmds[i].submit_offset + cmds[i].size > b->size) {
++			IOLog("RedwoodGPU: command buffer %u of a submission: buffer %u, offset %u, "
++			    "%u bytes, %u relocations: not taken\n", i, cmds[i].submit_idx,
++			    cmds[i].submit_offset, cmds[i].size, cmds[i].nr_relocs);
++			goto out;
++		}
++		if (count == 16) {          /* the submit path's buffer bound */
++			IOLog("RedwoodGPU: %u command buffers is more than the submit path takes\n", count);
++			goto out;
++		}
++		ibs[count].handle = b->vm_handle;
++		ibs[count].iova = b->iova + cmds[i].submit_offset;
++		ibs[count].bytes = cmds[i].size;
++		++count;
++	}
++	if (!count) { ret = kIOReturnBadArgument; goto out; }
++	request->fence = 0;
++	ret = liuqin_redwood_submit(ibs, count, &request->fence);
++	if (ret) goto out;
++	for (uint32_t i = 0; i < request->nr_bos; ++i) {
++		struct gpu_buffer *b = buffer(bos[i].handle);
++		if (b) b->fence = request->fence;
++	}
++	if (request->flags & MSM_SUBMIT_FENCE_FD_OUT) request->fence_fd = -1;
++	reap();
++out:
++	if (bos) IODelete(bos, struct msm_gem_submit_bo, request->nr_bos);
++	if (cmds) IODelete(cmds, struct msm_gem_submit_cmd, request->nr_cmds);
++	return ret;
++}
++
++IOReturn RedwoodGPUUserClient::cpuPrep(struct msm_gem_cpu_prep *request)
++{
++	const uint32_t fence = liuqin_redwood_last_fence();
++	if (!fence) return kIOReturnSuccess;
++	const uint32_t ms = (request->op & MSM_PREP_NOSYNC) ? 0 : (uint32_t)millisecondsUntil(&request->timeout);
++	if (!liuqin_redwood_wait_fence(fence, ms)) return kIOReturnBusy;
++	return kIOReturnSuccess;
++}
++
++IOReturn RedwoodGPUUserClient::waitFence(struct msm_wait_fence *request)
++{
++	const uint32_t ms = (uint32_t)millisecondsUntil(&request->timeout);
++	if (!liuqin_redwood_wait_fence(request->fence, ms)) return kIOReturnTimeout;
++	return kIOReturnSuccess;
++}
++
++IOReturn RedwoodGPUUserClient::surface(struct redwood_surface *request)
++{
++	LiuqinSurface *s = liuqin_surface_copy(request->surface);
++	if (!s) return kIOReturnNotFound;
++	request->size = s->allocSize;
++	request->offset = s->offset;
++	request->rowBytes = s->bytesPerRow;
++	request->width = s->width;
++	request->height = s->height;
++	request->pixelFormat = s->pixelFormat;
++	request->planes = s->planeCount;
++	if (request->handle == kRedwoodDescribe) {
++		request->handle = 0;
++		s->release();
++		return kIOReturnSuccess;
++	}
++	/* Importing surface memory as a drawable arrives with the Metal side
++	 * (needs a NativeAdrenoMemory that adopts a foreign descriptor). */
++	s->release();
++	return kIOReturnUnsupported;
++}
++
++IOReturn RedwoodGPUUserClient::show(const struct redwood_show *request)
++{
++	if (!request->pixels || !request->width || !request->height) return kIOReturnBadArgument;
++	const uint64_t size = (uint64_t)request->rowBytes * request->height;
++	uint8_t *pixels = (uint8_t *)IOMallocData(size);
++	if (!pixels) return kIOReturnNoMemory;
++	IOReturn ret = kIOReturnSuccess;
++	if (copyin((user_addr_t)request->pixels, pixels, size) != 0) ret = kIOReturnVMError;
++	else if (!liuqin_redwood_show(pixels, request->width, request->height, request->rowBytes))
++		ret = kIOReturnUnsupported;
++	IOFreeData(pixels, size);
++	return ret;
++}
++
++IOReturn RedwoodGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
++    IOMemoryDescriptor **memory)
++{
++	if (memory) *memory = nullptr;
++	if (options) *options = kIOMapAnywhere;
++	if (!memory) return kIOReturnBadArgument;
++	struct gpu_buffer *b = buffer(type);
++	if (!b) return kIOReturnBadArgument;
++	const size_t count = b->memory.spanCount();
++	if (!count || count > 65536) return kIOReturnNoResources;
++	IOAddressRange *ranges = IONewData(IOAddressRange, count);
++	if (!ranges) return kIOReturnNoMemory;
++	for (size_t i = 0; i < count; ++i) {
++		ranges[i].address = b->memory.spans()[i].physical;
++		ranges[i].length = b->memory.spans()[i].bytes;
++	}
++	IOMemoryDescriptor *descriptor = IOMemoryDescriptor::withAddressRanges(ranges,
++	    (UInt32)count, kIODirectionInOut | kIOMemoryTypePhysical64, nullptr);
++	IODeleteData(ranges, IOAddressRange, count);
++	if (!descriptor) return kIOReturnNoMemory;
++	*memory = descriptor;
++	if (options) *options = kIOMapAnywhere | kIOMapInhibitCache;
++	return kIOReturnSuccess;
++}
++
++IOReturn RedwoodGPUUserClient::externalMethod(uint32_t selector,
++    IOExternalMethodArguments *arguments, IOExternalMethodDispatch *dispatch,
++    OSObject *target, void *reference)
++{
++	(void)target; (void)reference;
++	if (!arguments || !arguments->structureInput || arguments->structureInputSize > sizeof(union redwood_request))
++		return kIOReturnBadArgument;
++	if (!liuqin_redwood_ready() && selector != kRedwoodShow)
++		return kIOReturnNotReady;
++	union redwood_request request;
++	bzero(&request, sizeof(request));
++	memcpy(&request, arguments->structureInput, arguments->structureInputSize);
++	IOReturn ret = kIOReturnUnsupported;
++	switch (selector) {
++	case kMsmGetParam: {
++		uint64_t value = 0;
++		ret = liuqin_redwood_parameter(request.param.param, &value) ?
++		    kIOReturnSuccess : kIOReturnBadArgument;
++		request.param.value = value;
++		break;
++	}
++	case kMsmSetParam:
++	case kMsmGemCpuFini:
++	case kMsmSubmitQueueClose:
++		ret = kIOReturnSuccess;
++		break;
++	case kMsmGemNew:     ret = gemNew(&request.gemNew); break;
++	case kMsmGemInfo:    ret = gemInfo(&request.gemInfo); break;
++	case kMsmGemCpuPrep: ret = cpuPrep(&request.cpuPrep); break;
++	case kMsmGemSubmit:  ret = submit(&request.submit); break;
++	case kMsmWaitFence:  ret = waitFence(&request.waitFence); break;
++	case kMsmGemMadvise:
++		request.madvise.retained = 1;
++		ret = kIOReturnSuccess;
++		break;
++	case kMsmSubmitQueueNew:
++		request.queue.id = ++fQueue;
++		ret = kIOReturnSuccess;
++		break;
++	case kMsmSubmitQueueQuery: {
++		uint64_t zero = 0;
++		if (request.query.data && request.query.len >= sizeof(zero))
++			copyout(&zero, (user_addr_t)request.query.data, sizeof(zero));
++		ret = kIOReturnSuccess;
++		break;
++	}
++	case kDrmGemClose: {
++		struct gpu_buffer *b = buffer(request.close.handle);
++		if (!b) ret = kIOReturnBadArgument;
++		else { freeBuffer(b); reap(); ret = kIOReturnSuccess; }
++		break;
++	}
++	case kRedwoodGPUWorked:
++		ret = kIOReturnUnsupported;   /* no per-submission timings from this face yet */
++		break;
++	case kRedwoodSurface: ret = surface(&request.surface); break;
++	case kRedwoodShow:    ret = show(&request.show); break;
++	default:
++		IOLog("RedwoodGPU: request %#x (%zu bytes) is not known here\n",
++		    selector, (size_t)arguments->structureInputSize);
++		ret = kIOReturnUnsupported;
++		break;
++	}
++	if (ret == kIOReturnSuccess && arguments->structureOutput) {
++		size_t out = arguments->structureOutputSize < arguments->structureInputSize ?
++		    arguments->structureOutputSize : arguments->structureInputSize;
++		if (out > sizeof(request)) out = sizeof(request);
++		memcpy(arguments->structureOutput, &request, out);
++	}
++	return ret;
++}
++
++/* Board hand-off: register the service once the CP is running. */
++extern "C" IOReturn liuqin_redwood_start(NativeAdrenoVm *vm, NativeAdrenoSubmit *execbuf,
++    NativeAdrenoRing *ring, const NativeAdrenoRingClock *clock,
++    const NativeAdrenoAbiDeviceInfo *info, uint32_t input_bits, uint32_t output_bits)
++{
++	liuqin_redwood_core(vm, execbuf, ring, clock, info, input_bits, output_bits);
++	if (!liuqin_redwood_ready()) return kIOReturnNotReady;
++	IOService *provider = IOService::getPlatform();
++	RedwoodGPU *service = new RedwoodGPU;
++	if (!service || !provider || !service->init() || !service->attach(provider)) {
++		if (service) service->release();
++		return kIOReturnNoMemory;
++	}
++	if (!service->start(provider)) {
++		service->detach(provider);
++		service->release();
++		return kIOReturnNotReady;
++	}
++	service->release();
++	return kIOReturnSuccess;
++}
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -53,6 +53,7 @@
+ extern "C" const uint8_t native_adreno_sqe_firmware_image[] __attribute__((weak));
+ extern "C" const uint64_t native_adreno_sqe_firmware_image_size __attribute__((weak));
+ #include "NativeAdrenoUserClient.h"
++#include "RedwoodGpuGlue.h"
+ /* sheng native-Metal path (NativeAdrenoPublish.cpp / NativeAdrenoAccelerator.cpp).
+  * Kept opt-in through sheng-gpu-metal=1 until the userspace plugin lands. */
+ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *,NativeAdrenoSubmit *,
+@@ -567,6 +568,15 @@
+             core_->open(NativeAdrenoAbiVersion,vm,execbuf_,&ring_,32,40)==kIOReturnSuccess)
+             core_ready_=true;
+     }
++    /* liuqinredwood=1: register the msm-DRM face (RedwoodGPU) Mesa's freedreno drives. */
++    uint32_t redwood=0;
++    PE_parse_boot_argn("liuqinredwood",&redwood,sizeof(redwood));
++    if(redwood && submit_status==kIOReturnSuccess) {
++        NativeAdrenoRingClock redclock{nullptr,ring_now,nullptr};
++        const IOReturn redwood_status=liuqin_redwood_start(vm,execbuf_,&ring_,&redclock,
++            &liuqin_metal_info,32,40);
++        IOLog("NativeAdreno: redwood start 0x%x\n",redwood_status);
++    }
+     ready_=true;
+     IOLog("NativeAdreno: CP started, fence=%u, interrupts masked=%08x, client=%s\n",
+         start_fence,NativeAdrenoIrq::mask(),core_ready_?"ready":"FAILED");
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -68,3 +68,5 @@
+ iokit/NativeAdreno/kits/ArmSmmu4K/ArmSmmu4KTableMemory.c                            optional iokitcpp
+ iokit/NativeAdreno/LiuqinAdrenoGlue.cpp                            optional iokitcpp
+ iokit/NativeAdreno/NativeAdrenoPublish.cpp                            optional iokitcpp
++iokit/NativeAdreno/RedwoodGpuGlue.cpp                            optional iokitcpp
++iokit/NativeAdreno/RedwoodGpuService.cpp                            optional iokitcpp
