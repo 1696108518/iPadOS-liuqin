@@ -1,0 +1,79 @@
+--- a/iokit/NativeAdreno/NativeAdrenoRing.h
++++ b/iokit/NativeAdreno/NativeAdrenoRing.h
+@@ -97,5 +97,9 @@
+     uint32_t completedFence() const {return completed_;}
+     uint32_t submissions() const {return submissions_;}
+     uint32_t readPointer() const {return rptr_shadow_;}
++    /* On a fence timeout, report what the CP did with the last submission: the
++     * hardware read/write pointers, every memptr word a fence lands in, and the
++     * fault/interrupt registers. Read-only through the service's window. */
++    void debugState(const char *tag);
+ };
+ #endif
+--- a/iokit/NativeAdreno/NativeAdrenoRing.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoRing.cpp
+@@ -71,6 +71,27 @@
+ {
+     poisoned_=true;return kIOReturnIOError;
+ }
++void NativeAdrenoRing::debugState(const char *tag)
++{
++    if(!attached_ || !fence_) {
++        IOLog("NativeAdrenoRing diag: %s not attached\n",tag?tag:"state");
++        return;
++    }
++    /* The CP wrote the memptrs page; drop what this CPU may still cache. */
++    (void)cache_.acquire(cache_.cookie,fence_,fence_bytes_);
++    uint32_t rptr=0xffffffffu,wptr=0xffffffffu,fault=0xffffffffu,cpint=0xffffffffu,rbbm=0xffffffffu;
++    (void)io_.read32(io_.cookie,RingRptr,&rptr);
++    (void)io_.read32(io_.cookie,RingWptr,&wptr);
++    (void)io_.read32(io_.cookie,0x0821,&fault);   /* CP_HW_FAULT_STATUS */
++    (void)io_.read32(io_.cookie,0x0823,&cpint);   /* CP_INTERRUPT_STATUS */
++    (void)io_.read32(io_.cookie,0x0201,&rbbm);    /* RBBM_INT_0_STATUS */
++    IOLog("NativeAdrenoRing diag: %s rptr=%u wptr=%u next=%u seqno=%u completed=%u "
++        "memptrs %08x %08x %08x %08x bv %08x %08x | cp_fault=%08x cp_int=%08x rbbm_int=%08x\n",
++        tag?tag:"state",(unsigned)rptr,(unsigned)wptr,(unsigned)next_,
++        (unsigned)seqno_,(unsigned)completed_,
++        (unsigned)fence_[0],(unsigned)fence_[1],(unsigned)fence_[2],(unsigned)fence_[3],
++        (unsigned)fence_[12],(unsigned)fence_[13],fault,cpint,rbbm);
++}
+ IOReturn NativeAdrenoRing::readRptr(uint32_t *value)
+ {
+     uint32_t rptr=0;
+@@ -292,8 +313,16 @@
+         if(value>seqno_) {poison();return NativeAdrenoRingFencePoisoned;}
+         if(value>=fence)return NativeAdrenoRingFenceComplete;
+         if(!clock || !clock->now_us)return NativeAdrenoRingFenceTimeout;
+-        if(clock->now_us(clock->cookie)-start>=timeout_us)return NativeAdrenoRingFenceTimeout;
+-        if(clock->idle && clock->idle(clock->cookie))return NativeAdrenoRingFenceTimeout;
++        if(clock->now_us(clock->cookie)-start>=timeout_us) {
++            static uint32_t once;
++            if(once++<8)debugState("fence timeout");
++            return NativeAdrenoRingFenceTimeout;
++        }
++        if(clock->idle && clock->idle(clock->cookie)) {
++            static uint32_t once;
++            if(once++<8)debugState("fence idle");
++            return NativeAdrenoRingFenceTimeout;
++        }
+     }
+ }
+ NativeAdrenoRingFence NativeAdrenoRing::wait(uint32_t fence,const NativeAdrenoRingClock *clock,
+@@ -310,7 +339,15 @@
+         if(value>=fence) {if(value>seqno_) {poison();return NativeAdrenoRingFencePoisoned;}completed_=value;
+             return NativeAdrenoRingFenceComplete;}
+         if(!clock || !clock->now_us)return NativeAdrenoRingFenceTimeout;
+-        if(clock->now_us(clock->cookie)-start>=timeout_us)return NativeAdrenoRingFenceTimeout;
+-        if(clock->idle && clock->idle(clock->cookie))return NativeAdrenoRingFenceTimeout;
++        if(clock->now_us(clock->cookie)-start>=timeout_us) {
++            static uint32_t once;
++            if(once++<8)debugState("fence timeout");
++            return NativeAdrenoRingFenceTimeout;
++        }
++        if(clock->idle && clock->idle(clock->cookie)) {
++            static uint32_t once;
++            if(once++<8)debugState("fence idle");
++            return NativeAdrenoRingFenceTimeout;
++        }
+     }
+ }
