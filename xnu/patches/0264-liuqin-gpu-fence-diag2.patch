@@ -1,0 +1,58 @@
+--- a/iokit/NativeAdreno/NativeAdrenoRing.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoRing.cpp
+@@ -313,16 +313,8 @@
+         if(value>seqno_) {poison();return NativeAdrenoRingFencePoisoned;}
+         if(value>=fence)return NativeAdrenoRingFenceComplete;
+         if(!clock || !clock->now_us)return NativeAdrenoRingFenceTimeout;
+-        if(clock->now_us(clock->cookie)-start>=timeout_us) {
+-            static uint32_t once;
+-            if(once++<8)debugState("fence timeout");
+-            return NativeAdrenoRingFenceTimeout;
+-        }
+-        if(clock->idle && clock->idle(clock->cookie)) {
+-            static uint32_t once;
+-            if(once++<8)debugState("fence idle");
+-            return NativeAdrenoRingFenceTimeout;
+-        }
++        if(clock->now_us(clock->cookie)-start>=timeout_us)return NativeAdrenoRingFenceTimeout;
++        if(clock->idle && clock->idle(clock->cookie))return NativeAdrenoRingFenceTimeout;
+     }
+ }
+ NativeAdrenoRingFence NativeAdrenoRing::wait(uint32_t fence,const NativeAdrenoRingClock *clock,
+@@ -339,15 +331,7 @@
+         if(value>=fence) {if(value>seqno_) {poison();return NativeAdrenoRingFencePoisoned;}completed_=value;
+             return NativeAdrenoRingFenceComplete;}
+         if(!clock || !clock->now_us)return NativeAdrenoRingFenceTimeout;
+-        if(clock->now_us(clock->cookie)-start>=timeout_us) {
+-            static uint32_t once;
+-            if(once++<8)debugState("fence timeout");
+-            return NativeAdrenoRingFenceTimeout;
+-        }
+-        if(clock->idle && clock->idle(clock->cookie)) {
+-            static uint32_t once;
+-            if(once++<8)debugState("fence idle");
+-            return NativeAdrenoRingFenceTimeout;
+-        }
++        if(clock->now_us(clock->cookie)-start>=timeout_us)return NativeAdrenoRingFenceTimeout;
++        if(clock->idle && clock->idle(clock->cookie))return NativeAdrenoRingFenceTimeout;
+     }
+ }
+--- a/iokit/NativeAdreno/RedwoodGpuGlue.cpp
++++ b/iokit/NativeAdreno/RedwoodGpuGlue.cpp
+@@ -147,8 +147,14 @@
+     if (!gRedwood.ready) return false;
+     const uint32_t microseconds = timeout_ms > 0xffffffffu / 1000u ? 0xffffffffu : timeout_ms * 1000u;
+     uint32_t observed = 0;
+-    return gRedwood.ring->observeFence(fence, &gRedwood.clock, microseconds, &observed) ==
+-        NativeAdrenoRingFenceComplete;
++    const NativeAdrenoRingFence state =
++        gRedwood.ring->observeFence(fence, &gRedwood.clock, microseconds, &observed);
++    /* The CP accepted the submission but stopped without writing the fence:
++     * report where it got to. This runs only after the system is up, so even a
++     * register read that wedges the bus leaves the whole boot log on disk. */
++    if (state == NativeAdrenoRingFenceTimeout)
++        gRedwood.ring->debugState("redwood wait timeout");
++    return state == NativeAdrenoRingFenceComplete;
+ }
+ 
+ extern "C" uint32_t liuqin_redwood_last_fence(void)
