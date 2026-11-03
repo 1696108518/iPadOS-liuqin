@@ -1,0 +1,103 @@
+--- a/iokit/NativeAdreno/NativeAdrenoSubmit.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoSubmit.cpp
+@@ -87,12 +87,18 @@
+             return kIOReturnBadArgument;
+         uint64_t iova=0;size_t bytes=0;unsigned permissions=0;
+         IOReturn status=vm_->describe(buffer.handle,&iova,&bytes,&permissions);
+-        if(status)return status;
++        if(status){static uint32_t once;if(once++<8)IOLog("NativeAdrenoSub diag: describe 0x%x handle %llu\n",status,(unsigned long long)buffer.handle);return status;}
+         if(!(permissions&ArmSmmu4KRead) || buffer.iova<iova ||
+-            buffer.iova-iova>bytes || buffer.bytes>bytes-(buffer.iova-iova))return kIOReturnBadArgument;
++            buffer.iova-iova>bytes || buffer.bytes>bytes-(buffer.iova-iova)) {
++            static uint32_t once;if(once++<8)IOLog("NativeAdrenoSub diag: window iova 0x%llx req 0x%llx bytes %u perm %u mapbytes %zu\n",
++                (unsigned long long)iova,(unsigned long long)buffer.iova,buffer.bytes,permissions,bytes);
++            return kIOReturnBadArgument;
++        }
+         uint32_t header=0;
+-        if(AdrenoPM4Type7(SubmitIndirectBuffer,SubmitIbWords,&header)!=AdrenoPM4Success)
++        if(AdrenoPM4Type7(SubmitIndirectBuffer,SubmitIbWords,&header)!=AdrenoPM4Success) {
++            static uint32_t once;if(once++<8)IOLog("NativeAdrenoSub diag: pm4 header failed\n");
+             return poison();
++        }
+         words[word_count++]=header;
+         words[word_count++]=(uint32_t)buffer.iova;
+         words[word_count++]=(uint32_t)(buffer.iova>>32);
+@@ -102,12 +108,13 @@
+         if(!known)handles[handle_count++]=buffer.handle;
+     }
+     IOReturn swept=retireCompleted();
+-    if(swept)return swept;
++    if(swept){static uint32_t once;if(once++<8)IOLog("NativeAdrenoSub diag: retire 0x%x\n",swept);return swept;}
+     Job *job=free();
+-    if(!job)return kIOReturnBusy;
++    if(!job){static uint32_t once;if(once++<8)IOLog("NativeAdrenoSub diag: no job slot\n");return kIOReturnBusy;}
+     for(size_t i=0;i<handle_count;++i) {
+         IOReturn status=vm_->holdJob(handles[i]);
+         if(status) {
++            {static uint32_t once;if(once++<8)IOLog("NativeAdrenoSub diag: holdJob 0x%x handle %llu\n",status,(unsigned long long)handles[i]);}
+             while(i) {vm_->retireJobAfterCompletion(handles[--i]);++stats_.references_retired;}
+             return status;
+         }
+@@ -166,6 +173,7 @@
+         status=vm_->invalidateTlb();
+     }
+     if(status) {
++        {static uint32_t once;if(once++<8)IOLog("NativeAdrenoSub diag: publish/tlbi 0x%x\n",status);}
+         for(size_t i=0;i<handle_count;++i) {vm_->retireJobAfterCompletion(handles[i]);++stats_.references_retired;}
+         return status;
+     }
+@@ -179,6 +187,7 @@
+     }
+     status=ring_->submitFramed(words,word_count,&value);
+     if(status) {
++        {static uint32_t once;if(once++<8)IOLog("NativeAdrenoSub diag: ring submit 0x%x poisoned %u words %zu\n",status,ring_->poisoned()?1:0,word_count);}
+         /* A poisoned ring may already have consumed the WPTR write, so the
+          * referenced buffers cannot be retired here. */
+         if(ring_->poisoned()) {
+@@ -190,6 +199,7 @@
+         while(handle_count) {vm_->retireJobAfterCompletion(handles[--handle_count]);++stats_.references_retired;}
+         return status;
+     }
++    {static uint32_t once;if(once++<8)IOLog("NativeAdrenoSub diag: ok fence %u buffers %zu words %zu queue %u\n",value,count,word_count,queue);}
+     for(size_t i=0;i<handle_count;++i)job->handles[i]=handles[i];
+     job->count=handle_count;job->fence=value;job->queue=queue;job->active=true;
+     ++stats_.submissions;
+--- a/iokit/NativeAdreno/NativeAdrenoUserClient.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoUserClient.cpp
+@@ -321,8 +321,11 @@
+     if(!open_)return kIOReturnNotReady;
+     if(!request->buffer_count || request->buffer_count>NativeAdrenoAbiMaxBuffers ||
+         request->reserved)return kIOReturnBadArgument;
+-    if(request->queue>=NativeAdrenoAbiMaxQueues || !queues_[request->queue].active)
++    if(request->queue>=NativeAdrenoAbiMaxQueues || !queues_[request->queue].active) {
++        static uint32_t once;if(once++<8)IOLog("NativeAdrenoUc diag: queue %u base %u active %u\n",
++            request->queue,queue_base_,request->queue<NativeAdrenoAbiMaxQueues?queues_[request->queue].active:0);
+         return kIOReturnBadArgument;
++    }
+     if(request->wait_fence) {
+         if(!clock)return kIOReturnBadArgument;
+         const uint32_t wait_us=request->wait_timeout_ns==0?0:
+@@ -334,16 +337,20 @@
+     NativeAdrenoSubmitBuffer buffers[NativeAdrenoAbiMaxBuffers];
+     for(uint32_t i=0;i<request->buffer_count;++i) {
+         const NativeAdrenoAbiSubmitBuffer &wire=request->buffers[i];
+-        if(!wire.bytes || (wire.bytes&3))return kIOReturnBadArgument;
++        if(!wire.bytes || (wire.bytes&3)){static uint32_t once;if(once++<8)IOLog("NativeAdrenoUc diag: wire bytes %u\n",wire.bytes);return kIOReturnBadArgument;}
+         Entry *entry=find(wire.handle);
+-        if(!entry || !entry->mapped_state)return kIOReturnBadArgument;
++        if(!entry || !entry->mapped_state) {
++            static uint32_t once;if(once++<8)IOLog("NativeAdrenoUc diag: handle %llu entry %d mapped %d\n",
++                (unsigned long long)wire.handle,entry?1:0,entry?entry->mapped_state:0);
++            return kIOReturnBadArgument;
++        }
+         buffers[i]={entry->mapped,wire.iova,(size_t)wire.bytes};
+     }
+     uint32_t fence=0;
+     used_=true;
+     const IOReturn status=submit_->submit(buffers,request->buffer_count,
+         queue_base_+static_cast<uint32_t>(request->queue),&fence);
+-    if(status)return status;
++    if(status){static uint32_t once;if(once++<8)IOLog("NativeAdrenoUc diag: core 0x%x queue %u\n",status,queue_base_+static_cast<uint32_t>(request->queue));return status;}
+     reply->fence=fence;
+     return kIOReturnSuccess;
+ }
