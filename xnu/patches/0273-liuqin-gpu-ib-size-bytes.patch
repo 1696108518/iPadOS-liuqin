@@ -1,0 +1,45 @@
+--- a/iokit/NativeAdreno/NativeAdrenoSubmit.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoSubmit.cpp
+@@ -8,7 +8,7 @@
+  * and IB_SIZE in dwords (bits 0..19), exactly as the pinned adreno_pm4.xml
+  * domain states and Linux msm_gem_submit.c converts the userspace byte size. */
+ enum : uint32_t {SubmitIndirectBuffer=0x3f,SubmitIbWords=3,SubmitMaxJobs=8,
+-    SubmitMaxBuffers=16,SubmitMaxIbBytes=0xfffffu*4u,
++    SubmitMaxBuffers=16,SubmitMaxIbBytes=0xfffffu,
+     SubmitAuditBytes=256u*1024u};   /* IB bytes the write-combine audit compares per submission */
+ extern "C" {volatile uint32_t native_adreno_coherence[8];}
+ /* The submission (1-based count) at which the write-combine audit found a dirty IB line or failed; 0 = never. */
+@@ -103,7 +103,10 @@
+         words[word_count++]=header;
+         words[word_count++]=(uint32_t)buffer.iova;
+         words[word_count++]=(uint32_t)(buffer.iova>>32);
+-        words[word_count++]=(uint32_t)(buffer.bytes/4);
++        /* a7xx_submit() puts the byte size straight into IB_SIZE (bits 0..19,
++         * A5XX_CP_INDIRECT_BUFFER_2_IB_SIZE); dividing by four made the CP
++         * run one dword of the IB and raise CP_OPCODE_ERROR (liuqin). */
++        words[word_count++]=buffer.bytes;
+         bool known=false;
+         for(size_t j=0;j<handle_count;++j)if(handles[j]==buffer.handle) {known=true;break;}
+         if(!known)handles[handle_count++]=buffer.handle;
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -516,7 +516,7 @@
+             if(AdrenoPM4Type7(0x3f,3,&ib[0])==AdrenoPM4Success) {  /* CP_INDIRECT_BUFFER */
+                 ib[1]=(uint32_t)(GpuScratchIova+0x80);
+                 ib[2]=0;
+-                ib[3]=4;
++                ib[3]=16;   /* IB_SIZE is a byte count */
+                 st=ring_.submit(ib,4,&fence);
+             }
+             uint32_t seen=0;
+--- a/iokit/NativeAdreno/RedwoodGpuGlue.cpp
++++ b/iokit/NativeAdreno/RedwoodGpuGlue.cpp
+@@ -209,7 +209,7 @@
+                 scratch[tgt] = 0;
+                 __asm__ volatile("dsb sy" ::: "memory");
+                 (void)NativeAdrenoMaintainPhysicalPages(b[4].physical, 0x1000, NativeAdrenoCleanInvalidate);
+-                uint32_t words[4] = {0x703F0003u, (uint32_t)(b[4].iova + 0x80), 0, 4};
++                uint32_t words[4] = {0x703F0003u, (uint32_t)(b[4].iova + 0x80), 0, 16};
+                 uint32_t fence = 0, seen = 0;
+                 IOReturn st = gRedwood.ring->submit(words, 4, &fence);
+                 NativeAdrenoRingFence f = NativeAdrenoRingFencePoisoned;
