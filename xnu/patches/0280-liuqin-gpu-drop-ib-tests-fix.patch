@@ -1,0 +1,10 @@
+--- a/iokit/NativeAdreno/RedwoodGpuGlue.cpp
++++ b/iokit/NativeAdreno/RedwoodGpuGlue.cpp
+@@ -190,6 +190,7 @@
+      * register read that wedges the bus leaves the whole boot log on disk. */
+     if (state == NativeAdrenoRingFenceTimeout) {
+         gRedwood.ring->debugState("redwood wait timeout");
++    }
+     return state == NativeAdrenoRingFenceComplete;
+ }
+ 
