@@ -23,7 +23,7 @@
 +        static bool tested = false;
 +        if (!tested) {
 +            tested = true;
-+            NativeAdrenoGpuBuffer b[5];
++            NativeAdrenoGpuBuffer b[5] = {};
 +            volatile uint32_t *scratch = static_cast<volatile uint32_t *>(NativeAdrenoGpuContextBufferCpu(4));
 +            if (scratch && !NativeAdrenoGpuContextBuffers(b) && b[4].iova == 0x302000) {
 +                const uint32_t at = 0x80 / 4, tgt = 0xC0 / 4;
@@ -44,7 +44,7 @@
 +                    st, fence, (unsigned)f, seen, (unsigned)scratch[tgt]);
 +            } else {
 +                IOLog("RedwoodGPU: kernel IB test unavailable (scratch %p iova 0x%llx)\n",
-+                    static_cast<const void *>(scratch), (unsigned long long)b[4].iova);
++                    (const void *)(uintptr_t)scratch, (unsigned long long)b[4].iova);
 +            }
 +        }
 +    }
