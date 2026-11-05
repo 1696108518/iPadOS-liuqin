@@ -1,0 +1,34 @@
+--- a/iokit/NativeAdreno/NativeAdrenoRing.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoRing.cpp
+@@ -138,6 +138,20 @@
+         native_adreno_ib_log_count?(unsigned)native_adreno_ib_log[(native_adreno_ib_log_count-1)&3][9]:0u,
+         native_adreno_ib_log_count?(unsigned)native_adreno_ib_log[(native_adreno_ib_log_count-1)&3][10]:0u,
+         native_adreno_ib_log_count?(unsigned)native_adreno_ib_log[(native_adreno_ib_log_count-1)&3][11]:0u);
++    {
++        /* The words this ring actually handed the CP for the last submission:
++         * if they differ from the client's buffer the copy/ordering is wrong,
++         * not the CP's execution. */
++        const uint32_t records=native_adreno_ring_log_count;
++        if(records) {
++            const uint32_t slot=(records-1)&3;
++            volatile uint32_t *r=native_adreno_ring_log[slot];
++            IOLog("NativeAdrenoRing diag: ringlog fence=%u start=%u end=%u words=%u head %08x %08x %08x %08x %08x %08x %08x %08x\n",
++                (unsigned)r[0],(unsigned)r[1],(unsigned)r[2],(unsigned)r[3],
++                (unsigned)r[4],(unsigned)r[5],(unsigned)r[6],(unsigned)r[7],
++                (unsigned)r[8],(unsigned)r[9],(unsigned)r[10],(unsigned)r[11]);
++        }
++    }
+     IOLog("NativeAdrenoRing diag: coherence cached=%08x before=%08x after=%08x drift=%u | wc_audit lines=%u dirty=%u stale=%u fail=%08x distrusted=%u | phys maintained=%u skipped=%u\n",
+         native_adreno_coherence[1],native_adreno_coherence[2],native_adreno_coherence[3],
+         native_adreno_coherence[4],native_adreno_wc_audit[1],native_adreno_wc_audit[2],
+--- a/iokit/NativeAdreno/NativeAdrenoSubmit.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoSubmit.cpp
+@@ -8,7 +8,7 @@
+  * and IB_SIZE in dwords (bits 0..19), exactly as the pinned adreno_pm4.xml
+  * domain states and Linux msm_gem_submit.c converts the userspace byte size. */
+ enum : uint32_t {SubmitIndirectBuffer=0x3f,SubmitIbWords=3,SubmitMaxJobs=8,
+-    SubmitMaxBuffers=16,SubmitMaxIbBytes=0xfffffu,
++    SubmitMaxBuffers=16,SubmitMaxIbBytes=0xfffffu*4u,
+     /* The board's CP never fetches an indirect buffer (every address, size and
+      * memory tried came back CP_OPCODE_ERROR), so the stream is copied into the
+      * ring and executed inline, the path the kernel's own packets use. The ring
