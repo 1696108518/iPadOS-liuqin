@@ -1,0 +1,132 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -495,87 +495,6 @@
+                 st,fence,unsigned(f),seen,*cell);
+         }
+     }
+-    /* Does the CP fetch an indirect buffer at all? The self-test above only
+-     * proved inline PM4 execution; the client's IB failed with CP_OPCODE_ERROR
+-     * while the kernel's view of it was correct. Use the same scratch page the
+-     * self-test wrote: an IB at +0x80 holds a CP_MEM_WRITE to +0xC0. Runs
+-     * before any userland submission, so a CP halt here is not inherited. */
+-    {
+-        void *cpu=NativeAdrenoGpuContextBufferCpu(4);
+-        if(cpu && b[4].physical) {
+-            volatile uint32_t *slot=static_cast<volatile uint32_t *>(cpu);
+-            slot[0x80/4+0]=0x703D0003u;                  /* CP_MEM_WRITE, 3 words */
+-            slot[0x80/4+1]=(uint32_t)(GpuScratchIova+0xC0);
+-            slot[0x80/4+2]=0;
+-            slot[0x80/4+3]=0x600dc0deu;
+-            slot[0xC0/4]=0;
+-            __asm__ volatile("dsb sy":::"memory");
+-            (void)maintainPhysical(b[4].physical,0x1000,NativeAdrenoCleanInvalidate);
+-            /* First an IB that only contains a NOP: if its fence arrives the CP
+-             * fetches indirect buffers at all, and only the CP_MEM_WRITE inside
+-             * the second one is in question. */
+-            slot[0x90/4+0]=0x70100001u;                  /* CP_NOP, one payload word */
+-            slot[0x90/4+1]=0;
+-            __asm__ volatile("dsb sy":::"memory");
+-            (void)maintainPhysical(b[4].physical,0x1000,NativeAdrenoCleanInvalidate);
+-            uint32_t nib[4]={0x703F0003u,(uint32_t)(GpuScratchIova+0x90),0,8},nfence=0;
+-            IOReturn nst=kIOReturnError;
+-            if(AdrenoPM4Type7(0x3f,3,&nib[0])==AdrenoPM4Success) nst=ring_.submit(nib,4,&nfence);
+-            uint32_t nseen=0;
+-            NativeAdrenoRingClock nclock{nullptr,ring_now,nullptr};
+-            const NativeAdrenoRingFence nf=!nst?ring_.wait(nfence,&nclock,100000,&nseen):
+-                NativeAdrenoRingFencePoisoned;
+-            IOLog("NativeAdreno: kernel NOP-IB test submit 0x%x fence=%u result=%u observed=%u\n",
+-                nst,nfence,unsigned(nf),nseen);
+-            uint32_t ib[4]={0},fence=0;
+-            IOReturn st=kIOReturnError;
+-            if(AdrenoPM4Type7(0x3f,3,&ib[0])==AdrenoPM4Success) {  /* CP_INDIRECT_BUFFER */
+-                ib[1]=(uint32_t)(GpuScratchIova+0x80);
+-                ib[2]=0;
+-                ib[3]=16;   /* IB_SIZE is a byte count */
+-                st=ring_.submit(ib,4,&fence);
+-            }
+-            uint32_t seen=0;
+-            NativeAdrenoRingClock clock{nullptr,ring_now,nullptr};
+-            const NativeAdrenoRingFence f=!st?ring_.wait(fence,&clock,100000,&seen):
+-                NativeAdrenoRingFencePoisoned;
+-            (void)maintainPhysical(b[4].physical,0x1000,NativeAdrenoInvalidate);
+-            IOLog("NativeAdreno: kernel IB test submit 0x%x fence=%u result=%u observed=%u wrote=0x%08x (want 0x600dc0de)\n",
+-                st,fence,unsigned(f),seen,slot[0xC0/4]);
+-            /* (2) The same NOP IB addressed physically: if the CP's IB fetch
+-             * bypasses the SMMU this one completes. */
+-            {
+-                uint64_t pa=b[4].physical+0x90;
+-                uint32_t pit[4]={0x703F0003u,(uint32_t)pa,(uint32_t)(pa>>32),8},pfence=0;
+-                IOReturn pst=ring_.submit(pit,4,&pfence);
+-                uint32_t pseen=0;
+-                NativeAdrenoRingClock pclock{nullptr,ring_now,nullptr};
+-                const NativeAdrenoRingFence pf=!pst?ring_.wait(pfence,&pclock,100000,&pseen):
+-                    NativeAdrenoRingFencePoisoned;
+-                IOLog("NativeAdreno: kernel PA NOP-IB test submit 0x%x fence=%u result=%u observed=%u\n",
+-                    pst,pfence,unsigned(pf),pseen);
+-            }
+-            /* (3) The same NOP IB placed in the ring's own mapping at
+-             * GpuRingIova+0x4000, an address the CP provably reads. */
+-            {
+-                volatile uint32_t *ring_words=static_cast<volatile uint32_t *>(NativeAdrenoGpuContextBufferCpu(1));
+-                if(ring_words) {
+-                    ring_words[0x4000/4]=0x70100001u;
+-                    ring_words[0x4000/4+1]=0;
+-                    __asm__ volatile("dsb sy":::"memory");
+-                    uint64_t ra=GpuRingIova+0x4000;
+-                    uint32_t rit[4]={0x703F0003u,(uint32_t)ra,(uint32_t)(ra>>32),8},rfence=0;
+-                    IOReturn rst=ring_.submit(rit,4,&rfence);
+-                    uint32_t rseen=0;
+-                    NativeAdrenoRingClock rclock{nullptr,ring_now,nullptr};
+-                    const NativeAdrenoRingFence rf=!rst?ring_.wait(rfence,&rclock,100000,&rseen):
+-                        NativeAdrenoRingFencePoisoned;
+-                    IOLog("NativeAdreno: kernel ring NOP-IB test submit 0x%x fence=%u result=%u observed=%u\n",
+-                        rst,rfence,unsigned(rf),rseen);
+-                }
+-            }
+-        }
+-    }
+     /* Interrupts are an optimisation here: the ring retires fences by polling
+      * the memptrs page, so a mask register that does not keep every requested
+      * bit must not block the submission path.  Report it and carry on. */
+--- a/iokit/NativeAdreno/RedwoodGpuGlue.cpp
++++ b/iokit/NativeAdreno/RedwoodGpuGlue.cpp
+@@ -190,39 +190,6 @@
+      * register read that wedges the bus leaves the whole boot log on disk. */
+     if (state == NativeAdrenoRingFenceTimeout) {
+         gRedwood.ring->debugState("redwood wait timeout");
+-        /* One kernel-memory indirect buffer through the same ring: the scratch
+-         * page at 0x302000 was mapped during bring-up and the CP has read and
+-         * written it, so this separates "the CP cannot fetch an IB" from "the
+-         * CP cannot see the client BO's pages" (the user IB at 0x120000 errored
+-         * with CP_OPCODE_ERROR while the kernel's view of it was correct). */
+-        static bool tested = false;
+-        if (!tested) {
+-            tested = true;
+-            NativeAdrenoGpuBuffer b[5] = {};
+-            volatile uint32_t *scratch = static_cast<volatile uint32_t *>(NativeAdrenoGpuContextBufferCpu(4));
+-            if (scratch && !NativeAdrenoGpuContextBuffers(b) && b[4].iova == 0x302000) {
+-                const uint32_t at = 0x80 / 4, tgt = 0xC0 / 4;
+-                scratch[at + 0] = 0x703D0003u;                    /* CP_MEM_WRITE, 3 words */
+-                scratch[at + 1] = (uint32_t)(b[4].iova + 0xC0);
+-                scratch[at + 2] = 0;
+-                scratch[at + 3] = 0x600dc0deu;
+-                scratch[tgt] = 0;
+-                __asm__ volatile("dsb sy" ::: "memory");
+-                (void)NativeAdrenoMaintainPhysicalPages(b[4].physical, 0x1000, NativeAdrenoCleanInvalidate);
+-                uint32_t words[4] = {0x703F0003u, (uint32_t)(b[4].iova + 0x80), 0, 16};
+-                uint32_t fence = 0, seen = 0;
+-                IOReturn st = gRedwood.ring->submit(words, 4, &fence);
+-                NativeAdrenoRingFence f = NativeAdrenoRingFencePoisoned;
+-                if (!st) f = gRedwood.ring->wait(fence, &gRedwood.clock, 1000000, &seen);
+-                (void)NativeAdrenoMaintainPhysicalPages(b[4].physical, 0x1000, NativeAdrenoInvalidate);
+-                IOLog("RedwoodGPU: kernel IB test submit 0x%x fence=%u result=%u observed=%u wrote=%08x (want 600dc0de)\n",
+-                    st, fence, (unsigned)f, seen, (unsigned)scratch[tgt]);
+-            } else {
+-                IOLog("RedwoodGPU: kernel IB test unavailable (scratch %p iova 0x%llx)\n",
+-                    (const void *)(uintptr_t)scratch, (unsigned long long)b[4].iova);
+-            }
+-        }
+-    }
+     return state == NativeAdrenoRingFenceComplete;
+ }
+ 
