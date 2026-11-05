@@ -1,0 +1,92 @@
+--- a/iokit/NativeAdreno/NativeAdrenoSubmit.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoSubmit.cpp
+@@ -9,6 +9,11 @@
+  * domain states and Linux msm_gem_submit.c converts the userspace byte size. */
+ enum : uint32_t {SubmitIndirectBuffer=0x3f,SubmitIbWords=3,SubmitMaxJobs=8,
+     SubmitMaxBuffers=16,SubmitMaxIbBytes=0xfffffu,
++    /* The board's CP never fetches an indirect buffer (every address, size and
++     * memory tried came back CP_OPCODE_ERROR), so the stream is copied into the
++     * ring and executed inline, the path the kernel's own packets use. The ring
++     * is 32 KiB; this leaves room for the framing and fence. */
++    SubmitInlineMaxWords=7800,
+     SubmitAuditBytes=256u*1024u};   /* IB bytes the write-combine audit compares per submission */
+ extern "C" {volatile uint32_t native_adreno_coherence[8];}
+ /* The submission (1-based count) at which the write-combine audit found a dirty IB line or failed; 0 = never. */
+@@ -81,7 +86,7 @@
+     if(!buffers || !count || count>SubmitMaxBuffers)return kIOReturnBadArgument;
+     /* Every buffer is validated against the live VM before any reference. */
+     uint64_t handles[SubmitMaxBuffers];size_t handle_count=0;
+-    uint32_t words[SubmitMaxBuffers*(1+SubmitIbWords)];size_t word_count=0;
++    size_t total_words=0;
+     for(size_t i=0;i<count;++i) {
+         const NativeAdrenoSubmitBuffer &buffer=buffers[i];
+         if(!buffer.handle || !buffer.bytes || (buffer.bytes&3) || buffer.bytes>SubmitMaxIbBytes)
+@@ -95,18 +100,7 @@
+                 (unsigned long long)iova,(unsigned long long)buffer.iova,buffer.bytes,permissions,bytes);
+             return kIOReturnBadArgument;
+         }
+-        uint32_t header=0;
+-        if(AdrenoPM4Type7(SubmitIndirectBuffer,SubmitIbWords,&header)!=AdrenoPM4Success) {
+-            static uint32_t once;if(once++<8)IOLog("NativeAdrenoSub diag: pm4 header failed\n");
+-            return poison();
+-        }
+-        words[word_count++]=header;
+-        words[word_count++]=(uint32_t)buffer.iova;
+-        words[word_count++]=(uint32_t)(buffer.iova>>32);
+-        /* a7xx_submit() puts the byte size straight into IB_SIZE (bits 0..19,
+-         * A5XX_CP_INDIRECT_BUFFER_2_IB_SIZE); dividing by four made the CP
+-         * run one dword of the IB and raise CP_OPCODE_ERROR (liuqin). */
+-        words[word_count++]=buffer.bytes;
++        total_words+=buffer.bytes/4;
+         bool known=false;
+         for(size_t j=0;j<handle_count;++j)if(handles[j]==buffer.handle) {known=true;break;}
+         if(!known)handles[handle_count++]=buffer.handle;
+@@ -189,6 +183,33 @@
+         for(unsigned i=0;i<28;++i)native_adreno_ib_log[slot][4+i]=head[i];
+         native_adreno_ib_log_count=native_adreno_ib_log_count+1;
+     }
++    const uint32_t *words=nullptr;size_t word_count=0;uint32_t *inline_words=nullptr;
++    if(total_words) {
++        if(total_words>SubmitInlineMaxWords) {
++            static uint32_t once;if(once++<8)IOLog("NativeAdrenoSub diag: inline too large words %zu\n",total_words);
++            while(handle_count) {vm_->retireJobAfterCompletion(handles[--handle_count]);++stats_.references_retired;}
++            return kIOReturnNoResources;
++        }
++        inline_words=IONewData(uint32_t,total_words);
++        if(!inline_words) {
++            while(handle_count) {vm_->retireJobAfterCompletion(handles[--handle_count]);++stats_.references_retired;}
++            return kIOReturnNoMemory;
++        }
++        size_t at=0;
++        for(size_t i=0;i<count;++i) {
++            const size_t dwords=buffers[i].bytes/4;
++            const IOReturn copied=vm_->peekWords(buffers[i].iova,inline_words+at,dwords);
++            if(copied) {
++                static uint32_t once;if(once++<8)IOLog("NativeAdrenoSub diag: inline copy 0x%x iova 0x%llx words %zu\n",
++                    copied,(unsigned long long)buffers[i].iova,dwords);
++                IOFreeData(inline_words,total_words);
++                while(handle_count) {vm_->retireJobAfterCompletion(handles[--handle_count]);++stats_.references_retired;}
++                return copied;
++            }
++            at+=dwords;
++        }
++        words=inline_words;word_count=total_words;
++    }
+     {
+         /* sheng-gpu-unframed=1: hand user IBs to the ring without the A7XX
+          * BR/BV thread framing (the plain path the kernel's own packets use),
+@@ -206,11 +227,14 @@
+             *job=Job{};++stats_.poisoned_jobs;
+             for(size_t i=0;i<handle_count;++i)job->handles[i]=handles[i];
+             job->count=handle_count;job->queue=queue;job->active=true;
++            if(inline_words)IOFreeData(inline_words,total_words);
+             return poison();
+         }
+         while(handle_count) {vm_->retireJobAfterCompletion(handles[--handle_count]);++stats_.references_retired;}
++        if(inline_words)IOFreeData(inline_words,total_words);
+         return status;
+     }
++    if(inline_words)IOFreeData(inline_words,total_words);
+     {static uint32_t once;if(once++<8)IOLog("NativeAdrenoSub diag: ok fence %u buffers %zu words %zu queue %u\n",value,count,word_count,queue);}
+     for(size_t i=0;i<handle_count;++i)job->handles[i]=handles[i];
+     job->count=handle_count;job->fence=value;job->queue=queue;job->active=true;
