@@ -1,0 +1,41 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -542,6 +542,38 @@
+             (void)maintainPhysical(b[4].physical,0x1000,NativeAdrenoInvalidate);
+             IOLog("NativeAdreno: kernel IB test submit 0x%x fence=%u result=%u observed=%u wrote=0x%08x (want 0x600dc0de)\n",
+                 st,fence,unsigned(f),seen,slot[0xC0/4]);
++            /* (2) The same NOP IB addressed physically: if the CP's IB fetch
++             * bypasses the SMMU this one completes. */
++            {
++                uint64_t pa=b[4].physical+0x90;
++                uint32_t pit[4]={0x703F0003u,(uint32_t)pa,(uint32_t)(pa>>32),8},pfence=0;
++                IOReturn pst=ring_.submit(pit,4,&pfence);
++                uint32_t pseen=0;
++                NativeAdrenoRingClock pclock{nullptr,ring_now,nullptr};
++                const NativeAdrenoRingFence pf=!pst?ring_.wait(pfence,&pclock,100000,&pseen):
++                    NativeAdrenoRingFencePoisoned;
++                IOLog("NativeAdreno: kernel PA NOP-IB test submit 0x%x fence=%u result=%u observed=%u\n",
++                    pst,pfence,unsigned(pf),pseen);
++            }
++            /* (3) The same NOP IB placed in the ring's own mapping at
++             * GpuRingIova+0x4000, an address the CP provably reads. */
++            {
++                volatile uint32_t *ring_words=static_cast<volatile uint32_t *>(NativeAdrenoGpuContextBufferCpu(1));
++                if(ring_words) {
++                    ring_words[0x4000/4]=0x70100001u;
++                    ring_words[0x4000/4+1]=0;
++                    __asm__ volatile("dsb sy":::"memory");
++                    uint64_t ra=GpuRingIova+0x4000;
++                    uint32_t rit[4]={0x703F0003u,(uint32_t)ra,(uint32_t)(ra>>32),8},rfence=0;
++                    IOReturn rst=ring_.submit(rit,4,&rfence);
++                    uint32_t rseen=0;
++                    NativeAdrenoRingClock rclock{nullptr,ring_now,nullptr};
++                    const NativeAdrenoRingFence rf=!rst?ring_.wait(rfence,&rclock,100000,&rseen):
++                        NativeAdrenoRingFencePoisoned;
++                    IOLog("NativeAdreno: kernel ring NOP-IB test submit 0x%x fence=%u result=%u observed=%u\n",
++                        rst,rfence,unsigned(rf),rseen);
++                }
++            }
+         }
+     }
+     /* Interrupts are an optimisation here: the ring retires fences by polling
