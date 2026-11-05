@@ -1,0 +1,53 @@
+--- a/iokit/NativeAdreno/RedwoodGpuGlue.cpp
++++ b/iokit/NativeAdreno/RedwoodGpuGlue.cpp
+@@ -14,6 +14,7 @@
+ #include <vm/vm_kern.h>
+ #include "RedwoodGpuGlue.h"
+ #include "NativeAdrenoKernelTime.h"
++#include "NativeAdrenoGpuContext.h"
+ 
+ /* osfmk/arm/machine_routines.h, which <machine/...> does not expose to C++
+  * here; the same mapping the ladder's step 22 uses for the framebuffer. */
+@@ -187,8 +188,41 @@
+     /* The CP accepted the submission but stopped without writing the fence:
+      * report where it got to. This runs only after the system is up, so even a
+      * register read that wedges the bus leaves the whole boot log on disk. */
+-    if (state == NativeAdrenoRingFenceTimeout)
++    if (state == NativeAdrenoRingFenceTimeout) {
+         gRedwood.ring->debugState("redwood wait timeout");
++        /* One kernel-memory indirect buffer through the same ring: the scratch
++         * page at 0x302000 was mapped during bring-up and the CP has read and
++         * written it, so this separates "the CP cannot fetch an IB" from "the
++         * CP cannot see the client BO's pages" (the user IB at 0x120000 errored
++         * with CP_OPCODE_ERROR while the kernel's view of it was correct). */
++        static bool tested = false;
++        if (!tested) {
++            tested = true;
++            NativeAdrenoGpuBuffer b[5];
++            volatile uint32_t *scratch = static_cast<volatile uint32_t *>(NativeAdrenoGpuContextBufferCpu(4));
++            if (scratch && !NativeAdrenoGpuContextBuffers(b) && b[4].iova == 0x302000) {
++                const uint32_t at = 0x80 / 4, tgt = 0xC0 / 4;
++                scratch[at + 0] = 0x703D0003u;                    /* CP_MEM_WRITE, 3 words */
++                scratch[at + 1] = (uint32_t)(b[4].iova + 0xC0);
++                scratch[at + 2] = 0;
++                scratch[at + 3] = 0x600dc0deu;
++                scratch[tgt] = 0;
++                __asm__ volatile("dsb sy" ::: "memory");
++                (void)NativeAdrenoMaintainPhysicalPages(b[4].physical, 0x1000, NativeAdrenoCleanInvalidate);
++                uint32_t words[4] = {0x703F0003u, (uint32_t)(b[4].iova + 0x80), 0, 4};
++                uint32_t fence = 0, seen = 0;
++                IOReturn st = gRedwood.ring->submit(words, 4, &fence);
++                NativeAdrenoRingFence f = NativeAdrenoRingFencePoisoned;
++                if (!st) f = gRedwood.ring->wait(fence, &gRedwood.clock, 1000000, &seen);
++                (void)NativeAdrenoMaintainPhysicalPages(b[4].physical, 0x1000, NativeAdrenoInvalidate);
++                IOLog("RedwoodGPU: kernel IB test submit 0x%x fence=%u result=%u observed=%u wrote=%08x (want 600dc0de)\n",
++                    st, fence, (unsigned)f, seen, (unsigned)scratch[tgt]);
++            } else {
++                IOLog("RedwoodGPU: kernel IB test unavailable (scratch %p iova 0x%llx)\n",
++                    static_cast<const void *>(scratch), (unsigned long long)b[4].iova);
++            }
++        }
++    }
+     return state == NativeAdrenoRingFenceComplete;
+ }
+ 
