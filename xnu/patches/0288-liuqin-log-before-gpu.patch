@@ -1,0 +1,28 @@
+--- a/bsd/dev/liuqin_ufs.c
++++ b/bsd/dev/liuqin_ufs.c
+@@ -1804,17 +1804,23 @@
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	liuqin_boot_mark("ufs partition ready");
+ 	liuqin_fw_load();
+ 	liuqin_boot_mark("firmware area loaded");
++	/*
++	 * Before the GPU ladder: the ladder, its services and the RedwoodGPU
++	 * face all run from here, and a panic in any of them must still leave
++	 * the console on the partition. The log thread only needs su.ready,
++	 * which is set above.
++	 */
++	liuqin_log_start();
++	liuqin_boot_mark("log thread started");
+ 	liuqin_adreno_init();
+ 	liuqin_input_init();
+ 	liuqin_boot_mark("gpu ladder done");
+ 	if (liuqin_adreno_services_start) {
+ 		liuqin_adreno_services_start();
+ 		liuqin_boot_mark("adreno services started");
+ 	}
+-	liuqin_log_start();
+-	liuqin_boot_mark("log thread started");
+ 	liuqin_sample_start();
+ 	liuqin_touch_probe();
+ 	/* gated by liuqinusb (0 off, 1 report, 2 device); the QUSB2 PHY address is sweet's
+ 	 * and does not exist here, so liuqin_usb.c skips it unless asked. */
