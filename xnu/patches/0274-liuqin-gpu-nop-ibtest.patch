@@ -1,0 +1,25 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -511,6 +511,22 @@
+             slot[0xC0/4]=0;
+             __asm__ volatile("dsb sy":::"memory");
+             (void)maintainPhysical(b[4].physical,0x1000,NativeAdrenoCleanInvalidate);
++            /* First an IB that only contains a NOP: if its fence arrives the CP
++             * fetches indirect buffers at all, and only the CP_MEM_WRITE inside
++             * the second one is in question. */
++            slot[0x90/4+0]=0x70100001u;                  /* CP_NOP, one payload word */
++            slot[0x90/4+1]=0;
++            __asm__ volatile("dsb sy":::"memory");
++            (void)maintainPhysical(b[4].physical,0x1000,NativeAdrenoCleanInvalidate);
++            uint32_t nib[4]={0x703F0003u,(uint32_t)(GpuScratchIova+0x90),0,8},nfence=0;
++            IOReturn nst=kIOReturnError;
++            if(AdrenoPM4Type7(0x3f,3,&nib[0])==AdrenoPM4Success) nst=ring_.submit(nib,4,&nfence);
++            uint32_t nseen=0;
++            NativeAdrenoRingClock nclock{nullptr,ring_now,nullptr};
++            const NativeAdrenoRingFence nf=!nst?ring_.wait(nfence,&nclock,100000,&nseen):
++                NativeAdrenoRingFencePoisoned;
++            IOLog("NativeAdreno: kernel NOP-IB test submit 0x%x fence=%u result=%u observed=%u\n",
++                nst,nfence,unsigned(nf),nseen);
+             uint32_t ib[4]={0},fence=0;
+             IOReturn st=kIOReturnError;
+             if(AdrenoPM4Type7(0x3f,3,&ib[0])==AdrenoPM4Success) {  /* CP_INDIRECT_BUFFER */
