@@ -1,0 +1,61 @@
+--- a/iokit/NativeAdreno/RedwoodGpuGlue.cpp
++++ b/iokit/NativeAdreno/RedwoodGpuGlue.cpp
+@@ -22,6 +22,12 @@
+ 
+ /* Defined (and initialized) by NativeAdrenoUserClient.cpp. */
+ extern "C" extern volatile uint32_t native_adreno_wc_enabled;
++/* Defined by NativeAdrenoSubmit.cpp: the first words of the recent command
++ * buffers, as the kernel's mapping of them read before submission. A plain
++ * extern inside an extern "C" block is a definition on this tree, so the
++ * explicit `extern "C" extern` form is used here too. */
++extern "C" extern volatile uint32_t native_adreno_ib_log[4][4+28];
++extern "C" extern volatile uint32_t native_adreno_ib_log_count;
+ 
+ namespace {
+ struct RedwoodGpuCore {
+@@ -201,6 +207,45 @@
+      * register read that wedges the bus leaves the whole boot log on disk. */
+     if (state == NativeAdrenoRingFenceTimeout) {
+         gRedwood.ring->debugState("redwood wait timeout");
++        /* What the CP was last asked to do, and what became of it. The client's
++         * first packet is a CP_MEM_WRITE (type7 opcode 0x3d, three payload
++         * words): its destination is the two words after the header, and the
++         * destination's contents say whether the write itself landed. */
++        const uint32_t records = native_adreno_ib_log_count;
++        if (records) {
++            volatile uint32_t *record = native_adreno_ib_log[(records - 1) & 3];
++            if (record[4] == 0x703D0003u) {
++                const uint64_t address = ((uint64_t)(uint32_t)record[6] << 32) |
++                    (uint32_t)record[5];
++                uint32_t cached = 0, dram = 0;
++                (void)gRedwood.vm->sampleWord(address, &cached, &dram);
++                IOLog("RedwoodGPU: client write target 0x%llx reads %08x "
++                    "(dram %08x), want 600dc0de\n",
++                    (unsigned long long)address, cached, dram);
++            }
++        }
++        /* Whether the CP (not the packet) stopped: one kernel-owned packet
++         * through the same ring, into the bring-up scratch page the CP has
++         * written before. A retired fence here means the CP still runs and the
++         * failure is the client buffer's address; a timeout means the client
++         * submission wedged the CP. */
++        static bool replayed = false;
++        if (!replayed) {
++            replayed = true;
++            NativeAdrenoGpuBuffer buffers[5] = {};
++            if (!NativeAdrenoGpuContextBuffers(buffers) && buffers[4].iova) {
++                uint32_t words[4] = {0x703D0003u, (uint32_t)buffers[4].iova, 0,
++                    0x600dc0deu};
++                uint32_t fence = 0, seen = 0;
++                IOReturn submitted = gRedwood.ring->submit(words, 4, &fence);
++                NativeAdrenoRingFence replay = NativeAdrenoRingFencePoisoned;
++                if (!submitted)
++                    replay = gRedwood.ring->wait(fence, &gRedwood.clock, 1000000, &seen);
++                IOLog("RedwoodGPU: post-timeout kernel CP_MEM_WRITE submit 0x%x "
++                    "fence=%u result=%u observed=%u\n",
++                    submitted, fence, (unsigned)replay, seen);
++            }
++        }
+     }
+     return state == NativeAdrenoRingFenceComplete;
+ }
