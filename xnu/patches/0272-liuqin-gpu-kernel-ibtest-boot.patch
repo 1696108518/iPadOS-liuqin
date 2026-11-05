@@ -1,0 +1,42 @@
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -495,6 +495,39 @@
+                 st,fence,unsigned(f),seen,*cell);
+         }
+     }
++    /* Does the CP fetch an indirect buffer at all? The self-test above only
++     * proved inline PM4 execution; the client's IB failed with CP_OPCODE_ERROR
++     * while the kernel's view of it was correct. Use the same scratch page the
++     * self-test wrote: an IB at +0x80 holds a CP_MEM_WRITE to +0xC0. Runs
++     * before any userland submission, so a CP halt here is not inherited. */
++    {
++        void *cpu=NativeAdrenoGpuContextBufferCpu(4);
++        if(cpu && b[4].physical) {
++            volatile uint32_t *slot=static_cast<volatile uint32_t *>(cpu);
++            slot[0x80/4+0]=0x703D0003u;                  /* CP_MEM_WRITE, 3 words */
++            slot[0x80/4+1]=(uint32_t)(GpuScratchIova+0xC0);
++            slot[0x80/4+2]=0;
++            slot[0x80/4+3]=0x600dc0deu;
++            slot[0xC0/4]=0;
++            __asm__ volatile("dsb sy":::"memory");
++            (void)maintainPhysical(b[4].physical,0x1000,NativeAdrenoCleanInvalidate);
++            uint32_t ib[4]={0},fence=0;
++            IOReturn st=kIOReturnError;
++            if(AdrenoPM4Type7(0x3f,3,&ib[0])==AdrenoPM4Success) {  /* CP_INDIRECT_BUFFER */
++                ib[1]=(uint32_t)(GpuScratchIova+0x80);
++                ib[2]=0;
++                ib[3]=4;
++                st=ring_.submit(ib,4,&fence);
++            }
++            uint32_t seen=0;
++            NativeAdrenoRingClock clock{nullptr,ring_now,nullptr};
++            const NativeAdrenoRingFence f=!st?ring_.wait(fence,&clock,100000,&seen):
++                NativeAdrenoRingFencePoisoned;
++            (void)maintainPhysical(b[4].physical,0x1000,NativeAdrenoInvalidate);
++            IOLog("NativeAdreno: kernel IB test submit 0x%x fence=%u result=%u observed=%u wrote=0x%08x (want 0x600dc0de)\n",
++                st,fence,unsigned(f),seen,slot[0xC0/4]);
++        }
++    }
+     /* Interrupts are an optimisation here: the ring retires fences by polling
+      * the memptrs page, so a mask register that does not keep every requested
+      * bit must not block the submission path.  Report it and carry on. */
