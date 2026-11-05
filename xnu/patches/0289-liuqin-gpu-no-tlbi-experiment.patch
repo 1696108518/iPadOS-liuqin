@@ -1,0 +1,19 @@
+--- a/iokit/NativeAdreno/NativeAdrenoSubmit.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoSubmit.cpp
+@@ -167,9 +167,15 @@
+                 native_adreno_coherence[5]=cached;native_adreno_coherence[6]=before;native_adreno_coherence[7]=after;
+             }
+             native_adreno_coherence[4]=native_adreno_coherence[4]+1;
+         }
+-        status=vm_->invalidateTlb();
++        /* Experiment: do not invalidate the context bank before the submission. The
++         * client packet stops at its first opcode while the kernel's own identical
++         * packet through the same ring succeeds; this TLBIALL, which the kernel path
++         * never runs and which the client path runs between mapping and CP, is the last
++         * known difference. The client BO addresses are fresh in this boot, so no stale
++         * translation of theirs can survive. */
++        {static uint32_t once;if(once++<8)IOLog("NativeAdrenoSub diag: TLBI skipped\n");}
+     }
+     if(status) {
+         {static uint32_t once;if(once++<8)IOLog("NativeAdrenoSub diag: publish/tlbi 0x%x\n",status);}
+         for(size_t i=0;i<handle_count;++i) {vm_->retireJobAfterCompletion(handles[i]);++stats_.references_retired;}
