@@ -1,0 +1,54 @@
+--- a/iokit/NativeAdreno/RedwoodGpuGlue.cpp
++++ b/iokit/NativeAdreno/RedwoodGpuGlue.cpp
+@@ -99,36 +99,6 @@
+             (unsigned long long)kGuardBytes);
+         (void)guard->release();
+     }
+-    /* Preflight, before any client exists: the CP writes one word into a BO
+-     * allocated exactly the way liuqin_redwood_alloc allocates a client's
+-     * (pooled, write-combined, mapped by this VM at the finder's address).
+-     * A pass here means the client BO's pages and address are reachable by the
+-     * CP, so a later client failure is in NativeAdrenoSubmit's pre-submission
+-     * steps; a failure with this fresh CP means the BO's placement, attributes
+-     * or mapping are what the CP cannot write. */
+-    {
+-        NativeAdrenoMemory *bo = new NativeAdrenoMemory;
+-        uint64_t bo_handle = 0, bo_iova = 0;
+-        if (bo && !liuqin_redwood_alloc(bo, 0x10000, 0, &bo_handle, &bo_iova)) {
+-            const uint64_t at = bo_iova + 0x40;
+-            uint32_t words[4] = {0x703D0003u, (uint32_t)at, (uint32_t)(at >> 32),
+-                0x600dc0deu};
+-            uint32_t fence = 0, seen = 0;
+-            IOReturn submitted = ring->submit(words, 4, &fence);
+-            NativeAdrenoRingFence result = NativeAdrenoRingFencePoisoned;
+-            if (!submitted) result = ring->wait(fence, &gRedwood.clock, 200000, &seen);
+-            uint32_t read_back = 0;
+-            (void)vm->peekWords(at, &read_back, 1);
+-            IOLog("RedwoodGPU: preflight client-style BO 0x%llx physical 0x%llx "
+-                "spans %zu submit 0x%x fence=%u result=%u reads %08x "
+-                "(want 600dc0de)\n",
+-                (unsigned long long)bo_iova,
+-                (unsigned long long)(bo->spanCount() ? bo->spans()[0].physical : 0),
+-                bo->spanCount(), submitted, fence, (unsigned)result, read_back);
+-        } else {
+-            IOLog("RedwoodGPU: preflight client-style BO allocation failed\n");
+-        }
+-    }
+     /* Nothing has asked for the A7XX context entry on this ring yet: only
+      * NativeAdrenoUserClient::open() calls requestContextReset(), and the legacy
+      * client's open failed at boot (client=FAILED). Without the context entry
+@@ -182,6 +152,14 @@
+         IOLog("RedwoodGPU: map of %llu bytes at 0x%llx failed 0x%x\n",
+             (unsigned long long)bytes, (unsigned long long)address, status);
+         return status;
++    }
++    {
++        static uint32_t said;
++        if (said++ < 16)
++            IOLog("RedwoodGPU: BO %llu bytes at 0x%llx physical 0x%llx spans %zu\n",
++                (unsigned long long)bytes, (unsigned long long)address,
++                (unsigned long long)(memory->spanCount() ? memory->spans()[0].physical : 0),
++                memory->spanCount());
+     }
+     *vm_handle = handle;
+     *iova = address;
