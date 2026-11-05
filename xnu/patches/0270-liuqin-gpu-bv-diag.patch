@@ -1,0 +1,29 @@
+--- a/iokit/NativeAdreno/NativeAdrenoRing.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoRing.cpp
+@@ -99,12 +99,26 @@
+     (void)io_.read32(io_.cookie,0x0928,&ib1_lo);  /* CP_IB1_BASE */
+     (void)io_.read32(io_.cookie,0x0929,&ib1_hi);
+     (void)io_.read32(io_.cookie,0x092a,&ib1_rem); /* CP_IB1_REM_SIZE (dwords to go) */
++    /* The BV thread's own view (a6xx.xml A7XX): where it is and what it was doing. */
++    uint32_t bv_rptr=0xffffffffu,bv_fault=0xffffffffu,bv_prot=0xffffffffu;
++    uint32_t bv_ib1_lo=0xffffffffu,bv_ib1_hi=0xffffffffu,bv_rem=0xffffffffu;
++    uint32_t sqe_cntl=0xffffffffu,misc=0xffffffffu;
++    (void)io_.read32(io_.cookie,0x0a66,&bv_rptr);  /* CP_BV_RB_RPTR */
++    (void)io_.read32(io_.cookie,0x0a64,&bv_fault); /* CP_BV_HW_FAULT */
++    (void)io_.read32(io_.cookie,0x0a61,&bv_prot);  /* CP_BV_PROTECT_STATUS */
++    (void)io_.read32(io_.cookie,0x0a6d,&bv_ib1_lo);/* CP_BV_IB1_BASE */
++    (void)io_.read32(io_.cookie,0x0a6e,&bv_ib1_hi);
++    (void)io_.read32(io_.cookie,0x0a70,&bv_rem);   /* CP_BV_IB1_REM_SIZE */
++    (void)io_.read32(io_.cookie,0x0808,&sqe_cntl); /* CP_SQE_CNTL */
++    (void)io_.read32(io_.cookie,0x0840,&misc);     /* CP_MISC_CNTL */
+     IOLog("NativeAdrenoRing diag: %s rptr=%u wptr=%u next=%u seqno=%u completed=%u "
+         "memptrs %08x %08x %08x %08x bv %08x %08x | cp_fault=%08x cp_int=%08x rbbm_int=%08x\n",
+         tag?tag:"state",(unsigned)rptr,(unsigned)wptr,(unsigned)next_,
+         (unsigned)seqno_,(unsigned)completed_,
+         (unsigned)fence_[0],(unsigned)fence_[1],(unsigned)fence_[2],(unsigned)fence_[3],
+         (unsigned)fence_[12],(unsigned)fence_[13],fault,cpint,rbbm);
++    IOLog("NativeAdrenoRing diag: bv rptr=%u ib1=%08x:%08x rem=%u fault=%08x protect=%08x | cp_sqe_cntl=%08x cp_misc=%08x\n",
++        bv_rptr,bv_ib1_hi,bv_ib1_lo,bv_rem,bv_fault,bv_prot,sqe_cntl,misc);
+     IOLog("NativeAdrenoRing diag: cp_ib1=%08x:%08x rem=%u protect=%08x | iblog fences=%u "
+         "fence=%u iova=%08x:%08x bytes=%u head %08x %08x %08x %08x %08x %08x %08x %08x\n",
+         ib1_hi,ib1_lo,ib1_rem,protect,(unsigned)native_adreno_ib_log_count,
