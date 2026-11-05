@@ -1,0 +1,18 @@
+--- a/iokit/NativeAdreno/NativeAdrenoVm.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoVm.cpp
+@@ -335,7 +335,14 @@
+         const Mapping &m=mappings_[i];
+         if(!m.memory)continue;
+         if(coherentMapping(m.writeback) || importedUntouched(m.memory)) {native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;continue;}
+-        if(m.memory->publishForDevice(0,m.memory->bytes(),true,distrust_write_combined_))return fail(ArmSmmu4KIoError);
++        /* Write-combined BOs are maintained by physical address as well: on this
++         * board a client's uncached physical-range view of the pool still cached
++         * the writes (int-2xx liuqin: the IB's first word was 0x703d0003 in the
++         * cache and 0xffffffff in DRAM right after the clean), and the WC audit
++         * that used to catch this has no hooks here. publishForDevice's own WC
++         * fast path assumes no CPU mapping caches those pages, which is not
++         * true for client mappings. */
++        if(m.memory->publishForDevice(0,m.memory->bytes(),true,true))return fail(ArmSmmu4KIoError);
+     }
+     return kIOReturnSuccess;
+ }
