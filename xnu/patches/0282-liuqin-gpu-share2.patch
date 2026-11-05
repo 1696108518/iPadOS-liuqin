@@ -1,0 +1,25 @@
+--- a/iokit/NativeAdreno/RedwoodGpuGlue.cpp
++++ b/iokit/NativeAdreno/RedwoodGpuGlue.cpp
+@@ -80,7 +80,7 @@
+     if (guard && !guard->allocate((size_t)kGuardBytes, gRedwood.output_bits, false,
+             (size_t)kGuardBytes, false)) {
+         uint64_t handle = 0;
+-        if (!gRedwood.vm->map(guard, 0, 0, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3, &handle)) {
++        if (!gRedwood.vm->map(guard, 0, 0, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 2, &handle)) {
+             gRedwood.guard = guard;
+             gRedwood.guard_handle = handle;
+         } else {
+@@ -128,8 +128,12 @@
+     /* Same permissions the user client's own BOs are mapped with: GPU read and
+      * write, non-coherent (the CPU view is write-combined). */
+     uint64_t handle = 0;
++    /* Shareability 2, exactly like the GPU context's own buffers (which the CP
++     * reads and writes): 3 (outer shareable) was the only attribute difference
++     * between a buffer the CP writes happily and the client BO whose target the
++     * CP faulted on (ringlog showed the CP_MEM_WRITE itself was correct). */
+     status = gRedwood.vm->map(memory, 0, address, ArmSmmu4KRead | ArmSmmu4KWrite,
+-        0, 3, &handle);
++        0, 2, &handle);
+     if (status) {
+         (void)memory->release();
+         IOLog("RedwoodGPU: map of %llu bytes at 0x%llx failed 0x%x\n",
