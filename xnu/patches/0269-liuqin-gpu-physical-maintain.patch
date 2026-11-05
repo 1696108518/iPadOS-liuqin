@@ -1,0 +1,82 @@
+--- a/iokit/NativeAdreno/NativeAdrenoMemory.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoMemory.cpp
+@@ -288,20 +288,23 @@
+ {
+     if(!backed() || !prepared_ || quarantined_)return kIOReturnNotReady;
+     if(!bytes || ((offset|bytes)&4095) || offset>bytes_ || bytes>bytes_-offset)return kIOReturnBadArgument;
+-    if(imported_)return maintainImported(offset,bytes,writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);
+-    if(write_combined_)   /* no CPU mapping should cache these pages; if one does, reach its lines through the physical pages */
+-        return include_write_combined?maintainImported(offset,bytes,writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean):kIOReturnSuccess;
+-    return NativeAdrenoMaintainOwnedPages(static_cast<unsigned char *>(mapping_)+offset,bytes,
+-        writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);
++    /* Always maintain owned pages by physical address. On this board the
++     * kernel's view of a BO is not reliably cacheable (the pooled BO mapping is
++     * not, and a client's physical-range view caches the pages): dc cvac/civac
++     * through a non-cacheable VA is a no-op in the architecture, so the dirty
++     * line written through the client's view was never cleaned and DRAM kept
++     * 0xffffffff (liuqin int-2xx: the CP read that and raised CP_OPCODE_ERROR).
++     * phystokv gives the cacheable linear alias, so the physical walk cleans
++     * and invalidates the real lines whatever mapping wrote them. */
++    return maintainImported(offset,bytes,writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);
+ }
+ IOReturn NativeAdrenoMemory::acquireDeviceWrites(size_t offset,size_t bytes)
+ {
+     if(!backed() || !prepared_ || quarantined_)return kIOReturnNotReady;
+     if(!bytes || ((offset|bytes)&4095) || offset>bytes_ || bytes>bytes_-offset)return kIOReturnBadArgument;
+-    /* Imported pages may hold the owner's unrelated dirty lines next to the GPU's writes: clean as well as invalidate. */
+-    if(imported_)return maintainImported(offset,bytes,NativeAdrenoCleanInvalidate);
+-    if(write_combined_)return kIOReturnSuccess;
+-    return NativeAdrenoMaintainOwnedPages(static_cast<unsigned char *>(mapping_)+offset,bytes,NativeAdrenoInvalidate);
++    /* Imported pages may hold the owner's unrelated dirty lines next to the GPU's writes: clean as well as invalidate.
++     * Owned pages go the same way, by physical address, for the reason stated in publishForDevice. */
++    return maintainImported(offset,bytes,NativeAdrenoCleanInvalidate);
+ }
+ /* Imported pages have no kernel mapping here (and write-combined ones only a non-cacheable one); maintain each span's part of
+  * [offset, offset+bytes) by physical address. */
+--- a/iokit/NativeAdreno/NativeAdrenoCpu.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoCpu.cpp
+@@ -79,6 +79,10 @@
+     if(!status)noteMaintenance(began,bytes);
+     return status;
+ }
++/* Pages this walk maintained, and pages it skipped because phystokv does not
++ * cover them (the caller's data then never reaches DRAM). Printed by the ring's
++ * fence-timeout dump. */
++extern "C" {volatile uint32_t native_adreno_phys_pages,native_adreno_phys_skipped;}
+ IOReturn NativeAdrenoMaintainPhysicalPages(uint64_t physical,size_t bytes,NativeAdrenoCacheOperation op)
+ {
+     if(!physical || !bytes || ((physical|bytes)&4095) || physical>UINT64_MAX-bytes || op>NativeAdrenoInvalidate || op<NativeAdrenoClean)
+@@ -97,7 +101,8 @@
+              * uncached (kIOMapInhibitCache), no cache line of it exists to maintain, and phystokv would panic on it (int-080: illegal PA
+              * 0xb8000000). */
+             const uint64_t page=physical+offset;
+-            if(page<gPhysBase || page-gPhysBase>=gPhysSize)continue;
++            if(page<gPhysBase || page-gPhysBase>=gPhysSize) {native_adreno_phys_skipped=native_adreno_phys_skipped+1;continue;}
++            native_adreno_phys_pages=native_adreno_phys_pages+1;
+             const vm_offset_t alias=phystokv(page);
+             if(!alias) {__asm__ volatile("dsb sy":::"memory");enable_preemption();return kIOReturnUnsupported;}
+             for(uintptr_t address=alias,end=alias+4096;address<end;address+=line) {
+--- a/iokit/NativeAdreno/NativeAdrenoRing.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoRing.cpp
+@@ -75,6 +75,7 @@
+ extern "C" extern volatile uint32_t native_adreno_coherence[8];
+ extern "C" extern volatile uint32_t native_adreno_wc_audit[6];
+ extern "C" extern volatile uint32_t native_adreno_wc_distrusted;
++extern "C" extern volatile uint32_t native_adreno_phys_pages,native_adreno_phys_skipped;
+ IOReturn NativeAdrenoRing::poison()
+ {
+     poisoned_=true;return kIOReturnIOError;
+@@ -119,10 +120,11 @@
+         native_adreno_ib_log_count?(unsigned)native_adreno_ib_log[(native_adreno_ib_log_count-1)&3][9]:0u,
+         native_adreno_ib_log_count?(unsigned)native_adreno_ib_log[(native_adreno_ib_log_count-1)&3][10]:0u,
+         native_adreno_ib_log_count?(unsigned)native_adreno_ib_log[(native_adreno_ib_log_count-1)&3][11]:0u);
+-    IOLog("NativeAdrenoRing diag: coherence cached=%08x before=%08x after=%08x drift=%u | wc_audit lines=%u dirty=%u stale=%u fail=%08x distrusted=%u\n",
++    IOLog("NativeAdrenoRing diag: coherence cached=%08x before=%08x after=%08x drift=%u | wc_audit lines=%u dirty=%u stale=%u fail=%08x distrusted=%u | phys maintained=%u skipped=%u\n",
+         native_adreno_coherence[1],native_adreno_coherence[2],native_adreno_coherence[3],
+         native_adreno_coherence[4],native_adreno_wc_audit[1],native_adreno_wc_audit[2],
+-        native_adreno_wc_audit[3],native_adreno_wc_audit[4],native_adreno_wc_distrusted);
++        native_adreno_wc_audit[3],native_adreno_wc_audit[4],native_adreno_wc_distrusted,
++        native_adreno_phys_pages,native_adreno_phys_skipped);
+ }
+ IOReturn NativeAdrenoRing::readRptr(uint32_t *value)
+ {
