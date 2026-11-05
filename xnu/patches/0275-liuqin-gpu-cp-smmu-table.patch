@@ -1,0 +1,122 @@
+--- a/iokit/NativeAdreno/NativeAdrenoVm.h
++++ b/iokit/NativeAdreno/NativeAdrenoVm.h
+@@ -80,6 +80,9 @@
+      * disables a bank or returns the platform lease; board lifecycle owns it. */
+     IOReturn detach();
+     IOReturn findAddress(unsigned upper,size_t bytes,uint64_t alignment,uint64_t *iova) const;
++    /* The context bank image this VM was attached with: the table base the CP
++     * must be told about (CP_SMMU_TABLE_UPDATE) before it can fetch IBs. */
++    IOReturn pagetable(uint64_t *ttbr0,unsigned *asid) const;
+     IOReturn map(NativeAdrenoMemory *,unsigned upper,uint64_t iova,
+         unsigned permissions,unsigned writeback,unsigned shareability,uint64_t *handle);
+     IOReturn unmap(uint64_t handle);
+--- a/iokit/NativeAdreno/NativeAdrenoVm.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoVm.cpp
+@@ -121,6 +121,15 @@
+     attached_=false;regions_[0]={};regions_[1]={};context_=nullptr;streams_=nullptr;capacity_=0;
+     return kIOReturnSuccess;
+ }
++IOReturn NativeAdrenoVm::pagetable(uint64_t *ttbr0,unsigned *asid) const
++{
++    if(!context_)return kIOReturnNotReady;
++    ArmSmmu4KContextImage image;
++    if(ArmSmmu4KEncodeContext(context_,&image)!=ArmSmmu4KSuccess)return kIOReturnError;
++    if(ttbr0)*ttbr0=image.ttbr0;
++    if(asid)*asid=context_->asid;
++    return kIOReturnSuccess;
++}
+ IOReturn NativeAdrenoVm::findAddress(unsigned upper,size_t bytes,uint64_t alignment,uint64_t *out) const
+ {
+     if(!out)return kIOReturnBadArgument;*out=0;
+--- a/iokit/NativeAdreno/NativeAdrenoRing.h
++++ b/iokit/NativeAdreno/NativeAdrenoRing.h
+@@ -48,7 +48,9 @@
+     NativeAdrenoRingCache cache_{};
+     volatile uint32_t *ring_=nullptr,*fence_=nullptr;
+     size_t ring_bytes_=0,fence_bytes_=0;
+-    uint64_t ring_iova_=0,fence_iova_=0;
++    uint64_t ring_iova_=0,fence_iova_=0,ttbr0_=0;
++    unsigned asid_=0;
++    bool have_pagetable_=false,pagetable_sent_=false;
+     uint32_t next_=0,rptr_shadow_=0,seqno_=0,completed_=0,submissions_=0;
+     bool attached_=false,poisoned_=false,reset_pending_=false;
+     IOReturn poison();
+@@ -82,6 +84,11 @@
+     /* The next framed submission starts with the A7XX context entry of a6xx_set_pagetable() (BR/BV counters, on-chip
+      * timestamps and resource table cleared between thread syncs); a new user client requests it, as Linux does per context. */
+     void requestContextReset() {reset_pending_=true;}
++    /* a6xx_set_pagetable()'s a7xx block runs CP_SMMU_TABLE_UPDATE so the CP
++     * fetches indirect buffers through this context's tables; without it the
++     * IB fetch has no table and comes back as CP_OPCODE_ERROR. Sent once, before
++     * the first submission after this call. */
++    void setPagetable(uint64_t ttbr0,unsigned asid) {ttbr0_=ttbr0;asid_=asid;have_pagetable_=true;}
+     /* Polls the CP-written timestamp after invalidating the fence page. Never
+      * writes registers and never advances the ring. Timeout is not poison. */
+     NativeAdrenoRingFence wait(uint32_t fence,const NativeAdrenoRingClock *,
+--- a/iokit/NativeAdreno/NativeAdrenoRing.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoRing.cpp
+@@ -58,7 +58,11 @@
+     RingResetWords = 26,
+     RingFenceWords = 7,       /* kernel bring-up submissions: TYPE4 scratch + TYPE7 event */
+     RingFramedFenceWords = 31,/* user submissions: scratch, BV timestamp, BR wait, ring timestamp */
+-    RingBvFenceOffset = 12    /* msm_rbmemptrs.bv_fence; +8 is bv_rptr, the BV RPTR shadow hw init programs */
++    RingBvFenceOffset = 12,   /* msm_rbmemptrs.bv_fence; +8 is bv_rptr, the BV RPTR shadow hw init programs */
++    /* CP_SMMU_TABLE_UPDATE (opcode 0x53, 4 payload words: TTBR0_LO,
++     * TTBR0_HI (bits 0..15) | ASID (bits 16..31), CONTEXTIDR, CONTEXTBANK). */
++    RingTableUpdate = 0x53,
++    RingTableUpdateWords = 5
+ };
+ static uint32_t ilog2(size_t value)
+ {
+@@ -288,7 +292,9 @@
+     if(!words || !word_count || word_count>SIZE_MAX/sizeof(uint32_t))return kIOReturnBadArgument;
+     const uint32_t size_words=(uint32_t)(ring_bytes_/4),mask=size_words-1;
+     const bool reset=framed && reset_pending_;
+-    const uint32_t extra=framed?RingPrologueWords+(reset?RingResetWords:0)+RingFramedFenceWords:RingFenceWords;
++    const uint32_t table_words=(have_pagetable_&&!pagetable_sent_)?RingTableUpdateWords:0;
++    const uint32_t extra=table_words+
++        (framed?RingPrologueWords+(reset?RingResetWords:0)+RingFramedFenceWords:RingFenceWords);
+     if(word_count>size_words-extra-8)return kIOReturnNoResources;
+     uint32_t rptr=0;IOReturn status=readRptr(&rptr);
+     if(status) {
+@@ -299,6 +305,14 @@
+     const uint32_t used=(next_-rptr)&mask;
+     if(word_count+extra+8>size_words-used)return kIOReturnNoResources;
+     uint32_t at=next_;
++    if(table_words) {
++        uint32_t packet_words[RingTableUpdateWords]={0};
++        if(AdrenoPM4Type7(RingTableUpdate,4,&packet_words[0])!=AdrenoPM4Success)return poison();
++        packet_words[1]=(uint32_t)ttbr0_;
++        packet_words[2]=(uint32_t)((ttbr0_>>32)&0xffffu)|((uint32_t)(asid_&0xffffu)<<16);
++        for(uint32_t i=0;i<RingTableUpdateWords;++i)ring_[(at+i)&mask]=packet_words[i];
++        at=(at+RingTableUpdateWords)&mask;
++    }
+     if(framed) {
+         status=emitPrologue(at,reset,&at);
+         if(status)return status;
+@@ -343,6 +357,7 @@
+         if(once++<8) IOLog("NativeAdrenoRing diag: commit ok end=%u rptr=%u used=%u words=%zu\n",
+             (unsigned)end,(unsigned)rptr,(unsigned)((next_-rptr)&mask),word_count);
+     }
++    if(table_words)pagetable_sent_=true;
+     next_=end;*fence=++seqno_;++submissions_;
+     if(reset)reset_pending_=false;
+     return kIOReturnSuccess;
+--- a/iokit/NativeAdreno/NativeAdrenoService.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoService.cpp
+@@ -1249,6 +1249,15 @@
+                                                 ring_status=ring_.attach(&ring_io,&cache,ring_cpu,
+                                                     static_cast<size_t>(b[1].bytes),GpuRingIova,
+                                                     fence_cpu,static_cast<size_t>(b[2].bytes),GpuMemptrsIova);
++                                            if(!ring_status) {
++                                                NativeAdrenoVm *gpu_vm=NativeAdrenoGpuContextVm();
++                                                uint64_t ttbr0=0;unsigned asid=0;
++                                                if(gpu_vm && !gpu_vm->pagetable(&ttbr0,&asid)) {
++                                                    ring_.setPagetable(ttbr0,asid);
++                                                    IOLog("NativeAdreno: CP pagetable ttbr0=0x%llx asid=%u\n",
++                                                        (unsigned long long)ttbr0,asid);
++                                                } else IOLog("NativeAdreno: CP pagetable parameters unavailable\n");
++                                            }
+                                             if(ring_status)
+                                                 IOLog("NativeAdreno: CP ring attach stopped at 0x%x\n",ring_status);
+                                             else {
