@@ -1,0 +1,32 @@
+--- a/iokit/NativeAdreno/NativeAdrenoGpuContext.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoGpuContext.cpp
+@@ -32,7 +32,12 @@
+      * A pool that cannot be had at one size is tried at the next smaller; none is not an error. */
+     if(!status && native_adreno_pool_mib) {
+         for(uint32_t mib=native_adreno_pool_mib;mib>=16;mib>>=1) {
+-            const IOReturn pooled=NativeAdrenoMemory::reservePool(report->output_bits,(size_t)mib<<20);
++            /* Keep the BO pool in the real DRAM the GPU's data path reaches
++             * (below 16 GiB): with the full 40-bit mask the contiguous block
++             * lands in the shim's 33-45 GiB extension, which the SMMU reads
++             * page tables from but where a GPU write has never been proven
++             * (the CP faulted writing a client BO target). */
++            const IOReturn pooled=NativeAdrenoMemory::reservePool(34u,(size_t)mib<<20);
+             native_adreno_pool_stats[0]=pooled==kIOReturnSuccess?mib:0;native_adreno_pool_status=(uint32_t)pooled;
+             if(pooled==kIOReturnSuccess)break;
+         }
+--- a/iokit/NativeAdreno/RedwoodGpuGlue.cpp
++++ b/iokit/NativeAdreno/RedwoodGpuGlue.cpp
+@@ -119,6 +119,13 @@
+         (void)memory->release();
+         return status == kIOReturnUnsupported ? kIOReturnUnsupported : status;
+     }
++    {
++        static uint32_t said;
++        if(said++<16 && memory->spanCount())
++            IOLog("RedwoodGPU: BO %llu bytes at physical 0x%llx (spans %zu)\n",
++                (unsigned long long)bytes,(unsigned long long)memory->spans()[0].physical,
++                memory->spanCount());
++    }
+     uint64_t address = 0;
+     status = gRedwood.vm->findAddress(0, (size_t)bytes, kGranule, &address);
+     if (status) {
