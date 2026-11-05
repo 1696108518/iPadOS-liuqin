@@ -1,0 +1,29 @@
+--- a/iokit/NativeAdreno/NativeAdrenoVm.cpp
++++ b/iokit/NativeAdreno/NativeAdrenoVm.cpp
+@@ -123,12 +123,21 @@
+ }
+ IOReturn NativeAdrenoVm::pagetable(uint64_t *ttbr0,unsigned *asid) const
+ {
+-    if(!context_)return kIOReturnNotReady;
++    if(!context_ || !ttbr0 || !asid)return kIOReturnBadArgument;
+     ArmSmmu4KContextImage image;
+-    if(ArmSmmu4KEncodeContext(context_,&image)!=ArmSmmu4KSuccess)return kIOReturnError;
+-    if(ttbr0)*ttbr0=image.ttbr0;
+-    if(asid)*asid=context_->asid;
+-    return kIOReturnSuccess;
++    if(ArmSmmu4KEncodeContext(context_,&image)==ArmSmmu4KSuccess && image.ttbr0) {
++        *ttbr0=image.ttbr0;*asid=context_->asid;return kIOReturnSuccess;
++    }
++    /* Live arenas keep no Build() result for EncodeContext: the table base the
++     * context bank was programmed with is the table pool's own first span. */
++    for(size_t i=0;i<2;++i) {
++        const NativeAdrenoVmRegion &r=regions_[i];
++        if(!r.arena || !r.tables || r.tables->spanCount()!=1)continue;
++        const uint64_t physical=r.tables->spans()[0].physical;
++        if(!physical || r.tables->spans()[0].offset || r.tables->spans()[0].bytes!=r.tables->bytes())continue;
++        *ttbr0=physical;*asid=context_->asid;return kIOReturnSuccess;
++    }
++    return kIOReturnUnsupported;
+ }
+ IOReturn NativeAdrenoVm::findAddress(unsigned upper,size_t bytes,uint64_t alignment,uint64_t *out) const
+ {
