@@ -1,0 +1,39 @@
+--- a/bsd/dev/liuqin_ufs.c
++++ b/bsd/dev/liuqin_ufs.c
+@@ -1865,8 +1865,9 @@
+ 
+ static char liuqin_log_ring[LIUQIN_LOG_SIZE];
+ static uint64_t _Atomic liuqin_log_total;
+ static int liuqin_log_chan;
++static uint32_t liuqin_log_flushed_once;
+ static uint32_t liuqin_log_secs = LIUQIN_LOG_SECS;
+ 
+ void liuqin_log_append(const char *c, int size);
+ 
+@@ -2062,8 +2063,9 @@
+ 			printf("LIUQIN LOG: write failed (%d), stopping\n", error);
+ 			return;
+ 		}
+ 		flushed = total;
++		liuqin_log_flushed_once = 1;
+ 	}
+ }
+ 
+ /*
+@@ -2213,8 +2215,16 @@
+ 				kr = KERN_SUCCESS;
+ 			}
+ 		}
+ 	}
++	/*
++	 * The GPU ladder runs right after this call and can panic at any point;
++	 * the first write is already in flight in the new thread, so let it reach
++	 * the disk before returning. 5 s is far beyond the ~0.1 s it takes.
++	 */
++	for (uint32_t waited = 0; waited < 5000 && !liuqin_log_flushed_once; waited++) {
++		delay(1000);
++	}
+ 	liuqin_wdt_start();
+ }
+ 
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
